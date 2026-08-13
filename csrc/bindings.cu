@@ -1,4 +1,4 @@
-#include "mok_megakernel.cuh"
+#include "megakernel/entrypoints.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
 #include "utils.cuh"
