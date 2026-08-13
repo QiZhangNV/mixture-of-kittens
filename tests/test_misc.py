@@ -509,6 +509,9 @@ def test_workspace_cache_reuse_and_isolation(
         assert larger_workspace.schedule_capacity == expected_larger_capacity
         assert duplicate_group_workspace.group_name == duplicate_world.group_name
         assert duplicate_group_workspace.group_name != default_workspace.group_name
+        assert default_workspace.d_x_routed_buffer is default_workspace.combine_buffer
+        assert default_workspace.d_x_routed_buffer_handle is default_workspace.combine_buffer_handle
+        assert default_workspace.d_x_routed_buffer_ptrs is default_workspace.combine_buffer_ptrs
     finally:
         functional.clear_workspace_cache()
         dist.barrier()
