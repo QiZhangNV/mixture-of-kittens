@@ -45,10 +45,12 @@ def _run_e2e_case(
     seed: int = 1234,
     grad_seed: int | None = None,
     top_experts: torch.Tensor | None = None,
+    group: dist.ProcessGroup | None = None,
 ) -> None:
-    rank, world_size, device = context
+    rank, _, device = context
+    ep_group = dist.group.WORLD if group is None else group
     num_local_tokens = 512
-    num_experts = num_local_experts * world_size
+    num_experts = num_local_experts * dist.get_world_size(ep_group)
     generator = torch.Generator(device=device).manual_seed(seed + rank)
     router_logits = torch.randn(
         num_local_tokens,
@@ -156,10 +158,10 @@ def _run_e2e_case(
         w_routed_down,
         d_output,
     )
-    reference = run_reference_bf16(*input_tuple)
+    reference = run_reference_bf16(*input_tuple, group=ep_group)
     workspace = functional.get_workspace(
         config,
-        dist.group.WORLD,
+        ep_group,
         device=device,
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
@@ -414,6 +416,133 @@ def _make_fake_workspace(
         barrier_buffer_multicast_ptr=1,
         barrier_target=tensor((1,), torch.int32),
     )
+
+
+def test_ep1_on_each_rank(
+    context: tuple[int, int, torch.device],
+) -> None:
+    rank, world_size, device = context
+    singleton_groups = [
+        dist.new_group(ranks=[group_rank])
+        for group_rank in range(world_size)
+    ]
+    ep_group = singleton_groups[rank]
+    assert isinstance(ep_group, dist.ProcessGroup)
+
+    config = functional.MoKConfig(
+        fwd_num_comm_sms=2,
+        bwd_num_comm_sms=2,
+        minibatch_size=256,
+        macrobatch_size=512,
+        all_gather_top_experts_chunk_bytes=16,
+    )
+    functional.clear_workspace_cache()
+    try:
+        workspace = functional.get_workspace(
+            config,
+            ep_group,
+            device=device,
+            num_local_tokens=512,
+            hidden_size=256,
+            topk=1,
+        )
+
+        assert workspace.ep_rank == 0
+        assert workspace.ep_size == 1
+        for buffer, handle, pointers in (
+            (
+                workspace.x_buffer,
+                workspace.x_buffer_handle,
+                workspace.x_buffer_ptrs,
+            ),
+            (
+                workspace.combine_buffer,
+                workspace.combine_buffer_handle,
+                workspace.combine_buffer_ptrs,
+            ),
+            (
+                workspace.d_y_buffer,
+                workspace.d_y_buffer_handle,
+                workspace.d_y_buffer_ptrs,
+            ),
+            (
+                workspace.d_x_routed_buffer,
+                workspace.d_x_routed_buffer_handle,
+                workspace.d_x_routed_buffer_ptrs,
+            ),
+            (
+                workspace.router_weight_buffer,
+                workspace.router_weight_buffer_handle,
+                workspace.router_weight_buffer_ptrs,
+            ),
+            (
+                workspace.d_router_weight_buffer,
+                workspace.d_router_weight_buffer_handle,
+                workspace.d_router_weight_buffer_ptrs,
+            ),
+        ):
+            assert handle is None
+            assert pointers == [buffer.data_ptr()]
+
+        assert workspace.all_gather_top_experts_buffer_handle is None
+        assert (
+            workspace.all_gather_top_experts_buffer_multicast_ptr
+            == workspace.all_gather_top_experts_buffer.data_ptr()
+        )
+        assert workspace.barrier_buffer_handle is None
+        assert workspace.barrier_buffer_ptrs == [
+            workspace.barrier_buffer.data_ptr()
+        ]
+        assert (
+            workspace.barrier_buffer_multicast_ptr
+            == workspace.barrier_buffer.data_ptr()
+        )
+
+        top_experts = torch.zeros(
+            512,
+            1,
+            dtype=torch.int32,
+            device=device,
+        )
+        ops.all_gather_top_experts(
+            top_experts,
+            workspace.all_gather_top_experts_buffer,
+            workspace.all_gather_top_experts_buffer_multicast_ptr,
+            0,
+            16,
+        )
+        assert torch.equal(
+            workspace.all_gather_top_experts_buffer[0],
+            top_experts,
+        )
+
+        ops.barrier_all(
+            workspace.barrier_buffer,
+            workspace.barrier_buffer_ptrs,
+            workspace.barrier_buffer_multicast_ptr,
+            workspace.barrier_target,
+        )
+        torch.cuda.synchronize(device)
+        assert int(workspace.barrier_buffer.item()) == 0
+        assert int(workspace.barrier_target.item()) == 0
+
+        _run_e2e_case(
+            context,
+            name="ep1-minimum",
+            hidden_size=256,
+            intermediate_size=256,
+            num_local_experts=1,
+            topk=1,
+            config=config,
+            precisions=("bf16", "mxfp8"),
+            group=ep_group,
+        )
+    finally:
+        functional.clear_workspace_cache()
+        dist.barrier()
+        for group in singleton_groups:
+            if isinstance(group, dist.ProcessGroup):
+                dist.destroy_process_group(group)
 
 
 def test_e2e_fixed_first_topk_experts_default_capacity(

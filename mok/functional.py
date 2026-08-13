@@ -151,8 +151,8 @@ def validate_workspace_args(
         raise RuntimeError("process group must have a nonempty group_name")
     ep_rank = dist.get_rank(group=group)
     ep_size = dist.get_world_size(group=group)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("MoK EP size must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("MoK EP size must be one of 1, 4, 8, 16, 32, 64")
     if not 0 <= ep_rank < ep_size:
         raise RuntimeError("current process is not a member of the EP process group")
 
@@ -201,54 +201,47 @@ def create_workspace(
     gathered_shapes = gathered_shapes.view(ep_size, local_shape.numel())
     if not torch.all(gathered_shapes == local_shape).item():  # .item() here is fine since this is one-time setup
         raise ValueError("MoK requires identical token, hidden, and top-k shapes on every EP rank")
-    symm_mem.enable_symm_mem_for_group(group_name)
+    if ep_size > 1:
+        symm_mem.enable_symm_mem_for_group(group_name)
 
     schedule_capacity = num_local_tokens * topk * schedule_capacity_factor
 
-    x_buffer = symm_mem.empty(num_local_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-    x_buffer_handle = symm_mem.rendezvous(x_buffer, group_name)
-    x_buffer_ptrs = [int(x_buffer_handle.buffer_ptrs[peer_rank]) for peer_rank in range(ep_size)]
+    def allocate_buffer(*shape: int, dtype: torch.dtype, zero: bool = False) -> tuple[torch.Tensor, Any, list[int]]:
+        if ep_size == 1:
+            if zero:
+                buffer = torch.zeros(*shape, dtype=dtype, device=device)
+            else:
+                buffer = torch.empty(*shape, dtype=dtype, device=device)
+            handle = None
+            ptrs = [int(buffer.data_ptr())]
+        else:
+            buffer = symm_mem.empty(*shape, dtype=dtype, device=device)
+            if zero:
+                buffer.zero_()
+            handle = symm_mem.rendezvous(buffer, group_name)
+            ptrs = [int(handle.buffer_ptrs[peer_rank]) for peer_rank in range(ep_size)]
+        return buffer, handle, ptrs
 
-    combine_buffer = symm_mem.empty(num_local_tokens * topk, hidden_size,
-                                    dtype=torch.bfloat16, device=device)
-    combine_buffer_handle = symm_mem.rendezvous(combine_buffer, group_name)
-    combine_buffer_ptrs = [int(combine_buffer_handle.buffer_ptrs[peer_rank])
-                           for peer_rank in range(ep_size)]
+    x_buffer, x_buffer_handle, x_buffer_ptrs = allocate_buffer(num_local_tokens, hidden_size, dtype=torch.bfloat16)
+    combine_buffer, combine_buffer_handle, combine_buffer_ptrs = allocate_buffer(num_local_tokens * topk, hidden_size, dtype=torch.bfloat16)
+    d_y_buffer, d_y_buffer_handle, d_y_buffer_ptrs = allocate_buffer(num_local_tokens, hidden_size, dtype=torch.bfloat16)
+    d_x_routed_buffer, d_x_routed_buffer_handle, d_x_routed_buffer_ptrs = allocate_buffer(num_local_tokens * topk, hidden_size, dtype=torch.bfloat16)
+    router_weight_buffer, router_weight_buffer_handle, router_weight_buffer_ptrs = allocate_buffer(num_local_tokens, topk, dtype=torch.float32)
+    d_router_weight_buffer, d_router_weight_buffer_handle, d_router_weight_buffer_ptrs = allocate_buffer(num_local_tokens, topk, dtype=torch.float32)
 
-    d_y_buffer = symm_mem.empty(num_local_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-    d_y_buffer_handle = symm_mem.rendezvous(d_y_buffer, group_name)
-    d_y_buffer_ptrs = [int(d_y_buffer_handle.buffer_ptrs[peer_rank])
-                       for peer_rank in range(ep_size)]
+    all_gather_top_experts_buffer, all_gather_top_experts_buffer_handle, _ = allocate_buffer(ep_size, num_local_tokens, topk, dtype=torch.int32)
+    all_gather_top_experts_buffer_multicast_ptr = int(
+        all_gather_top_experts_buffer.data_ptr()
+        if all_gather_top_experts_buffer_handle is None
+        else all_gather_top_experts_buffer_handle.multicast_ptr
+    )
 
-    d_x_routed_buffer = symm_mem.empty(num_local_tokens * topk, hidden_size,
-                                      dtype=torch.bfloat16, device=device)
-    d_x_routed_buffer_handle = symm_mem.rendezvous(d_x_routed_buffer, group_name)
-    d_x_routed_buffer_ptrs = [int(d_x_routed_buffer_handle.buffer_ptrs[peer_rank])
-                              for peer_rank in range(ep_size)]
-
-    router_weight_buffer = symm_mem.empty(num_local_tokens, topk, dtype=torch.float32, device=device)
-    router_weight_buffer_handle = symm_mem.rendezvous(router_weight_buffer, group_name)
-    router_weight_buffer_ptrs = [int(router_weight_buffer_handle.buffer_ptrs[peer_rank])
-                                 for peer_rank in range(ep_size)]
-
-    d_router_weight_buffer = symm_mem.empty(num_local_tokens, topk,
-                                            dtype=torch.float32, device=device)
-    d_router_weight_buffer_handle = symm_mem.rendezvous(d_router_weight_buffer, group_name)
-    d_router_weight_buffer_ptrs = [int(d_router_weight_buffer_handle.buffer_ptrs[peer_rank])
-                                   for peer_rank in range(ep_size)]
-
-    all_gather_top_experts_buffer = symm_mem.empty(
-        ep_size, num_local_tokens, topk, dtype=torch.int32, device=device)
-    all_gather_top_experts_buffer_handle = symm_mem.rendezvous(all_gather_top_experts_buffer,
-                                                               group_name)
-    all_gather_top_experts_buffer_multicast_ptr = int(all_gather_top_experts_buffer_handle.multicast_ptr)
-
-    barrier_buffer = symm_mem.empty(1, dtype=torch.int32, device=device)
-    barrier_buffer.zero_()
-    barrier_buffer_handle = symm_mem.rendezvous(barrier_buffer, group_name)
-    barrier_buffer_ptrs = [int(barrier_buffer_handle.buffer_ptrs[peer_rank])
-                           for peer_rank in range(ep_size)]
-    barrier_buffer_multicast_ptr = int(barrier_buffer_handle.multicast_ptr)
+    barrier_buffer, barrier_buffer_handle, barrier_buffer_ptrs = allocate_buffer(1, dtype=torch.int32, zero=True)
+    barrier_buffer_multicast_ptr = int(
+        barrier_buffer.data_ptr()
+        if barrier_buffer_handle is None
+        else barrier_buffer_handle.multicast_ptr
+    )
     barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
 
     dist.barrier(group=group, async_op=True, device_ids=[device_index]).block_current_stream()

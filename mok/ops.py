@@ -38,8 +38,8 @@ def all_gather_top_experts(
     if any(size <= 0 for size in all_gather_top_experts_buffer.shape):
         raise ValueError("all_gather_top_experts_buffer dimensions must be positive")
     ep_size = all_gather_top_experts_buffer.shape[0]
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("all_gather_top_experts_buffer ep_size must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("all_gather_top_experts_buffer ep_size must be one of 1, 4, 8, 16, 32, 64")
     if (all_gather_top_experts_buffer.device != top_experts.device
             or tuple(all_gather_top_experts_buffer.shape[1:]) != tuple(top_experts.shape)):
         raise ValueError("all_gather_top_experts_buffer must match top_experts shape and device")
@@ -55,7 +55,10 @@ def all_gather_top_experts(
     if rank_buffer_bytes % chunk_bytes != 0:
         raise ValueError("chunk_bytes must divide one rank's route-buffer bytes")
 
-    _C.all_gather_top_experts(top_experts, all_gather_top_experts_buffer, all_gather_top_experts_buffer_multicast_ptr, rank, chunk_bytes)
+    if ep_size == 1:
+        all_gather_top_experts_buffer[0].copy_(top_experts)
+    else:
+        _C.all_gather_top_experts(top_experts, all_gather_top_experts_buffer, all_gather_top_experts_buffer_multicast_ptr, rank, chunk_bytes)
 
 
 @torch.library.custom_op("mok::barrier_all", mutates_args=("barrier_buffer", "target"))
@@ -88,8 +91,8 @@ def barrier_all(
         type(pointer) is not int or pointer <= 0 for pointer in barrier_buffer_ptrs):
         raise TypeError("barrier_buffer_ptrs must be a list of positive integers")
     ep_size = len(barrier_buffer_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("barrier_buffer_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("barrier_buffer_ptrs length must be one of 1, 4, 8, 16, 32, 64")
     if type(barrier_buffer_multicast_ptr) is not int or barrier_buffer_multicast_ptr <= 0:
         raise TypeError("barrier_buffer_multicast_ptr must be a positive integer")
     if (not target.is_cuda or target.device != barrier_buffer.device
@@ -97,7 +100,10 @@ def barrier_all(
             or tuple(target.shape) != (1,)):
         raise ValueError("target must be contiguous int32 [1] on the barrier CUDA device")
 
-    _C.barrier_all(barrier_buffer, barrier_buffer_ptrs, barrier_buffer_multicast_ptr, target)
+    if ep_size == 1:
+        return
+    else:
+        _C.barrier_all(barrier_buffer, barrier_buffer_ptrs, barrier_buffer_multicast_ptr, target)
 
 
 @torch.library.custom_op("mok::schedule", mutates_args=())
@@ -129,8 +135,8 @@ def schedule(
     if topk_all.ndim != 3:
         raise ValueError("topk_all must have shape (ep_size, num_local_tokens, topk)")
     ep_size, num_local_tokens, topk = topk_all.shape
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("topk_all ep_size must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("topk_all ep_size must be one of 1, 4, 8, 16, 32, 64")
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError(
             "topk_all num_local_tokens must be at least 512 and divisible by 256"
@@ -297,8 +303,8 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 1, 4, 8, 16, 32, 64")
     if len(combine_buffer_ptrs) != ep_size:
         raise ValueError("combine_buffer_ptrs length must match x_ptrs")
     if w_shared_gate.ndim != 2:
@@ -465,8 +471,8 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 1, 4, 8, 16, 32, 64")
     if len(combine_buffer_ptrs) != ep_size:
         raise ValueError("combine_buffer_ptrs length must match x_ptrs")
     if schedule_peer_rank.ndim != 1 or schedule_peer_rank.numel() == 0:
@@ -683,8 +689,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 1, 4, 8, 16, 32, 64")
     for pointer_name, pointers in (
         ("d_y_buffer_ptrs", d_y_buffer_ptrs),
         ("d_x_routed_buffer_ptrs", d_x_routed_buffer_ptrs),
@@ -953,8 +959,8 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         ):
             raise TypeError(f"{pointer_name} must be a list of positive integers")
     ep_size = len(x_ptrs)
-    if ep_size not in (4, 8, 16, 32, 64):
-        raise ValueError("x_ptrs length must be one of 4, 8, 16, 32, 64")
+    if ep_size not in (1, 4, 8, 16, 32, 64):
+        raise ValueError("x_ptrs length must be one of 1, 4, 8, 16, 32, 64")
     for pointer_name, pointers in pointer_lists[:-1]:
         if len(pointers) != ep_size:
             raise ValueError(f"{pointer_name} length must match x_ptrs")

@@ -231,11 +231,6 @@ def test_schedule(context: tuple[int, int, torch.device]) -> None:
     }
     for failure_name, overrides, expected_exception in (
         ("topk_all rank", {"topk_all": topk_all.squeeze(-1)}, ValueError),
-        (
-            "topk_all EP size",
-            {"topk_all": topk_all[:1]},
-            ValueError,
-        ),
         ("local experts", {"num_local_experts": 0}, ValueError),
         ("schedule capacity zero", {"schedule_capacity": 0}, ValueError),
         ("schedule capacity alignment", {"schedule_capacity": 128}, ValueError),
