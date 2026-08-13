@@ -12,6 +12,8 @@ from .ops import (
     bwd_epilogue,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
+    dispatch_mlp_swiglu_combine_bwd_mxfp8_accum,
+    dispatch_mlp_swiglu_combine_bwd_bf16_accum,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fwd_epilogue,
@@ -27,6 +29,10 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    # Kept for MCore integration compatibility. The BF16 path applies router
+    # weights in the normal epilogue, so this only affects the MXFP8 extension.
+    scale_router_before_fc2: bool = False
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +123,8 @@ def validate_workspace_args(
         or config.schedule_capacity_multiplier <= 0
     ):
         raise ValueError("schedule_capacity_multiplier must be a positive finite number")
+    if type(config.scale_router_before_fc2) is not bool:
+        raise TypeError("scale_router_before_fc2 must be a bool")
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized")
     if not isinstance(group, dist.ProcessGroup):
@@ -587,6 +595,14 @@ def backward(
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     routed_down_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     swiglu_limit: float | None = None,
+    main_grads: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -614,6 +630,9 @@ def backward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 tensor tuple
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 tensor tuple
         swiglu_limit:        float | None
+        main_grads:          optional FP32 buffers ordered as shared gate,
+                             routed gate, shared up, routed up, shared down,
+                             routed down; wgrad is accumulated in-place
 
     Outputs:
         d_x:                   bfloat16 [num_local_tokens, hidden_size]
@@ -644,12 +663,7 @@ def backward(
         gate_fp8_routed, gate_sc_routed = forward_context.gate_routed
         up_fp8_routed, up_sc_routed = forward_context.up_routed
         hidden_fp8_t_routed, hidden_sc_t_routed = forward_context.hidden_routed
-        (d_x_shared, d_x_routed,
-         d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
-         d_up_shared, d_up_fp8_routed, d_up_sc_routed,
-         d_hidden_shared, d_hidden_routed, d_y_fp8_routed, d_y_sc_routed,
-         d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up,
-         d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd_mxfp8(
+        mxfp8_bwd_args = (
             workspace.d_y_buffer, workspace.d_y_buffer_ptrs,
             workspace.d_x_routed_buffer, workspace.d_x_routed_buffer_ptrs,
             workspace.router_weight_buffer, workspace.router_weight_buffer_ptrs,
@@ -669,15 +683,31 @@ def backward(
             workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
             config.macrobatch_size, config.minibatch_size,
         )
+        if main_grads is None:
+            (d_x_shared, d_x_routed,
+             d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
+             d_up_shared, d_up_fp8_routed, d_up_sc_routed,
+             d_hidden_shared, d_hidden_routed, d_y_fp8_routed, d_y_sc_routed,
+             d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up,
+             d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd_mxfp8(
+                *mxfp8_bwd_args
+            )
+        else:
+            (d_x_shared, d_x_routed,
+             d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
+             d_up_shared, d_up_fp8_routed, d_up_sc_routed,
+             d_hidden_shared, d_hidden_routed,
+             d_y_fp8_routed, d_y_sc_routed) = dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+                *mxfp8_bwd_args, main_grads=main_grads
+            )
+            (d_w_shared_gate, d_w_routed_gate, d_w_shared_up,
+             d_w_routed_up, d_w_shared_down, d_w_routed_down) = main_grads
     else:
         x_routed = forward_context.x_routed
         gate_routed = forward_context.gate_routed
         up_routed = forward_context.up_routed
         hidden_routed = forward_context.hidden_routed
-        (d_x_shared, d_x_routed, d_gate_shared, d_gate_routed,
-         d_up_shared, d_up_routed, d_hidden_shared, d_hidden_routed, d_y_routed,
-         d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up,
-         d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd_bf16(
+        bwd_args = (
             workspace.d_y_buffer, workspace.d_y_buffer_ptrs,
             workspace.d_x_routed_buffer, workspace.d_x_routed_buffer_ptrs,
             workspace.router_weight_buffer, workspace.router_weight_buffer_ptrs,
@@ -694,6 +724,21 @@ def backward(
             workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
             config.macrobatch_size, config.minibatch_size,
         )
+        if main_grads is None:
+            (d_x_shared, d_x_routed, d_gate_shared, d_gate_routed,
+             d_up_shared, d_up_routed, d_hidden_shared, d_hidden_routed, d_y_routed,
+             d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up,
+             d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd_bf16(
+                *bwd_args
+            )
+        else:
+            (d_x_shared, d_x_routed, d_gate_shared, d_gate_routed,
+             d_up_shared, d_up_routed, d_hidden_shared, d_hidden_routed,
+             d_y_routed) = dispatch_mlp_swiglu_combine_bwd_bf16_accum(
+                *bwd_args, main_grads=main_grads
+            )
+            (d_w_shared_gate, d_w_routed_gate, d_w_shared_up,
+             d_w_routed_up, d_w_shared_down, d_w_routed_down) = main_grads
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
