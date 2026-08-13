@@ -174,7 +174,7 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
                 auto &hidden_fp8_t_smem = reinterpret_cast<quant_fp8_tile &>(up_smem[stage]);
                 auto &hidden_sc_t_smem = *reinterpret_cast<quant_sc_tile *>(reinterpret_cast<uint64_t>(&up_smem[stage]) + sizeof(hidden_fp8_t_smem));
 
-                mxfp8_quantize::mxfp8_quantize_tile<true, true>(hidden_quant_smem, hidden_fp8_smem, hidden_sc_smem, hidden_fp8_t_smem, hidden_sc_t_smem, nullptr, threadIdx.x, 1);
+                mxfp8::quantize_tile<true, true>(hidden_quant_smem, hidden_fp8_smem, hidden_sc_smem, hidden_fp8_t_smem, hidden_sc_t_smem, nullptr, threadIdx.x, 1);
                 __syncthreads();
 
                 if (threadIdx.x == 0) {
@@ -380,8 +380,8 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
 
                     // Dequantize
                     float2 gate_fp32[16], up_fp32[16];
-                    mxfp8_quantize::mxfp8_dequantize_single_block(gate_fp8, (static_cast<uint32_t>(gate_scale_word) >> (k_block_idx * 8)) & 0xFF, gate_fp32);
-                    mxfp8_quantize::mxfp8_dequantize_single_block(up_fp8, (static_cast<uint32_t>(up_scale_word) >> (k_block_idx * 8)) & 0xFF, up_fp32);
+                    mxfp8::dequantize_single_block(gate_fp8, (static_cast<uint32_t>(gate_scale_word) >> (k_block_idx * 8)) & 0xFF, gate_fp32);
+                    mxfp8::dequantize_single_block(up_fp8, (static_cast<uint32_t>(up_scale_word) >> (k_block_idx * 8)) & 0xFF, up_fp32);
 
                     // Apply SwiGLU backward
                     bf16_2 d_gate_bf16[16], d_up_bf16[16];
@@ -393,8 +393,8 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
 
                     // Quantize both gradients; also stage them in BF16 for the transpose-quantize below
                     uint32_t d_gate_fp8[8], d_up_fp8[8];
-                    mxfp8_quantize::mxfp8_quantize_single_block(d_gate_bf16, d_gate_fp8, d_gate_scale_byte[j]);
-                    mxfp8_quantize::mxfp8_quantize_single_block(d_up_bf16, d_up_fp8, d_up_scale_byte[j]);
+                    mxfp8::quantize_single_block(d_gate_bf16, d_gate_fp8, d_gate_scale_byte[j]);
+                    mxfp8::quantize_single_block(d_up_bf16, d_up_fp8, d_up_scale_byte[j]);
                     const uint32_t *d_gate_bf16_words = reinterpret_cast<const uint32_t *>(d_gate_bf16);
                     const uint32_t *d_up_bf16_words = reinterpret_cast<const uint32_t *>(d_up_bf16);
                     #pragma unroll
@@ -425,9 +425,9 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
 
                 // Transpose-quantize both gradients, one per warpgroup; d_gate was staged in the d_hidden tile, d_up in the shared staging buffer
                 if (threadIdx.x < config::QUANT_Mb)
-                    mxfp8_quantize::mxfp8_quantize_tile<false, true>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], nullptr, threadIdx.x, 1);
+                    mxfp8::quantize_tile<false, true>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], nullptr, threadIdx.x, 1);
                 else
-                    mxfp8_quantize::mxfp8_quantize_tile<false, true>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], nullptr, threadIdx.x - config::QUANT_Mb, 2);
+                    mxfp8::quantize_tile<false, true>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], nullptr, threadIdx.x - config::QUANT_Mb, 2);
                 
                 // Store partial router gradient to smem for the first col half to handle later
                 if (tile_col_half != 0) 

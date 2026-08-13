@@ -12,10 +12,15 @@
 
 using namespace kittens;
 
-template <int NUM_DEVICES, utils::RoutedPrecision ROUTED_PRECISION = utils::RoutedPrecision::MXFP8>
+enum class RoutedPrecision {
+    BF16,
+    MXFP8,
+};
+
+template <int NUM_DEVICES, RoutedPrecision ROUTED_PRECISION = RoutedPrecision::MXFP8>
 struct dispatch_mlp_swiglu_combiner {
 
-static constexpr bool USE_MXFP8 = ROUTED_PRECISION == utils::RoutedPrecision::MXFP8;
+static constexpr bool USE_MXFP8 = ROUTED_PRECISION == RoutedPrecision::MXFP8;
 
 #include "types.cuh"
 

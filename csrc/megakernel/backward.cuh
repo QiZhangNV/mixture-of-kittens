@@ -660,13 +660,16 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
-    const int64_t elements_per_expert = d_w_routed_gate.numel() / num_local_experts;
-    utils::zero_empty_routed_wgrads<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
-        reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
-        reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
-        tokens_per_expert.data_ptr<int>(),
-        elements_per_expert);
+
+    utils::zero_empty_routed_wgrads::globals g_zerw {
+        .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
+        .d_w_routed_up = reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
+        .d_w_routed_down = reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
+        .tokens_per_expert = tokens_per_expert.data_ptr<int>(),
+        .elements_per_expert = d_w_routed_gate.numel() / num_local_experts
+    };
+
+    utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
 
     return {d_x_shared, d_x_routed,
             d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
@@ -853,13 +856,17 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
-    const int64_t elements_per_expert = d_w_routed_gate.numel() / num_local_experts;
-    utils::zero_empty_routed_wgrads<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
-        reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
-        reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
-        tokens_per_expert.data_ptr<int>(),
-        elements_per_expert);
+
+    utils::zero_empty_routed_wgrads::globals g_zerw {
+        .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
+        .d_w_routed_up = reinterpret_cast<uint16_t *>(d_w_routed_up.data_ptr<at::BFloat16>()),
+        .d_w_routed_down = reinterpret_cast<uint16_t *>(d_w_routed_down.data_ptr<at::BFloat16>()),
+        .tokens_per_expert = tokens_per_expert.data_ptr<int>(),
+        .elements_per_expert = d_w_routed_gate.numel() / num_local_experts
+    };
+
+    utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
+
     return {d_x_shared, d_x_routed, d_gate_shared, d_gate_routed, d_up_shared, d_up_routed,
             d_hidden_shared, d_hidden_routed, d_y_routed,
             d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down};

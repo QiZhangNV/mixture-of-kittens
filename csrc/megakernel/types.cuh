@@ -50,9 +50,9 @@ using mlp_bf16_d_tile = st_bf<config::MLP_Mb / 2, config::MLP_Nb / config::MLP_E
 using mlp_fp8_d_tile = st_fp8e4m3<config::MLP_Mb / 2, 32>;
 
 // MXFP8 quantize tiles
-using quant_bf16_tile = mxfp8_quantize::globals::x_bf16_tile; // st_bf<128, 128, false>
-using quant_fp8_tile = mxfp8_quantize::globals::x_fp8_tile;   // st_fp8e4m3<128, 128, false>
-using quant_sc_tile = mxfp8_quantize::globals::x_sc_tile;     // st_fp8e8m0<32, 16, false>
+using quant_bf16_tile = mxfp8::globals::x_bf16_tile; // st_bf<128, 128, false>
+using quant_fp8_tile = mxfp8::globals::x_fp8_tile;   // st_fp8e4m3<128, 128, false>
+using quant_sc_tile = mxfp8::globals::x_sc_tile;     // st_fp8e8m0<32, 16, false>
 
 // Fused SwiGLU tiles
 using swiglu_tile = st_bf<config::SWIGLU_Mb, config::SWIGLU_Nb>;

@@ -335,7 +335,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 warpgroup::sync(1);
                 uint32_t d_fp8[8];
                 uint32_t d_scale_byte;
-                mxfp8_quantize::mxfp8_quantize_single_block(d_reg, d_fp8, d_scale_byte);
+                mxfp8::quantize_single_block(d_reg, d_fp8, d_scale_byte);
                 scale_word |= d_scale_byte << ((i % 4) * 8);
                 const uint32_t d_fp8_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&d_fp8_smem));
                 #pragma unroll

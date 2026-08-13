@@ -98,9 +98,9 @@ static __device__ __forceinline__ void dispatch_kernel(
                 if (tid == 0) tma::store_async_read_wait<4 * (config::DISPATCH_OUT_TILES - 1)>();
                 __syncthreads(); // also makes zero-filled rows visible before the first transpose-quantize
                 if constexpr (!SCALE_ROWS)
-                    mxfp8_quantize::mxfp8_quantize_tile<true, true, config::DISPATCH_Nb, true, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
+                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, false>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
                 else
-                    mxfp8_quantize::mxfp8_quantize_tile<true, true, config::DISPATCH_Nb, true, true> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
+                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, true> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
                 __syncthreads(); // quantized tiles must be complete before TMA reads them
 
                 if (tid == 0) {
