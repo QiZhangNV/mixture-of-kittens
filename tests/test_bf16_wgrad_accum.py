@@ -14,12 +14,21 @@ from .utils import (
 
 @pytest.mark.parametrize("leave_one_expert_empty", [False, True])
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize(
+    "routed_weight_storage",
+    ["separate_legacy", "single_grouped_legacy", "single_grouped_native"],
+)
 def test_wgrad_accumulates_directly_into_fp32_main_grad(
     context: tuple[int, int, torch.device],
     leave_one_expert_empty: bool,
     precision: str,
+    routed_weight_storage: str,
 ) -> None:
     rank, world_size, device = context
+    single_grouped = routed_weight_storage != "separate_legacy"
+    native_columnwise = routed_weight_storage == "single_grouped_native"
+    if single_grouped and precision != "mxfp8":
+        pytest.skip("single-grouped storage is an MXFP8-only test mode")
     num_experts = world_size
     num_local_experts = 1
     hidden_dim = 256
@@ -64,15 +73,47 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
         d_output,
     ) = inputs
     if precision == "mxfp8":
-        routed_gate_quantized = mxfp8_quantize(w_routed_gate, True, True)
-        routed_up_quantized = mxfp8_quantize(w_routed_up, True, True)
-        routed_down_quantized = mxfp8_quantize(w_routed_down, True, True)
-        forward_routed_gate = routed_gate_quantized[:2]
-        forward_routed_up = routed_up_quantized[:2]
-        forward_routed_down = routed_down_quantized[:2]
-        backward_routed_gate = routed_gate_quantized
-        backward_routed_up = routed_up_quantized
-        backward_routed_down = routed_down_quantized[2:]
+        if single_grouped:
+            routed_fc1 = torch.cat((w_routed_gate, w_routed_up), dim=1)
+            routed_fc1_quantized = mxfp8_quantize(routed_fc1, True, True)
+            routed_down_quantized = mxfp8_quantize(w_routed_down, True, True)
+            forward_routed_gate = routed_fc1_quantized[:2]
+            forward_routed_up = forward_routed_gate
+            forward_routed_down = routed_down_quantized[:2]
+            if native_columnwise:
+                native_fc1_columnwise = (
+                    routed_fc1_quantized[2]
+                    .transpose(-2, -1)
+                    .contiguous()
+                )
+                backward_routed_gate = (
+                    routed_fc1_quantized[0],
+                    routed_fc1_quantized[1],
+                    native_fc1_columnwise,
+                    routed_fc1_quantized[3],
+                    True,
+                )
+            else:
+                backward_routed_gate = routed_fc1_quantized
+            backward_routed_up = backward_routed_gate
+            if native_columnwise:
+                backward_routed_down = (
+                    routed_down_quantized[2].transpose(-2, -1).contiguous(),
+                    routed_down_quantized[3],
+                    True,
+                )
+            else:
+                backward_routed_down = routed_down_quantized[2:]
+        else:
+            routed_gate_quantized = mxfp8_quantize(w_routed_gate, True, True)
+            routed_up_quantized = mxfp8_quantize(w_routed_up, True, True)
+            routed_down_quantized = mxfp8_quantize(w_routed_down, True, True)
+            forward_routed_gate = routed_gate_quantized[:2]
+            forward_routed_up = routed_up_quantized[:2]
+            forward_routed_down = routed_down_quantized[:2]
+            backward_routed_gate = routed_gate_quantized
+            backward_routed_up = routed_up_quantized
+            backward_routed_down = routed_down_quantized[2:]
         tolerance = MXFP8_TOLERANCE
     else:
         forward_routed_gate = w_routed_gate
@@ -92,7 +133,7 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
         topk_experts,
         num_local_experts=num_local_experts,
     )
-    _, forward_context = functional.forward(
+    output, forward_context = functional.forward(
         config,
         workspace,
         schedule,
@@ -106,14 +147,24 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
         forward_routed_down,
     )
 
-    main_grads = (
-        torch.full_like(w_shared_gate, 0.25, dtype=torch.float32),
-        torch.full_like(w_routed_gate, 0.25, dtype=torch.float32),
-        torch.full_like(w_shared_up, 0.25, dtype=torch.float32),
-        torch.full_like(w_routed_up, 0.25, dtype=torch.float32),
-        torch.full_like(w_shared_down, 0.25, dtype=torch.float32),
-        torch.full_like(w_routed_down, 0.25, dtype=torch.float32),
-    )
+    if single_grouped:
+        routed_fc1_main_grad = torch.full_like(routed_fc1, 0.25, dtype=torch.float32)
+        main_grads = (
+            torch.full_like(w_shared_gate, 0.25, dtype=torch.float32),
+            routed_fc1_main_grad,
+            torch.full_like(w_shared_up, 0.25, dtype=torch.float32),
+            routed_fc1_main_grad,
+            torch.full_like(w_shared_down, 0.25, dtype=torch.float32),
+            torch.full_like(w_routed_down, 0.25, dtype=torch.float32),
+        )
+    else:
+        main_grads = tuple(
+            torch.full_like(weight, 0.25, dtype=torch.float32)
+            for weight in (
+                w_shared_gate, w_routed_gate, w_shared_up,
+                w_routed_up, w_shared_down, w_routed_down,
+            )
+        )
     d_x, d_router_weights, *_ = functional.backward(
         config,
         workspace,
@@ -131,27 +182,44 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
         main_grads=main_grads,
     )
 
-    reference = run_reference_bf16(*inputs)[1:]
+    reference_all = run_reference_bf16(*inputs)
+    check_correctness("output", reference_all[0], output, tolerance, rank == 0)
+    reference = reference_all[1:]
     check_correctness("d_x", reference[0], d_x, tolerance, rank == 0)
     check_correctness(
         "d_router_weights", reference[1], d_router_weights, tolerance, rank == 0
     )
-    reference_wgrads = (
-        reference[5],
-        reference[2],
-        reference[6],
-        reference[3],
-        reference[7],
-        reference[4],
-    )
-    for name, expected, actual in zip(
-        (
+    if single_grouped:
+        reference_wgrads = (
+            reference[5],
+            torch.cat((reference[2], reference[3]), dim=1),
+            reference[6],
+            reference[7],
+            reference[4],
+        )
+        actual_main_grads = (
+            main_grads[0],
+            main_grads[1],
+            main_grads[2],
+            main_grads[4],
+            main_grads[5],
+        )
+        weight_names = (
+            "shared_gate", "routed_fc1", "shared_up",
+            "shared_down", "routed_down",
+        )
+    else:
+        reference_wgrads = (
+            reference[5], reference[2], reference[6],
+            reference[3], reference[7], reference[4],
+        )
+        actual_main_grads = main_grads
+        weight_names = (
             "shared_gate", "routed_gate", "shared_up",
             "routed_up", "shared_down", "routed_down",
-        ),
-        reference_wgrads,
-        main_grads,
-        strict=True,
+        )
+    for name, expected, actual in zip(
+        weight_names, reference_wgrads, actual_main_grads, strict=True,
     ):
         check_correctness(
             f"main_grad/{name}",
