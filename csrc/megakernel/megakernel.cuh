@@ -31,5 +31,6 @@ static constexpr bool USE_MXFP8 = ROUTED_PRECISION == RoutedPrecision::MXFP8;
 
 #include "forward.cuh"
 #include "backward.cuh"
+#include "recompute_forward_context.cuh"
 
 }; // struct dispatch_mlp_swiglu_combiner

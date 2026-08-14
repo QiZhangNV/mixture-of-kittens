@@ -419,3 +419,153 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
     }
 }
+
+static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+recompute_forward_context_mxfp8_entrypoint(
+    // Input buffers
+    const at::Tensor &x,
+    const std::vector<int64_t> &x_ptrs,
+
+    // Weights
+    const at::Tensor &w_shared_gate,
+    const at::Tensor &w_routed_gate,
+    const at::Tensor &w_routed_gate_sc,
+    const at::Tensor &w_shared_up,
+    const at::Tensor &w_routed_up,
+    const at::Tensor &w_routed_up_sc,
+
+    // Dispatch schedule
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
+    const at::Tensor &num_tokens,
+    const at::Tensor &tokens_per_expert,
+
+    // Metadata
+    int topk,
+    std::optional<float> swiglu_limit,
+    int num_comm_sms,
+    int macrobatch_size,
+    int minibatch_size
+) {
+    const int num_devices = static_cast<int>(x_ptrs.size());
+
+    switch (num_devices) {
+        case 1:
+            return dispatch_mlp_swiglu_combiner<1>::recompute_forward_context_mxfp8(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_routed_gate_sc,
+                w_shared_up, w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 4:
+            return dispatch_mlp_swiglu_combiner<4>::recompute_forward_context_mxfp8(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_routed_gate_sc,
+                w_shared_up, w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 8:
+            return dispatch_mlp_swiglu_combiner<8>::recompute_forward_context_mxfp8(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_routed_gate_sc,
+                w_shared_up, w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 16:
+            return dispatch_mlp_swiglu_combiner<16>::recompute_forward_context_mxfp8(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_routed_gate_sc,
+                w_shared_up, w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 32:
+            return dispatch_mlp_swiglu_combiner<32>::recompute_forward_context_mxfp8(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_routed_gate_sc,
+                w_shared_up, w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 64:
+            return dispatch_mlp_swiglu_combiner<64>::recompute_forward_context_mxfp8(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_routed_gate_sc,
+                w_shared_up, w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        default:
+            throw std::runtime_error("MoK: recompute_forward_context_mxfp8 unsupported num_devices=" +
+                                     std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
+    }
+}
+
+static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                           at::Tensor, at::Tensor, at::Tensor>
+recompute_forward_context_bf16_entrypoint(
+    // Input buffers
+    const at::Tensor &x,
+    const std::vector<int64_t> &x_ptrs,
+
+    // Weights
+    const at::Tensor &w_shared_gate,
+    const at::Tensor &w_routed_gate,
+    const at::Tensor &w_shared_up,
+    const at::Tensor &w_routed_up,
+
+    // Dispatch schedule
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
+    const at::Tensor &num_tokens,
+    const at::Tensor &tokens_per_expert,
+
+    // Metadata
+    int topk,
+    std::optional<float> swiglu_limit,
+    int num_comm_sms,
+    int macrobatch_size,
+    int minibatch_size
+) {
+    const int num_devices = static_cast<int>(x_ptrs.size());
+
+    switch (num_devices) {
+        case 1:
+            return dispatch_mlp_swiglu_combiner<1, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 4:
+            return dispatch_mlp_swiglu_combiner<4, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 8:
+            return dispatch_mlp_swiglu_combiner<8, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 16:
+            return dispatch_mlp_swiglu_combiner<16, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 32:
+            return dispatch_mlp_swiglu_combiner<32, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        case 64:
+            return dispatch_mlp_swiglu_combiner<64, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+                x, x_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+        default:
+            throw std::runtime_error("MoK: recompute_forward_context_bf16 unsupported num_devices=" +
+                                     std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
+    }
+}

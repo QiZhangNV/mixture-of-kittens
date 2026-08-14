@@ -935,6 +935,65 @@ def test_fake_tensor_metadata(
                 ((macrobatch_size, hidden_size), torch.bfloat16),
             ),
         )
+        mxfp8_recomputed = ops.recompute_forward_context_mxfp8(
+            x,
+            pointers,
+            shared_gate,
+            routed_gate[0],
+            routed_gate[1],
+            shared_up,
+            routed_up[0],
+            routed_up[1],
+            *schedule,
+            topk,
+            None,
+            2,
+            macrobatch_size,
+            256,
+        )
+        _assert_metadata(
+            mxfp8_recomputed,
+            (
+                ((hidden_size, macrobatch_size), torch.float8_e4m3fn),
+                (
+                    (hidden_size // 128, macrobatch_size // 128, 32, 16),
+                    torch.uint8,
+                ),
+                ((num_local_tokens, intermediate_size), torch.bfloat16),
+                ((macrobatch_size, intermediate_size), torch.float8_e4m3fn),
+                (
+                    (
+                        macrobatch_size // 128,
+                        intermediate_size // 128,
+                        32,
+                        16,
+                    ),
+                    torch.uint8,
+                ),
+                ((num_local_tokens, intermediate_size), torch.bfloat16),
+                ((macrobatch_size, intermediate_size), torch.float8_e4m3fn),
+                (
+                    (
+                        macrobatch_size // 128,
+                        intermediate_size // 128,
+                        32,
+                        16,
+                    ),
+                    torch.uint8,
+                ),
+                ((num_local_tokens, intermediate_size), torch.bfloat16),
+                ((intermediate_size, macrobatch_size), torch.float8_e4m3fn),
+                (
+                    (
+                        intermediate_size // 128,
+                        macrobatch_size // 128,
+                        32,
+                        16,
+                    ),
+                    torch.uint8,
+                ),
+            ),
+        )
         output = ops.fwd_epilogue(
             mxfp8_forward[-2],
             workspace.combine_buffer,
@@ -1074,6 +1133,32 @@ def test_fake_tensor_metadata(
                 ((macrobatch_size, hidden_size), torch.bfloat16),
             ),
         )
+        bf16_recomputed = ops.recompute_forward_context_bf16(
+            x,
+            pointers,
+            shared_gate,
+            routed_gate_bf16,
+            shared_up,
+            routed_up_bf16,
+            *schedule,
+            topk,
+            None,
+            2,
+            macrobatch_size,
+            256,
+        )
+        _assert_metadata(
+            bf16_recomputed,
+            (
+                ((macrobatch_size, hidden_size), torch.bfloat16),
+                ((num_local_tokens, intermediate_size), torch.bfloat16),
+                ((macrobatch_size, intermediate_size), torch.bfloat16),
+                ((num_local_tokens, intermediate_size), torch.bfloat16),
+                ((macrobatch_size, intermediate_size), torch.bfloat16),
+                ((num_local_tokens, intermediate_size), torch.bfloat16),
+                ((macrobatch_size, intermediate_size), torch.bfloat16),
+            ),
+        )
         bf16_backward = ops.dispatch_mlp_swiglu_combine_bwd_bf16(
             workspace.d_y_buffer,
             pointers,
@@ -1138,6 +1223,8 @@ def test_custom_op_mutation_schemas() -> None:
         "mxfp8_quantize": set(),
         "dispatch_mlp_swiglu_combine_fwd_mxfp8": {"combine_buffer"},
         "dispatch_mlp_swiglu_combine_fwd_bf16": {"combine_buffer"},
+        "recompute_forward_context_mxfp8": set(),
+        "recompute_forward_context_bf16": set(),
         "dispatch_mlp_swiglu_combine_bwd_mxfp8": {
             "d_x_routed_buffer",
             "d_router_weight_buffer",
@@ -1432,6 +1519,212 @@ def test_compile_fullgraph(
                 *expected_targets[3:],
             ]
         assert custom_op_targets == expected_targets
+
+
+def test_compile_fullgraph_recomputed_forward_context(
+    context: tuple[int, int, torch.device],
+) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    _, _, real_device = context
+    num_local_tokens = 512
+    hidden_size = 1024
+    intermediate_size = 256
+    num_local_experts = 4
+    topk = 2
+    schedule_capacity = 4096
+    config = functional.MoKConfig(
+        minibatch_size=256,
+        macrobatch_size=512,
+    )
+    expected_metadata = (
+        ((num_local_tokens, hidden_size), torch.bfloat16),
+        ((num_local_tokens, topk), torch.float32),
+        (
+            (num_local_experts, intermediate_size, hidden_size),
+            torch.bfloat16,
+        ),
+        (
+            (num_local_experts, intermediate_size, hidden_size),
+            torch.bfloat16,
+        ),
+        (
+            (num_local_experts, hidden_size, intermediate_size),
+            torch.bfloat16,
+        ),
+        ((intermediate_size, hidden_size), torch.bfloat16),
+        ((intermediate_size, hidden_size), torch.bfloat16),
+        ((hidden_size, intermediate_size), torch.bfloat16),
+    )
+
+    for precision in ("bf16", "mxfp8"):
+        captured_graphs: list[torch.fx.GraphModule] = []
+
+        def capture_backend(
+            graph_module: torch.fx.GraphModule,
+            _example_inputs: list[torch.Tensor],
+        ) -> Callable[..., tuple[torch.Tensor, ...]]:
+            captured_graphs.append(graph_module)
+            return graph_module.forward
+
+        with FakeTensorMode():
+            device = torch.device("cuda", real_device.index)
+
+            def tensor(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+                return torch.empty(shape, device=device, dtype=dtype)
+
+            workspace = _make_fake_workspace(
+                device,
+                num_local_tokens=num_local_tokens,
+                hidden_size=hidden_size,
+                topk=topk,
+                schedule_capacity=schedule_capacity,
+            )
+            schedule = functional.MoKSchedule(
+                peer_rank=tensor((schedule_capacity,), torch.int32),
+                peer_token_idx=tensor((schedule_capacity,), torch.int32),
+                num_tokens=tensor((1,), torch.int32),
+                tokens_per_expert=tensor(
+                    (num_local_experts,),
+                    torch.int32,
+                ),
+            )
+            x = tensor((num_local_tokens, hidden_size), torch.bfloat16)
+            router_weights = tensor(
+                (num_local_tokens, topk),
+                torch.float32,
+            )
+            grad_output = tensor(
+                (num_local_tokens, hidden_size),
+                torch.bfloat16,
+            )
+            shared_gate = tensor(
+                (intermediate_size, hidden_size),
+                torch.bfloat16,
+            )
+            shared_up = tensor(
+                (intermediate_size, hidden_size),
+                torch.bfloat16,
+            )
+            shared_down = tensor(
+                (hidden_size, intermediate_size),
+                torch.bfloat16,
+            )
+            routed_gate_bf16 = tensor(
+                (num_local_experts, intermediate_size, hidden_size),
+                torch.bfloat16,
+            )
+            routed_up_bf16 = tensor(
+                (num_local_experts, intermediate_size, hidden_size),
+                torch.bfloat16,
+            )
+            routed_down_bf16 = tensor(
+                (num_local_experts, hidden_size, intermediate_size),
+                torch.bfloat16,
+            )
+
+            if precision == "bf16":
+                routed_gate_forward = routed_gate_bf16
+                routed_up_forward = routed_up_bf16
+                routed_gate_backward = routed_gate_bf16
+                routed_up_backward = routed_up_bf16
+                routed_down_backward = routed_down_bf16
+            else:
+                routed_gate_quantized = ops.mxfp8_quantize(
+                    routed_gate_bf16,
+                    True,
+                    True,
+                )
+                routed_up_quantized = ops.mxfp8_quantize(
+                    routed_up_bf16,
+                    True,
+                    True,
+                )
+                routed_down_quantized = ops.mxfp8_quantize(
+                    routed_down_bf16,
+                    True,
+                    True,
+                )
+                routed_gate_forward = routed_gate_quantized[:2]
+                routed_up_forward = routed_up_quantized[:2]
+                routed_gate_backward = routed_gate_quantized
+                routed_up_backward = routed_up_quantized
+                routed_down_backward = routed_down_quantized[2:]
+
+            def recomputed_backward_path(
+                x: torch.Tensor,
+                router_weights: torch.Tensor,
+                grad_output: torch.Tensor,
+                shared_gate: torch.Tensor,
+                shared_up: torch.Tensor,
+                shared_down: torch.Tensor,
+            ) -> tuple[torch.Tensor, ...]:
+                forward_context = functional.recompute_forward_context(
+                    config,
+                    workspace,
+                    schedule,
+                    x,
+                    shared_gate,
+                    shared_up,
+                    routed_gate_forward,
+                    routed_up_forward,
+                )
+                return functional.backward(
+                    config,
+                    workspace,
+                    schedule,
+                    forward_context,
+                    grad_output,
+                    x,
+                    router_weights,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                    routed_gate_backward,
+                    routed_up_backward,
+                    routed_down_backward,
+                )
+
+            torch._dynamo.reset()
+            compiled = torch.compile(
+                recomputed_backward_path,
+                backend=capture_backend,
+                fullgraph=True,
+            )
+            outputs = compiled(
+                x,
+                router_weights,
+                grad_output,
+                shared_gate,
+                shared_up,
+                shared_down,
+            )
+            repeated_outputs = compiled(
+                x,
+                router_weights,
+                grad_output,
+                shared_gate,
+                shared_up,
+                shared_down,
+            )
+            _assert_metadata(outputs, expected_metadata)
+            _assert_metadata(repeated_outputs, expected_metadata)
+
+        assert len(captured_graphs) == 1
+        custom_op_targets = [
+            str(node.target)
+            for node in captured_graphs[0].graph.nodes
+            if node.op == "call_function" and "mok" in str(node.target)
+        ]
+        assert custom_op_targets == [
+            "mok.barrier_all.default",
+            f"mok.recompute_forward_context_{precision}.default",
+            "mok.barrier_all.default",
+            "mok.barrier_all.default",
+            f"mok.dispatch_mlp_swiglu_combine_bwd_{precision}.default",
+            "mok.barrier_all.default",
+            "mok.bwd_epilogue.default",
+        ]
 
 
 def test_compiled_barrier_updates_state(

@@ -12,6 +12,8 @@ from .ops import (
     bwd_epilogue,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
+    recompute_forward_context_mxfp8,
+    recompute_forward_context_bf16,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fwd_epilogue,
@@ -428,7 +430,7 @@ def validate_inputs(
     workspace: MoKWorkspace,
     schedule: MoKSchedule,
     x: torch.Tensor,
-    router_weights: torch.Tensor,
+    router_weights: torch.Tensor | None = None,
     grad_output: torch.Tensor | None = None,
 ) -> None:
     """Validates runtime inputs against the workspace and schedule.
@@ -438,7 +440,7 @@ def validate_inputs(
         workspace:      MoKWorkspace
         schedule:       MoKSchedule
         x:              bfloat16 [num_local_tokens, hidden_size]
-        router_weights: float32 [num_local_tokens, topk]
+        router_weights: float32 [num_local_tokens, topk] | None
         grad_output:    bfloat16 [num_local_tokens, hidden_size] | None
 
     Outputs:
@@ -454,7 +456,8 @@ def validate_inputs(
     tensors = [("x", x, torch.bfloat16, expected_activation_shape)]
     if grad_output is not None:
         tensors.append(("grad_output", grad_output, torch.bfloat16, expected_activation_shape))
-    tensors.append(("router_weights", router_weights, torch.float32, (workspace.num_local_tokens, workspace.topk)))
+    if router_weights is not None:
+        tensors.append(("router_weights", router_weights, torch.float32, (workspace.num_local_tokens, workspace.topk)))
     for tensor_name, tensor, expected_dtype, expected_shape in tensors:
         if not tensor.is_cuda or tensor.device != workspace.device or tensor.dtype != expected_dtype or not tensor.is_contiguous():
             raise ValueError(f"{tensor_name} must be contiguous {expected_dtype} on the workspace CUDA device")
@@ -563,6 +566,87 @@ def forward(
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     output = fwd_epilogue(y_shared, workspace.combine_buffer, workspace.router_weight_buffer)
     return output, forward_context
+
+
+def recompute_forward_context(
+    config: MoKConfig,
+    workspace: MoKWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    shared_gate_weights: torch.Tensor,
+    shared_up_weights: torch.Tensor,
+    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    swiglu_limit: float | None = None,
+) -> MoKForwardContext:
+    """Recomputes the intermediates needed by the MoK backward pass.
+
+    Inputs:
+        config:              MoKConfig
+        workspace:           MoKWorkspace
+        schedule:            MoKSchedule
+        x:                   bfloat16 [num_local_tokens, hidden_size]
+        shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
+        shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
+        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
+        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
+        swiglu_limit:        float | None
+
+    Outputs:
+        forward_context: MoKForwardContext
+    """
+    validate_inputs(config, workspace, schedule, x)
+    if isinstance(routed_gate_weights, tuple) != isinstance(routed_up_weights, tuple):
+        raise TypeError("routed gate and up weights must use the same precision representation")
+    if isinstance(routed_gate_weights, tuple) and (len(routed_gate_weights) != 2 or len(routed_up_weights) != 2):
+        raise ValueError("MXFP8 routed gate and up weights must be data/scale pairs")
+
+    workspace.x_buffer.copy_(x)
+    barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
+                workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
+
+    if isinstance(routed_gate_weights, tuple):
+        routed_gate_weights_fp8, routed_gate_weights_sc = routed_gate_weights
+        routed_up_weights_fp8, routed_up_weights_sc = routed_up_weights
+        (x_fp8_t_routed, x_sc_t_routed,
+         gate_shared, gate_fp8_routed, gate_sc_routed,
+         up_shared, up_fp8_routed, up_sc_routed,
+         hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed) = recompute_forward_context_mxfp8(
+            workspace.x_buffer, workspace.x_buffer_ptrs,
+            shared_gate_weights, routed_gate_weights_fp8, routed_gate_weights_sc,
+            shared_up_weights, routed_up_weights_fp8, routed_up_weights_sc,
+            schedule.peer_rank, schedule.peer_token_idx,
+            schedule.num_tokens, schedule.tokens_per_expert,
+            workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
+            config.macrobatch_size, config.minibatch_size,
+        )
+        x_routed = (x_fp8_t_routed, x_sc_t_routed)
+        gate_routed = (gate_fp8_routed, gate_sc_routed)
+        up_routed = (up_fp8_routed, up_sc_routed)
+        hidden_routed = (hidden_fp8_t_routed, hidden_sc_t_routed)
+    else:
+        (x_routed, gate_shared, gate_routed, up_shared, up_routed,
+         hidden_shared, hidden_routed) = recompute_forward_context_bf16(
+            workspace.x_buffer, workspace.x_buffer_ptrs,
+            shared_gate_weights, routed_gate_weights,
+            shared_up_weights, routed_up_weights,
+            schedule.peer_rank, schedule.peer_token_idx,
+            schedule.num_tokens, schedule.tokens_per_expert,
+            workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
+            config.macrobatch_size, config.minibatch_size,
+        )
+
+    barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
+                workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
+    return MoKForwardContext(
+        x_routed=x_routed,
+        gate_shared=gate_shared,
+        gate_routed=gate_routed,
+        up_shared=up_shared,
+        up_routed=up_routed,
+        hidden_shared=hidden_shared,
+        hidden_routed=hidden_routed,
+    )
 
 
 def backward(

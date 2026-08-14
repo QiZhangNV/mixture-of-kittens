@@ -273,3 +273,69 @@ struct globals_bwd {
         return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_bwd_tasks + num_replay_minibatches * minibatch_replay_tasks + num_macrobatches * wgrad_tasks) + num_comm_sms);
     }
 };
+
+struct globals_recompute_forward_context {
+    // Recomputed forward activations
+    mlp_bf16_gl x_shared;                     // (num_local_tokens, H) gate/up GEMM A
+    routed_activation_gl x_fp8_routed;        // (macrobatch_size, H) gate/up GEMM A + dispatch out
+    routed_sc_gl x_sc_routed;                 // MXFP8 only: (macrobatch_size / 128, H / 128, 32, 16)
+    routed_transposed_gl x_fp8_t_routed;      // MXFP8 only: (H, macrobatch_size) dispatch out
+    routed_sc_gl x_sc_t_routed;               // MXFP8 only: (H / 128, macrobatch_size / 128, 32, 16)
+    epi_bf16_gl gate_shared;                  // (num_local_tokens, I) gate GEMM D + swiglu in
+    epi_bf16_gl gate_routed;                  // (macrobatch_size, I) gate GEMM D + swiglu in
+    routed_gate_up_gl gate_fp8_routed;        // (macrobatch_size, I) routed gate saved for backward
+    routed_sc_gl gate_sc_routed;              // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
+    epi_bf16_gl up_shared;                    // (num_local_tokens, I) up GEMM D + swiglu in
+    epi_bf16_gl up_routed;                    // (macrobatch_size, I) up GEMM D + swiglu in
+    routed_gate_up_gl up_fp8_routed;          // (macrobatch_size, I) routed up saved for backward
+    routed_sc_gl up_sc_routed;                // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
+    mlp_bf16_gl hidden_shared;                // (num_local_tokens, I) swiglu out + down GEMM A
+    routed_activation_gl hidden_fp8_routed;   // (macrobatch_size, I) swiglu out + down GEMM A
+    routed_sc_gl hidden_sc_routed;            // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
+    routed_transposed_gl hidden_fp8_t_routed; // MXFP8 only: (I, macrobatch_size) swiglu out
+    routed_sc_gl hidden_sc_t_routed;          // MXFP8 only: (I / 128, macrobatch_size / 128, 32, 16)
+
+    // Symmetric buffers
+    activation_bf16_pgl x_routed_send_buffer; // (num_local_tokens, H)
+
+    // Weights
+    weight_bf16_gl w_shared_gate;             // (I, H)
+    routed_weight_gl w_routed_gate;           // (num_local_experts, I, H)
+    routed_sc_gl w_routed_gate_sc;            // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    weight_bf16_gl w_shared_up;               // (I, H)
+    routed_weight_gl w_routed_up;             // (num_local_experts, I, H)
+    routed_sc_gl w_routed_up_sc;              // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+
+    // Schedules
+    index_gl schedule_peer_rank;              // (schedule_capacity,)
+    index_gl schedule_peer_token_idx;         // (schedule_capacity,)
+    index_gl num_tokens;                      // (1,)
+    index_gl tokens_per_expert;               // (num_local_experts,)
+
+    // Barrier
+    index_gl gate_up_tile_ready;              // (shared_gate_up_tasks + routed_gate_up_tasks,)
+    index_gl hidden_row_block_ready;          // (shared_row_blocks + routed_row_blocks,)
+    index_gl x_routed_ready;                  // (num_minibatches,)
+
+    const int topk;
+    const float swiglu_limit;
+    const int num_comm_sms;
+    const int macrobatch_size;
+    const int minibatch_size;
+
+    __host__ inline dim3 grid() const {
+        const int routed_capacity = min(schedule_peer_rank.cols(), macrobatch_size);
+        const int num_minibatches = (routed_capacity + minibatch_size - 1) / minibatch_size;
+        const int shared_row_blocks = x_shared.rows() / config::MLP_Mb;
+        const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
+        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
+        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
+        const int shared_swiglu_tiles = (hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb);
+        const int minibatch_routed_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
+        const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+        const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+        const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks;
+        const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks;
+        return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks) + num_comm_sms);
+    }
+};
