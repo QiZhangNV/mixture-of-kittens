@@ -133,19 +133,6 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
         topk_experts,
         num_local_experts=num_local_experts,
     )
-    output, forward_context = functional.forward(
-        config,
-        workspace,
-        schedule,
-        x,
-        router_weights,
-        w_shared_gate,
-        w_shared_up,
-        w_shared_down,
-        forward_routed_gate,
-        forward_routed_up,
-        forward_routed_down,
-    )
 
     if single_grouped:
         routed_fc1_main_grad = torch.full_like(routed_fc1, 0.25, dtype=torch.float32)
@@ -165,22 +152,40 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
                 w_routed_up, w_shared_down, w_routed_down,
             )
         )
-    d_x, d_router_weights, *_ = functional.backward(
-        config,
-        workspace,
-        schedule,
-        forward_context,
-        d_output,
-        x,
-        router_weights,
-        w_shared_gate,
-        w_shared_up,
-        w_shared_down,
-        backward_routed_gate,
-        backward_routed_up,
-        backward_routed_down,
-        main_grads=main_grads,
-    )
+    # MCore calls the fused backward once per microbatch and expects every call
+    # to add into the same FP32 main_grad buffers. Exercise that lifecycle,
+    # rather than validating only one add into a pre-filled tensor.
+    num_accumulations = 3
+    for _ in range(num_accumulations):
+        output, forward_context = functional.forward(
+            config,
+            workspace,
+            schedule,
+            x,
+            router_weights,
+            w_shared_gate,
+            w_shared_up,
+            w_shared_down,
+            forward_routed_gate,
+            forward_routed_up,
+            forward_routed_down,
+        )
+        d_x, d_router_weights, *_ = functional.backward(
+            config,
+            workspace,
+            schedule,
+            forward_context,
+            d_output,
+            x,
+            router_weights,
+            w_shared_gate,
+            w_shared_up,
+            w_shared_down,
+            backward_routed_gate,
+            backward_routed_up,
+            backward_routed_down,
+            main_grads=main_grads,
+        )
 
     reference_all = run_reference_bf16(*inputs)
     check_correctness("output", reference_all[0], output, tolerance, rank == 0)
@@ -223,8 +228,8 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
     ):
         check_correctness(
             f"main_grad/{name}",
-            expected.float() + 0.25,
+            expected.float() * num_accumulations + 0.25,
             actual,
-            tolerance,
+            (tolerance[0] * num_accumulations, tolerance[1]),
             rank == 0,
         )
