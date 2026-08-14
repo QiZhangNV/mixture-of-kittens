@@ -29,8 +29,10 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
     native_columnwise = routed_weight_storage == "single_grouped_native"
     if single_grouped and precision != "mxfp8":
         pytest.skip("single-grouped storage is an MXFP8-only test mode")
-    num_experts = world_size
-    num_local_experts = 1
+    # Exercise both the gate/up offset within FC1 and the expert stride between
+    # adjacent slices in one single-grouped parameter.
+    num_local_experts = 2
+    num_experts = world_size * num_local_experts
     hidden_dim = 256
     intermediate_dim = 256
     topk = 1
