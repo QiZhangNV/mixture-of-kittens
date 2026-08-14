@@ -228,12 +228,11 @@ def create_workspace(
     d_y_buffer_ptrs = [int(d_y_buffer_handle.buffer_ptrs[peer_rank])
                        for peer_rank in range(ep_size)]
 
-    # Forward combine and backward routed-dX use the same shape and symmetric
-    # addressing, but their lifetimes do not overlap. Reuse the forward
-    # storage in backward instead of keeping a second top-k hidden buffer.
-    d_x_routed_buffer = combine_buffer
-    d_x_routed_buffer_handle = combine_buffer_handle
-    d_x_routed_buffer_ptrs = combine_buffer_ptrs
+    d_x_routed_buffer = symm_mem.empty(num_local_tokens * topk, hidden_size,
+                                      dtype=torch.bfloat16, device=device)
+    d_x_routed_buffer_handle = symm_mem.rendezvous(d_x_routed_buffer, group_name)
+    d_x_routed_buffer_ptrs = [int(d_x_routed_buffer_handle.buffer_ptrs[peer_rank])
+                              for peer_rank in range(ep_size)]
 
     router_weight_buffer = symm_mem.empty(num_local_tokens, topk, dtype=torch.float32, device=device)
     router_weight_buffer_handle = symm_mem.rendezvous(router_weight_buffer, group_name)
