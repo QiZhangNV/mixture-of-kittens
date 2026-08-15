@@ -3286,7 +3286,10 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
         .w_routed_up_T = make_routed_weight_view(
             w_routed_up, intermediate_dim, hidden_dim,
-            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0),
+            // BF16 dgrad consumes the normal [I, H] payload through the
+            // K-major 64x128 TMA tile, so this offset is measured in
+            // MLP_BF16_Kb rows rather than the forward 128-row tile.
+            single_grouped_fc1 ? intermediate_dim / config::MLP_BF16_Kb : 0),
         .w_routed_up_T_sc = {},
         .w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down),
         .w_routed_down_T = make_routed_weight_view(w_routed_down, hidden_dim, intermediate_dim),

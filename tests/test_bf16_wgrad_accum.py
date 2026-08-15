@@ -27,8 +27,6 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
     rank, world_size, device = context
     single_grouped = routed_weight_storage != "separate_legacy"
     native_columnwise = routed_weight_storage == "single_grouped_native"
-    if single_grouped and precision != "mxfp8":
-        pytest.skip("single-grouped storage is an MXFP8-only test mode")
     # Exercise both the gate/up offset within FC1 and the expert stride between
     # adjacent slices in one single-grouped parameter.
     num_local_experts = 2
@@ -118,11 +116,16 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
             backward_routed_down = routed_down_quantized[2:]
         tolerance = MXFP8_TOLERANCE
     else:
-        forward_routed_gate = w_routed_gate
-        forward_routed_up = w_routed_up
+        if single_grouped:
+            routed_fc1 = torch.cat((w_routed_gate, w_routed_up), dim=1)
+            forward_routed_gate = routed_fc1
+            forward_routed_up = routed_fc1
+        else:
+            forward_routed_gate = w_routed_gate
+            forward_routed_up = w_routed_up
         forward_routed_down = w_routed_down
-        backward_routed_gate = w_routed_gate
-        backward_routed_up = w_routed_up
+        backward_routed_gate = forward_routed_gate
+        backward_routed_up = forward_routed_up
         backward_routed_down = w_routed_down
         tolerance = BF16_TOLERANCE
     if leave_one_expert_empty:
