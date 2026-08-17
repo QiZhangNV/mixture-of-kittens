@@ -1,4 +1,7 @@
+from typing import Any
+
 import torch
+
 
 from . import _C
 
@@ -808,6 +811,47 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     )
 
 
+def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+    *args: Any,
+    main_grads: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+) -> tuple[torch.Tensor, ...]:
+    """Runs MXFP8 backward and accumulates wgrad directly into FP32 buffers.
+
+    ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_mxfp8`.
+    ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
+    up, shared down, routed down. The returned tuple contains only the twelve
+    non-weight-gradient outputs; the six weight gradients are side effects.
+
+    This eager wrapper is separate from the original custom op because custom
+    op outputs may not alias mutated inputs.
+    """
+    if len(main_grads) != 6:
+        raise ValueError("main_grads must contain six tensors")
+    for name, main_grad in zip(
+        (
+            "shared_gate", "routed_gate", "shared_up",
+            "routed_up", "shared_down", "routed_down",
+        ),
+        main_grads,
+        strict=True,
+    ):
+        if not main_grad.is_cuda or main_grad.dtype != torch.float32:
+            raise TypeError(f"main_grad_{name} must be a CUDA float32 tensor")
+        if not main_grad.is_contiguous():
+            raise ValueError(f"main_grad_{name} must be contiguous")
+    outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+        *args, *main_grads
+    )
+    return outputs[:12]
+
+
 @torch.library.custom_op(
     "mok::dispatch_mlp_swiglu_combine_bwd_bf16",
     mutates_args=("d_x_routed_buffer", "d_router_weight_buffer", "x_routed", "gate_routed", "up_routed", "hidden_routed"),
@@ -1006,6 +1050,43 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
     )
+
+
+def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
+    *args: Any,
+    main_grads: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+) -> tuple[torch.Tensor, ...]:
+    """Runs BF16 backward and accumulates wgrad directly into FP32 buffers.
+
+    ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_bf16`.
+    ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
+    up, shared down, routed down. The returned tuple contains only the nine
+    non-weight-gradient outputs; the six weight gradients are side effects.
+
+    This eager wrapper is intentionally separate from the original custom op:
+    PyTorch custom-op outputs may not alias mutated inputs, while the C++ entry
+    point returns the supplied buffers for convenient internal bookkeeping.
+    """
+    if len(main_grads) != 6:
+        raise ValueError("main_grads must contain six tensors")
+    for name, main_grad in zip(
+        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
+        main_grads,
+        strict=True,
+    ):
+        if not main_grad.is_cuda or main_grad.dtype != torch.float32:
+            raise TypeError(f"main_grad_{name} must be a CUDA float32 tensor")
+        if not main_grad.is_contiguous():
+            raise ValueError(f"main_grad_{name} must be contiguous")
+    outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(*args, *main_grads)
+    return outputs[:9]
 
 
 @torch.library.custom_op("mok::fwd_epilogue", mutates_args=())
