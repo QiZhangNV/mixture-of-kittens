@@ -889,7 +889,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         torch.Tensor,
     ],
 ) -> tuple[torch.Tensor, ...]:
-    """Runs MXFP8 backward and accumulates wgrad directly into FP32 buffers.
+    """Runs MXFP8 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
     ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_mxfp8`.
     ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
@@ -901,6 +901,9 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     """
     if len(main_grads) != 6:
         raise ValueError("main_grads must contain six tensors")
+    main_grad_dtype = main_grads[0].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
     for name, main_grad in zip(
         (
             "shared_gate", "routed_gate", "shared_up",
@@ -909,8 +912,10 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         main_grads,
         strict=True,
     ):
-        if not main_grad.is_cuda or main_grad.dtype != torch.float32:
-            raise TypeError(f"main_grad_{name} must be a CUDA float32 tensor")
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
         if not main_grad.is_contiguous():
             raise ValueError(f"main_grad_{name} must be contiguous")
     outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
@@ -1136,7 +1141,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
         torch.Tensor,
     ],
 ) -> tuple[torch.Tensor, ...]:
-    """Runs BF16 backward and accumulates wgrad directly into FP32 buffers.
+    """Runs BF16 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
     ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_bf16`.
     ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
@@ -1149,13 +1154,18 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
     """
     if len(main_grads) != 6:
         raise ValueError("main_grads must contain six tensors")
+    main_grad_dtype = main_grads[0].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
     for name, main_grad in zip(
         ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
         main_grads,
         strict=True,
     ):
-        if not main_grad.is_cuda or main_grad.dtype != torch.float32:
-            raise TypeError(f"main_grad_{name} must be a CUDA float32 tensor")
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
         if not main_grad.is_contiguous():
             raise ValueError(f"main_grad_{name} must be contiguous")
     outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(*args, *main_grads)

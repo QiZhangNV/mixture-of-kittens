@@ -13,10 +13,12 @@
 using namespace kittens;
 
 template <int NUM_DEVICES, utils::RoutedPrecision ROUTED_PRECISION = utils::RoutedPrecision::MXFP8,
-          bool ACCUMULATE_WGRAD = false>
+          bool ACCUMULATE_WGRAD = false, bool BF16_MAIN_GRAD = false>
 struct dispatch_mlp_swiglu_combiner {
 
 static constexpr bool USE_MXFP8 = ROUTED_PRECISION == utils::RoutedPrecision::MXFP8;
+static_assert(ACCUMULATE_WGRAD || !BF16_MAIN_GRAD,
+              "BF16_MAIN_GRAD is only meaningful for fused wgrad accumulation");
 
 struct config {
     // Grouped GEMM
@@ -95,7 +97,8 @@ using activation_bf16_pgl = std::array<bf16 *, NUM_DEVICES>; // lightweight pgl
 using weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_tile, mlp_bf16_t_tile>;
 using d_weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_d_tile>;
 using d_weight_fp32_gl = gl<float, 1, -1, -1, -1, mlp_fp32_d_tile>;
-using d_weight_gl = std::conditional_t<ACCUMULATE_WGRAD, d_weight_fp32_gl, d_weight_bf16_gl>;
+using d_weight_gl = std::conditional_t<ACCUMULATE_WGRAD && !BF16_MAIN_GRAD,
+                                       d_weight_fp32_gl, d_weight_bf16_gl>;
 using weight_fp8_gl = gl<fp8e4m3, 1, -1, -1, -1, mlp_fp8_tile, mlp_fp8_mn_tile>;
 using sc_gl = gl<fp8e8m0, -1, -1, 32, 16, mlp_sc_tile>;
 
@@ -1570,7 +1573,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
         auto store_bf16 = [&]() {
-          if constexpr (!(IS_WGRAD && ACCUMULATE_WGRAD)) {
+          if constexpr (!(IS_WGRAD && ACCUMULATE_WGRAD && !BF16_MAIN_GRAD)) {
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
@@ -1599,7 +1602,13 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                         row_tile += d_gmem.row_tile_offset;
                         col_tile += d_gmem.col_tile_offset;
                     }
-                    if (is_first_wgrad_contribution) {
+                    if constexpr (ACCUMULATE_WGRAD) {
+                        // main_grad already contains contributions from earlier
+                        // microbatches, so every contribution is additive.
+                        warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                            d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                            {tile_coord.z, row_tile, col_tile});
+                    } else if (is_first_wgrad_contribution) {
                         warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
                             d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
                             {tile_coord.z, row_tile, col_tile});
@@ -1685,7 +1694,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             store_bf16();
           }
         } else {
-            if constexpr (IS_WGRAD && ACCUMULATE_WGRAD) {
+            if constexpr (IS_WGRAD && ACCUMULATE_WGRAD && !BF16_MAIN_GRAD) {
                 // The Tensor Core accumulator is already FP32. Keep it FP32 and use
                 // TMA reduction stores to accumulate directly into MCore main_grad,
                 // avoiding the BF16 temporary-gradient write/read round trip.
@@ -2883,13 +2892,16 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     if constexpr (ACCUMULATE_WGRAD) {
         TORCH_CHECK(main_grad_shared_gate && main_grad_routed_gate && main_grad_shared_up &&
                     main_grad_routed_up && main_grad_shared_down && main_grad_routed_down,
-                    "MoK: all six FP32 main_grad tensors are required for fused accumulation");
+                    "MoK: all six main_grad tensors are required for fused accumulation");
         auto validate_main_grad = [&](const at::Tensor &main_grad,
                                       const std::vector<int64_t> &expected_shape,
                                       const char *name) {
             TORCH_CHECK(main_grad.is_cuda(), "MoK: ", name, " must be a CUDA tensor");
-            TORCH_CHECK(main_grad.scalar_type() == at::kFloat,
-                        "MoK: ", name, " must have dtype float32");
+            constexpr at::ScalarType expected_dtype =
+                BF16_MAIN_GRAD ? at::kBFloat16 : at::kFloat;
+            TORCH_CHECK(main_grad.scalar_type() == expected_dtype,
+                        "MoK: ", name, " must have dtype ",
+                        BF16_MAIN_GRAD ? "bfloat16" : "float32");
             TORCH_CHECK(main_grad.sizes().vec() == expected_shape,
                         "MoK: ", name, " has the wrong shape");
             TORCH_CHECK(main_grad.device() == x.device(),
@@ -3169,13 +3181,16 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     if constexpr (ACCUMULATE_WGRAD) {
         TORCH_CHECK(main_grad_shared_gate && main_grad_routed_gate && main_grad_shared_up &&
                     main_grad_routed_up && main_grad_shared_down && main_grad_routed_down,
-                    "MoK: all six FP32 main_grad tensors are required for fused accumulation");
+                    "MoK: all six main_grad tensors are required for fused accumulation");
         auto validate_main_grad = [&](const at::Tensor &main_grad,
                                       const at::Tensor &weight,
                                       const char *name) {
             TORCH_CHECK(main_grad.is_cuda(), "MoK: ", name, " must be a CUDA tensor");
-            TORCH_CHECK(main_grad.scalar_type() == at::kFloat,
-                        "MoK: ", name, " must have dtype float32");
+            constexpr at::ScalarType expected_dtype =
+                BF16_MAIN_GRAD ? at::kBFloat16 : at::kFloat;
+            TORCH_CHECK(main_grad.scalar_type() == expected_dtype,
+                        "MoK: ", name, " must have dtype ",
+                        BF16_MAIN_GRAD ? "bfloat16" : "float32");
             TORCH_CHECK(main_grad.sizes() == weight.sizes(),
                         "MoK: ", name, " shape does not match weight shape");
             TORCH_CHECK(main_grad.device() == weight.device(),
@@ -3694,8 +3709,9 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     const at::Tensor &main_grad_routed_down
 ) {
     auto dispatch_for_ep = [&]<int EP_SIZE>() {
-        return dispatch_mlp_swiglu_combiner<
-            EP_SIZE, utils::RoutedPrecision::MXFP8, true
+        auto dispatch_for_main_grad = [&]<bool USE_BF16_MAIN_GRAD>() {
+            return dispatch_mlp_swiglu_combiner<
+                EP_SIZE, utils::RoutedPrecision::MXFP8, true, USE_BF16_MAIN_GRAD
         >::dispatch_mlp_swiglu_combine_bwd_mxfp8(
             d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
             router_weight_buffer, router_weight_buffer_ptrs,
@@ -3715,6 +3731,13 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
             &main_grad_shared_gate, &main_grad_routed_gate,
             &main_grad_shared_up, &main_grad_routed_up,
             &main_grad_shared_down, &main_grad_routed_down);
+        };
+        const at::ScalarType main_grad_dtype = main_grad_shared_gate.scalar_type();
+        TORCH_CHECK(main_grad_dtype == at::kFloat || main_grad_dtype == at::kBFloat16,
+                    "MoK: main_grad tensors must have dtype float32 or bfloat16");
+        if (main_grad_dtype == at::kBFloat16)
+            return dispatch_for_main_grad.template operator()<true>();
+        return dispatch_for_main_grad.template operator()<false>();
     };
     switch (x_ptrs.size()) {
         case 4: return dispatch_for_ep.template operator()<4>();
@@ -3778,10 +3801,11 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
                 main_grad_routed_up.has_value() == accumulate_wgrad &&
                 main_grad_shared_down.has_value() == accumulate_wgrad &&
                 main_grad_routed_down.has_value() == accumulate_wgrad,
-                "MoK: FP32 main_grad tensors must be provided all together");
+                "MoK: main_grad tensors must be provided all together");
     auto dispatch_for_ep = [&]<int EP_SIZE>() {
-        if (accumulate_wgrad)
-            return dispatch_mlp_swiglu_combiner<EP_SIZE, utils::RoutedPrecision::BF16, true>::dispatch_mlp_swiglu_combine_bwd_bf16(
+        if (accumulate_wgrad) {
+            auto dispatch_for_main_grad = [&]<bool USE_BF16_MAIN_GRAD>() {
+                return dispatch_mlp_swiglu_combiner<EP_SIZE, utils::RoutedPrecision::BF16, true, USE_BF16_MAIN_GRAD>::dispatch_mlp_swiglu_combine_bwd_bf16(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
@@ -3790,6 +3814,14 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
                 &*main_grad_shared_gate, &*main_grad_routed_gate, &*main_grad_shared_up,
                 &*main_grad_routed_up, &*main_grad_shared_down, &*main_grad_routed_down);
+            };
+            const at::ScalarType main_grad_dtype = main_grad_shared_gate->scalar_type();
+            TORCH_CHECK(main_grad_dtype == at::kFloat || main_grad_dtype == at::kBFloat16,
+                        "MoK: main_grad tensors must have dtype float32 or bfloat16");
+            if (main_grad_dtype == at::kBFloat16)
+                return dispatch_for_main_grad.template operator()<true>();
+            return dispatch_for_main_grad.template operator()<false>();
+        }
         return dispatch_mlp_swiglu_combiner<EP_SIZE, utils::RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
             d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
             router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,

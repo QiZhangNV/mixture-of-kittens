@@ -630,7 +630,7 @@ def backward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 tensor tuple
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 tensor tuple
         swiglu_limit:        float | None
-        main_grads:          optional FP32 buffers ordered as shared gate,
+        main_grads:          optional FP32 or BF16 buffers ordered as shared gate,
                              routed gate, shared up, routed up, shared down,
                              routed down; wgrad is accumulated in-place
 

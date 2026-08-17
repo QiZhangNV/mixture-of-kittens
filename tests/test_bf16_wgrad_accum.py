@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 
@@ -13,14 +15,16 @@ from .utils import (
 
 
 @pytest.mark.parametrize("leave_one_expert_empty", [False, True])
+@pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 @pytest.mark.parametrize(
     "routed_weight_storage",
     ["separate_legacy", "single_grouped_legacy", "single_grouped_native"],
 )
-def test_wgrad_accumulates_directly_into_fp32_main_grad(
+def test_wgrad_accumulates_directly_into_main_grad(
     context: tuple[int, int, torch.device],
     leave_one_expert_empty: bool,
+    main_grad_dtype: torch.dtype,
     precision: str,
     routed_weight_storage: str,
 ) -> None:
@@ -39,7 +43,7 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
         fwd_num_comm_sms=2,
         bwd_num_comm_sms=2,
         minibatch_size=256,
-        macrobatch_size=256,
+        macrobatch_size=int(os.getenv("MOK_TEST_MACROBATCH_SIZE", "256")),
         schedule_capacity_multiplier=1.5,
     )
     workspace = functional.get_workspace(
@@ -140,27 +144,32 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
     )
 
     if single_grouped:
-        routed_fc1_main_grad = torch.full_like(routed_fc1, 0.25, dtype=torch.float32)
+        routed_fc1_main_grad = torch.full_like(routed_fc1, 0.25, dtype=main_grad_dtype)
         main_grads = (
-            torch.full_like(w_shared_gate, 0.25, dtype=torch.float32),
+            torch.full_like(w_shared_gate, 0.25, dtype=main_grad_dtype),
             routed_fc1_main_grad,
-            torch.full_like(w_shared_up, 0.25, dtype=torch.float32),
+            torch.full_like(w_shared_up, 0.25, dtype=main_grad_dtype),
             routed_fc1_main_grad,
-            torch.full_like(w_shared_down, 0.25, dtype=torch.float32),
-            torch.full_like(w_routed_down, 0.25, dtype=torch.float32),
+            torch.full_like(w_shared_down, 0.25, dtype=main_grad_dtype),
+            torch.full_like(w_routed_down, 0.25, dtype=main_grad_dtype),
         )
     else:
         main_grads = tuple(
-            torch.full_like(weight, 0.25, dtype=torch.float32)
+            torch.full_like(weight, 0.25, dtype=main_grad_dtype)
             for weight in (
                 w_shared_gate, w_routed_gate, w_shared_up,
                 w_routed_up, w_shared_down, w_routed_down,
             )
         )
     # MCore calls the fused backward once per microbatch and expects every call
-    # to add into the same FP32 main_grad buffers. Exercise that lifecycle,
+    # to add into the same main_grad buffers. Exercise that lifecycle,
     # rather than validating only one add into a pre-filled tensor.
-    num_accumulations = 3
+    # Production recipes may accumulate hundreds of microbatches. Keep regular
+    # CI fast, while allowing focused runs to stress the real accumulation depth.
+    num_accumulations = int(os.getenv("MOK_TEST_NUM_ACCUMULATIONS", "3"))
+    if num_accumulations <= 0:
+        raise ValueError("MOK_TEST_NUM_ACCUMULATIONS must be positive")
+
     for _ in range(num_accumulations):
         output, forward_context = functional.forward(
             config,
@@ -231,10 +240,16 @@ def test_wgrad_accumulates_directly_into_fp32_main_grad(
     for name, expected, actual in zip(
         weight_names, reference_wgrads, actual_main_grads, strict=True,
     ):
+        expected_accum = torch.full_like(expected, 0.25, dtype=main_grad_dtype)
+        for _ in range(num_accumulations):
+            expected_accum.add_(expected.to(main_grad_dtype))
         check_correctness(
             f"main_grad/{name}",
-            expected.float() * num_accumulations + 0.25,
+            expected_accum,
             actual,
-            (tolerance[0] * num_accumulations, tolerance[1]),
+            (
+                tolerance[0] * num_accumulations * (2 if num_accumulations > 3 else 1),
+                tolerance[1] * (2 if num_accumulations > 3 else 1),
+            ),
             rank == 0,
         )
