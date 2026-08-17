@@ -313,16 +313,29 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
+    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
+    single_grouped_fc1_sc = w_routed_gate_sc.data_ptr() == w_routed_up_sc.data_ptr()
+    if single_grouped_fc1 != single_grouped_fc1_sc:
+        raise ValueError(
+            "single-grouped FC1 data and scale tensors must alias consistently"
+        )
+    routed_fc1_shape = (
+        num_local_experts,
+        (2 if single_grouped_fc1 else 1) * intermediate_size,
+        hidden_size,
+    )
+    routed_fc1_sc_shape = (
+        num_local_experts * (2 if single_grouped_fc1 else 1) * intermediate_size // 128,
+        hidden_size // 128, 32, 16,
+    )
     expected_shapes = (
         ("combine_buffer", combine_buffer, (num_local_tokens * topk, hidden_size)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate", w_routed_gate, (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_gate_sc", w_routed_gate_sc,
-         (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
+        ("w_routed_gate_sc", w_routed_gate_sc, routed_fc1_sc_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_up_sc", w_routed_up_sc,
-         (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
+        ("w_routed_up_sc", w_routed_up_sc, routed_fc1_sc_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
         ("w_routed_down", w_routed_down, (num_local_experts, hidden_size, intermediate_size)),
         ("w_routed_down_sc", w_routed_down_sc,
@@ -452,6 +465,12 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
+    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
+    routed_fc1_shape = (
+        num_local_experts,
+        (2 if single_grouped_fc1 else 1) * intermediate_size,
+        hidden_size,
+    )
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -480,9 +499,9 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     expected_shapes = (
         ("combine_buffer", combine_buffer, (num_local_tokens * topk, hidden_size)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate", w_routed_gate, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
         ("w_routed_down", w_routed_down, (num_local_experts, hidden_size, intermediate_size)),
         ("schedule_peer_token_idx", schedule_peer_token_idx, (schedule_capacity,)),
@@ -568,6 +587,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    routed_weights_are_native_columnwise: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -600,13 +620,18 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         d_router_weight_buffer:        float32 [num_local_tokens, topk]
         d_router_weight_buffer_ptrs:   list[int] [ep_size]
         w_shared_gate:                 bfloat16 [intermediate_size, hidden_size]
-        w_routed_gate_T:               float8_e4m3fn [num_local_experts, hidden_size, intermediate_size]
-        w_routed_gate_T_sc:            uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16]
+        w_routed_gate_T:               legacy: float8_e4m3fn [num_local_experts, hidden_size, intermediate_size];
+                                         native single-grouped: shared FC1 columnwise payload [num_local_experts, 2 * intermediate_size, hidden_size]
+        w_routed_gate_T_sc:            legacy: uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16];
+                                         native single-grouped: uint8 [num_local_experts * hidden_size // 128, 2 * intermediate_size // 128, 32, 16]
         w_shared_up:                   bfloat16 [intermediate_size, hidden_size]
-        w_routed_up_T:                 float8_e4m3fn [num_local_experts, hidden_size, intermediate_size]
-        w_routed_up_T_sc:              uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16]
+        w_routed_up_T:                 legacy: float8_e4m3fn [num_local_experts, hidden_size, intermediate_size];
+                                         native single-grouped: alias of w_routed_gate_T
+        w_routed_up_T_sc:              legacy: uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16];
+                                         native single-grouped: alias of w_routed_gate_T_sc
         w_shared_down:                 bfloat16 [hidden_size, intermediate_size]
-        w_routed_down_T:               float8_e4m3fn [num_local_experts, intermediate_size, hidden_size]
+        w_routed_down_T:               legacy: float8_e4m3fn [num_local_experts, intermediate_size, hidden_size];
+                                         native single-grouped: float8_e4m3fn [num_local_experts, hidden_size, intermediate_size]
         w_routed_down_T_sc:            uint8 [num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16]
         x_fp8_t_routed:                float8_e4m3fn [hidden_size, macrobatch_size]
         x_sc_t_routed:                 uint8 [hidden_size // 128, macrobatch_size // 128, 32, 16]
@@ -634,6 +659,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         num_comm_sms:                  int
         macrobatch_size:               int
         minibatch_size:                int
+        routed_weights_are_native_columnwise:
+                                        bool; selects native TE/MCore single-grouped columnwise payloads
 
     Outputs:
         d_x_shared:          bfloat16 [num_local_tokens, hidden_size]
@@ -674,6 +701,9 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     if (type(macrobatch_size) is not int or macrobatch_size <= 0
             or macrobatch_size % minibatch_size != 0):
         raise ValueError("macrobatch_size must be a positive multiple of minibatch_size")
+    if type(routed_weights_are_native_columnwise) is not bool:
+        raise TypeError("routed_weights_are_native_columnwise must be a bool")
+
     for pointer_name, pointers in (
         ("d_y_buffer_ptrs", d_y_buffer_ptrs),
         ("d_x_routed_buffer_ptrs", d_x_routed_buffer_ptrs),
@@ -705,26 +735,63 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
+    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
+    single_grouped_fc1_sc = w_routed_gate_sc.data_ptr() == w_routed_up_sc.data_ptr()
+    single_grouped_fc1_t = w_routed_gate_T.data_ptr() == w_routed_up_T.data_ptr()
+    single_grouped_fc1_t_sc = (
+        w_routed_gate_T_sc.data_ptr() == w_routed_up_T_sc.data_ptr()
+    )
+    if single_grouped_fc1 != single_grouped_fc1_sc:
+        raise ValueError(
+            "single-grouped rowwise FC1 data and scales must alias consistently"
+        )
+    if single_grouped_fc1_t != single_grouped_fc1_t_sc:
+        raise ValueError(
+            "single-grouped columnwise FC1 data and scales must alias consistently"
+        )
+    if routed_weights_are_native_columnwise and not (
+        single_grouped_fc1 and single_grouped_fc1_sc
+        and single_grouped_fc1_t and single_grouped_fc1_t_sc
+    ):
+        raise ValueError("native columnwise weights require single-grouped FC1 aliases")
+
     mb_i_sc = (macrobatch_size // 128, intermediate_size // 128, 32, 16)
     i_mb_sc = (intermediate_size // 128, macrobatch_size // 128, 32, 16)
     h_mb_sc = (hidden_size // 128, macrobatch_size // 128, 32, 16)
     e_i_h_sc = (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)
     e_h_i_sc = (num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16)
+    routed_fc1_shape = (
+        num_local_experts, (2 if single_grouped_fc1 else 1) * intermediate_size, hidden_size
+    )
+    routed_fc1_sc_shape = (
+        num_local_experts * (2 if single_grouped_fc1 else 1) * intermediate_size // 128,
+        hidden_size // 128, 32, 16,
+    )
+    routed_fc1_t_shape = (
+        routed_fc1_shape if routed_weights_are_native_columnwise else
+        (num_local_experts, hidden_size,
+         (2 if single_grouped_fc1_t else 1) * intermediate_size)
+    )
+    routed_fc1_t_sc_shape = (
+        num_local_experts * hidden_size // 128,
+        (2 if single_grouped_fc1_t else 1) * intermediate_size // 128, 32, 16,
+    )
     expected_shapes = (
         ("d_y_buffer", d_y_buffer, (num_local_tokens, hidden_size)),
         ("d_x_routed_buffer", d_x_routed_buffer, (num_local_tokens * topk, hidden_size)),
         ("router_weight_buffer", router_weight_buffer, (num_local_tokens, topk)),
         ("d_router_weight_buffer", d_router_weight_buffer, (num_local_tokens, topk)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate_T", w_routed_gate_T,
-         (num_local_experts, hidden_size, intermediate_size)),
-        ("w_routed_gate_T_sc", w_routed_gate_T_sc, e_h_i_sc),
+        ("w_routed_gate_T", w_routed_gate_T, routed_fc1_t_shape),
+        ("w_routed_gate_T_sc", w_routed_gate_T_sc, routed_fc1_t_sc_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up_T", w_routed_up_T, (num_local_experts, hidden_size, intermediate_size)),
-        ("w_routed_up_T_sc", w_routed_up_T_sc, e_h_i_sc),
+        ("w_routed_up_T", w_routed_up_T, routed_fc1_t_shape),
+        ("w_routed_up_T_sc", w_routed_up_T_sc, routed_fc1_t_sc_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
         ("w_routed_down_T", w_routed_down_T,
-         (num_local_experts, intermediate_size, hidden_size)),
+         ((num_local_experts, hidden_size, intermediate_size)
+          if routed_weights_are_native_columnwise else
+          (num_local_experts, intermediate_size, hidden_size))),
         ("w_routed_down_T_sc", w_routed_down_T_sc, e_i_h_sc),
         ("x_fp8_t_routed", x_fp8_t_routed, (hidden_size, macrobatch_size)),
         ("x_sc_t_routed", x_sc_t_routed, h_mb_sc),
@@ -737,11 +804,10 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         ("hidden_shared", hidden_shared, (num_local_tokens, intermediate_size)),
         ("hidden_fp8_t_routed", hidden_fp8_t_routed, (intermediate_size, macrobatch_size)),
         ("hidden_sc_t_routed", hidden_sc_t_routed, i_mb_sc),
-        ("w_routed_gate", w_routed_gate,
-         (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_gate_sc", w_routed_gate_sc, e_i_h_sc),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_up_sc", w_routed_up_sc, e_i_h_sc),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
+        ("w_routed_gate_sc", w_routed_gate_sc, routed_fc1_sc_shape),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
+        ("w_routed_up_sc", w_routed_up_sc, routed_fc1_sc_shape),
     )
     for tensor_name, tensor, expected_shape in expected_shapes:
         if tuple(tensor.shape) != expected_shape:
@@ -808,6 +874,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         x, x_ptrs, w_routed_gate, w_routed_gate_sc, w_routed_up, w_routed_up_sc,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        routed_weights_are_native_columnwise,
     )
 
 
@@ -822,7 +889,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         torch.Tensor,
     ],
 ) -> tuple[torch.Tensor, ...]:
-    """Runs MXFP8 backward and accumulates wgrad directly into FP32 buffers.
+    """Runs MXFP8 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
     ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_mxfp8`.
     ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
@@ -834,6 +901,9 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     """
     if len(main_grads) != 6:
         raise ValueError("main_grads must contain six tensors")
+    main_grad_dtype = main_grads[0].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
     for name, main_grad in zip(
         (
             "shared_gate", "routed_gate", "shared_up",
@@ -842,8 +912,10 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         main_grads,
         strict=True,
     ):
-        if not main_grad.is_cuda or main_grad.dtype != torch.float32:
-            raise TypeError(f"main_grad_{name} must be a CUDA float32 tensor")
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
         if not main_grad.is_contiguous():
             raise ValueError(f"main_grad_{name} must be contiguous")
     outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
@@ -974,6 +1046,12 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
+    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
+    routed_fc1_shape = (
+        num_local_experts,
+        (2 if single_grouped_fc1 else 1) * intermediate_size,
+        hidden_size,
+    )
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -1013,9 +1091,9 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         ("router_weight_buffer", router_weight_buffer, (num_local_tokens, topk)),
         ("d_router_weight_buffer", d_router_weight_buffer, (num_local_tokens, topk)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate", w_routed_gate, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
         ("w_routed_down", w_routed_down, (num_local_experts, hidden_size, intermediate_size)),
         ("x_routed", x_routed, (macrobatch_size, hidden_size)),
@@ -1063,7 +1141,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
         torch.Tensor,
     ],
 ) -> tuple[torch.Tensor, ...]:
-    """Runs BF16 backward and accumulates wgrad directly into FP32 buffers.
+    """Runs BF16 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
     ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_bf16`.
     ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
@@ -1076,13 +1154,18 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
     """
     if len(main_grads) != 6:
         raise ValueError("main_grads must contain six tensors")
+    main_grad_dtype = main_grads[0].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
     for name, main_grad in zip(
         ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
         main_grads,
         strict=True,
     ):
-        if not main_grad.is_cuda or main_grad.dtype != torch.float32:
-            raise TypeError(f"main_grad_{name} must be a CUDA float32 tensor")
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
         if not main_grad.is_contiguous():
             raise ValueError(f"main_grad_{name} must be contiguous")
     outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(*args, *main_grads)
