@@ -630,7 +630,7 @@ def backward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 tensor tuple
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 tensor tuple
         swiglu_limit:        float | None
-        main_grads:          optional FP32 buffers ordered as shared gate,
+        main_grads:          optional FP32 or BF16 buffers ordered as shared gate,
                              routed gate, shared up, routed up, shared down,
                              routed down; wgrad is accumulated in-place
 
@@ -654,11 +654,32 @@ def backward(
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     if isinstance(routed_gate_weights, tuple):
-        (routed_gate_weights_fp8, routed_gate_weights_sc,
-         routed_gate_weights_t_fp8, routed_gate_weights_t_sc) = routed_gate_weights
-        (routed_up_weights_fp8, routed_up_weights_sc,
-         routed_up_weights_t_fp8, routed_up_weights_t_sc) = routed_up_weights
-        routed_down_weights_t_fp8, routed_down_weights_t_sc = routed_down_weights
+        if len(routed_gate_weights) == 5:
+            (routed_gate_weights_fp8, routed_gate_weights_sc,
+             routed_gate_weights_t_fp8, routed_gate_weights_t_sc,
+             routed_weights_are_native_columnwise) = routed_gate_weights
+            if len(routed_up_weights) != 5 or len(routed_down_weights) != 3:
+                raise ValueError(
+                    "native-columnwise MXFP8 gate/up/down tuples must have lengths 5/5/3"
+                )
+            (routed_up_weights_fp8, routed_up_weights_sc,
+             routed_up_weights_t_fp8, routed_up_weights_t_sc,
+             routed_up_is_native_columnwise) = routed_up_weights
+            (routed_down_weights_t_fp8, routed_down_weights_t_sc,
+             routed_down_is_native_columnwise) = routed_down_weights
+            if (routed_weights_are_native_columnwise is not True
+                    or routed_up_is_native_columnwise is not True
+                    or routed_down_is_native_columnwise is not True):
+                raise ValueError("all native-columnwise MXFP8 flags must be True")
+        elif len(routed_gate_weights) == 4:
+            (routed_gate_weights_fp8, routed_gate_weights_sc,
+             routed_gate_weights_t_fp8, routed_gate_weights_t_sc) = routed_gate_weights
+            (routed_up_weights_fp8, routed_up_weights_sc,
+             routed_up_weights_t_fp8, routed_up_weights_t_sc) = routed_up_weights
+            routed_down_weights_t_fp8, routed_down_weights_t_sc = routed_down_weights
+            routed_weights_are_native_columnwise = False
+        else:
+            raise ValueError("MXFP8 gate weight tuple must contain four or five values")
         x_fp8_t_routed, x_sc_t_routed = forward_context.x_routed
         gate_fp8_routed, gate_sc_routed = forward_context.gate_routed
         up_fp8_routed, up_sc_routed = forward_context.up_routed
@@ -682,6 +703,7 @@ def backward(
             schedule.num_tokens, schedule.tokens_per_expert,
             workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
             config.macrobatch_size, config.minibatch_size,
+            routed_weights_are_native_columnwise,
         )
         if main_grads is None:
             (d_x_shared, d_x_routed,
