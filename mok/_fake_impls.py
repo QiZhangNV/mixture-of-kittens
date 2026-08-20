@@ -88,6 +88,12 @@ def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
+    w_routed_gate_sc_storage_table: torch.Tensor | None = None,
+    w_routed_up_sc_storage_table: torch.Tensor | None = None,
+    w_routed_down_sc_storage_table: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
     torch.Tensor, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
@@ -135,6 +141,9 @@ def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor, torch.Tensor,

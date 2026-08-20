@@ -15,6 +15,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp8_quantize", &mxfp8_quantize::mxfp8_quantize_entrypoint, "",
           pybind11::arg("x_bf16"),
           pybind11::arg("return_normal"), pybind11::arg("return_transposed"));
+    m.def("make_routed_weight_storage_table_mxfp8",
+          &make_routed_weight_storage_table_mxfp8, "",
+          pybind11::arg("expert_tensors"));
+    m.def("make_routed_weight_storage_table_bf16",
+          &make_routed_weight_storage_table_bf16, "",
+          pybind11::arg("expert_tensors"));
+    m.def("make_routed_scale_storage_table",
+          &make_routed_scale_storage_table, "",
+          pybind11::arg("expert_tensors"));
+    m.def("make_routed_d_weight_storage_table",
+          &make_routed_d_weight_storage_table, "",
+          pybind11::arg("expert_tensors"));
     m.def("dispatch_mlp_swiglu_combine_fwd_mxfp8", &dispatch_mlp_swiglu_combine_fwd_mxfp8, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
@@ -24,7 +36,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
-          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
+          pybind11::arg("w_routed_gate_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_down_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_gate_sc_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_sc_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_down_sc_storage_table") = pybind11::none());
     m.def("dispatch_mlp_swiglu_combine_bwd_mxfp8", &dispatch_mlp_swiglu_combine_bwd_mxfp8, "",
           pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
@@ -70,7 +88,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("main_grad_shared_up"),
           pybind11::arg("main_grad_routed_up"),
           pybind11::arg("main_grad_shared_down"),
-          pybind11::arg("main_grad_routed_down"));
+          pybind11::arg("main_grad_routed_down"),
+          pybind11::arg("w_routed_gate_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_gate_T_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_T_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_down_T_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_gate_sc_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_sc_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_gate_T_sc_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_T_sc_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_down_T_sc_storage_table") = pybind11::none(),
+          pybind11::arg("main_grad_routed_gate_storage_table") = pybind11::none(),
+          pybind11::arg("main_grad_routed_up_storage_table") = pybind11::none(),
+          pybind11::arg("main_grad_routed_down_storage_table") = pybind11::none());
     m.def("dispatch_mlp_swiglu_combine_fwd_bf16", &dispatch_mlp_swiglu_combine_fwd_bf16, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
@@ -80,7 +111,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
-          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
+          pybind11::arg("w_routed_gate_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_down_storage_table") = pybind11::none());
     m.def("dispatch_mlp_swiglu_combine_bwd_bf16", &dispatch_mlp_swiglu_combine_bwd_bf16, "",
           pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
@@ -103,7 +137,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("main_grad_shared_up") = pybind11::none(),
           pybind11::arg("main_grad_routed_up") = pybind11::none(),
           pybind11::arg("main_grad_shared_down") = pybind11::none(),
-          pybind11::arg("main_grad_routed_down") = pybind11::none());
+          pybind11::arg("main_grad_routed_down") = pybind11::none(),
+          pybind11::arg("w_routed_gate_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_up_storage_table") = pybind11::none(),
+          pybind11::arg("w_routed_down_storage_table") = pybind11::none(),
+          pybind11::arg("main_grad_routed_gate_storage_table") = pybind11::none(),
+          pybind11::arg("main_grad_routed_up_storage_table") = pybind11::none(),
+          pybind11::arg("main_grad_routed_down_storage_table") = pybind11::none());
     m.def("fwd_epilogue", &utils::fwd_epilogue, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
     m.def("bwd_epilogue", &utils::bwd_epilogue, "",
