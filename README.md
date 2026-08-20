@@ -59,6 +59,19 @@ To verify the installation:
 python -c "import mok; print(mok.__version__)"
 ```
 
+The `qizhang/mok-fused-grad-accum` integration branch carries one
+ThunderKittens change as a repository-local patch so that all referenced
+submodule commits remain fetchable from their upstream repositories. Prepare
+the submodule before building this branch:
+
+```bash
+./scripts/prepare_thunderkittens.sh
+make -B ARCH=SM103
+```
+
+The preparation script is idempotent. It enables the native MN-major MXFP8 B
+operand consumed by MCore single-grouped parameters.
+
 ### Development
 
 For development, install MoK in editable mode once, then use `make` for fast rebuilds:
