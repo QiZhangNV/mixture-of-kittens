@@ -810,6 +810,7 @@ def test_fake_tensor_metadata(
             mxfp8_forward[-2],
             workspace.combine_buffer,
             router_weights,
+            schedule.top_experts,
         )
         _assert_metadata(
             (output,),
@@ -907,6 +908,7 @@ def test_fake_tensor_metadata(
         d_x = ops.bwd_epilogue(
             mxfp8_backward[0],
             workspace.d_x_routed_buffer,
+            schedule.top_experts,
         )
         _assert_metadata(
             (d_x,),
@@ -1526,8 +1528,10 @@ def test_epilogues_support_more_than_max_grid_y_tokens(
         dtype=torch.float32,
     )
 
-    output = ops.fwd_epilogue(shared, routed, topk_weights)
+    top_experts = torch.zeros(
+        num_local_tokens, 1, dtype=torch.int32, device=device)
+    output = ops.fwd_epilogue(shared, routed, topk_weights, top_experts)
     assert torch.all(output == 1.5)
 
-    d_x = ops.bwd_epilogue(shared, routed)
+    d_x = ops.bwd_epilogue(shared, routed, top_experts)
     assert torch.all(d_x == 3.0)

@@ -176,6 +176,9 @@ def test_schedule(context: tuple[int, int, torch.device]) -> None:
         num_local_experts = num_experts // world_size
         schedule_capacity = num_local_tokens * topk * max(2, math.ceil(world_size * 1.5))
         topk_experts = generate_topk_experts(rank, device, num_experts, topk, num_local_tokens).to(torch.int32)
+        route_counts = torch.arange(num_local_tokens, device=device) % (topk + 1)
+        route_valid = torch.arange(topk, device=device).unsqueeze(0) < route_counts.unsqueeze(1)
+        topk_experts.masked_fill_(~route_valid, -1)
         topk_all = run_all_gather_top_experts_reference(topk_experts)
 
         actual = schedule(topk_all, num_local_experts, schedule_capacity, rank)
@@ -1633,8 +1636,17 @@ def test_fwd_epilogue(context: tuple[int, int, torch.device]) -> None:
             ),
             dim=-1,
         )
-        actual = fwd_epilogue(y_shared, combine_buffer, topk_weights)
-        reference = run_fwd_epilogue_reference(y_shared, combine_buffer, topk_weights)
+        route_counts = torch.arange(num_local_tokens, device=device) % (topk + 1)
+        route_valid = torch.arange(topk, device=device).unsqueeze(0) < route_counts.unsqueeze(1)
+        top_experts = torch.zeros(
+            num_local_tokens, topk, dtype=torch.int32, device=device
+        ).masked_fill(~route_valid, -1)
+        combine_buffer.view(num_local_tokens, topk, hidden_dim).masked_fill_(
+            ~route_valid.unsqueeze(2), float("nan")
+        )
+        topk_weights.masked_fill_(~route_valid, 0.0)
+        actual = fwd_epilogue(y_shared, combine_buffer, topk_weights, top_experts)
+        reference = run_fwd_epilogue_reference(y_shared, combine_buffer, topk_weights, top_experts)
         check_correctness(
             shape_name,
             reference,
@@ -1646,7 +1658,7 @@ def test_fwd_epilogue(context: tuple[int, int, torch.device]) -> None:
     num_local_tokens = 512
     hidden_dim = 256
     shared_memory_limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
-    topk = (shared_memory_limit - 5120) // 4104
+    topk = (shared_memory_limit - 5120) // 4112
     generator = torch.Generator(device=device).manual_seed(5678 + rank)
     y_shared = torch.randn(
         num_local_tokens, hidden_dim, generator=generator,
@@ -1659,10 +1671,12 @@ def test_fwd_epilogue(context: tuple[int, int, torch.device]) -> None:
             num_local_tokens, topk, generator=generator, device=device),
         dim=-1,
     )
+    top_experts = torch.zeros(
+        num_local_tokens, topk, dtype=torch.int32, device=device)
 
-    actual = fwd_epilogue(y_shared, combine_buffer, topk_weights)
+    actual = fwd_epilogue(y_shared, combine_buffer, topk_weights, top_experts)
     reference = run_fwd_epilogue_reference(
-        y_shared, combine_buffer, topk_weights)
+        y_shared, combine_buffer, topk_weights, top_experts)
     check_correctness(
         "Maximum executable top-k",
         reference,
@@ -1675,6 +1689,7 @@ def test_fwd_epilogue(context: tuple[int, int, torch.device]) -> None:
         "y_shared": y_shared,
         "combine_buffer": combine_buffer,
         "topk_weights": topk_weights,
+        "top_experts": top_experts,
     }
     for failure_name, overrides, expected_exception in (
         ("shared output rank", {"y_shared": y_shared.unsqueeze(0)}, ValueError),
@@ -1727,8 +1742,16 @@ def test_bwd_epilogue(context: tuple[int, int, torch.device]) -> None:
             device=device,
             dtype=torch.bfloat16,
         )
-        actual = bwd_epilogue(d_x_shared, d_x_routed_buffer)
-        reference = run_bwd_epilogue_reference(d_x_shared, d_x_routed_buffer)
+        route_counts = torch.arange(num_local_tokens, device=device) % (topk + 1)
+        route_valid = torch.arange(topk, device=device).unsqueeze(0) < route_counts.unsqueeze(1)
+        top_experts = torch.zeros(
+            num_local_tokens, topk, dtype=torch.int32, device=device
+        ).masked_fill(~route_valid, -1)
+        d_x_routed_buffer.view(num_local_tokens, topk, hidden_dim).masked_fill_(
+            ~route_valid.unsqueeze(2), float("nan")
+        )
+        actual = bwd_epilogue(d_x_shared, d_x_routed_buffer, top_experts)
+        reference = run_bwd_epilogue_reference(d_x_shared, d_x_routed_buffer, top_experts)
         check_correctness(
             shape_name,
             reference,
@@ -1747,10 +1770,12 @@ def test_bwd_epilogue(context: tuple[int, int, torch.device]) -> None:
     d_x_routed_buffer = torch.randn(
         num_local_tokens * topk, hidden_dim, generator=generator,
         device=device, dtype=torch.bfloat16)
+    top_experts = torch.zeros(
+        num_local_tokens, topk, dtype=torch.int32, device=device)
 
-    actual = bwd_epilogue(d_x_shared, d_x_routed_buffer)
+    actual = bwd_epilogue(d_x_shared, d_x_routed_buffer, top_experts)
     reference = run_bwd_epilogue_reference(
-        d_x_shared, d_x_routed_buffer)
+        d_x_shared, d_x_routed_buffer, top_experts)
     check_correctness(
         "Large top-k",
         reference,
@@ -1762,6 +1787,7 @@ def test_bwd_epilogue(context: tuple[int, int, torch.device]) -> None:
     valid_kwargs = {
         "d_x_shared": d_x_shared,
         "d_x_routed_buffer": d_x_routed_buffer,
+        "top_experts": top_experts,
     }
     for failure_name, overrides, expected_exception in (
         (

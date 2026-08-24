@@ -41,6 +41,7 @@ class MoKSchedule:
     peer_token_idx: torch.Tensor     # (schedule_capacity,) int32
     num_tokens: torch.Tensor         # (1,) int32
     tokens_per_expert: torch.Tensor  # (num_local_experts,) int32
+    top_experts: torch.Tensor        # (num_local_tokens, topk) int32; -1 marks no route
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +180,7 @@ def validate_workspace_args(
         raise ValueError("hidden_size must be divisible by 256")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
-    fwd_epilogue_smem_bytes = 2 * ((topk + 1) * 2048 + topk * 4) + 1024
+    fwd_epilogue_smem_bytes = 2 * ((topk + 1) * 2048 + 2 * topk * 4) + 1024
     if fwd_epilogue_smem_bytes > device_properties.shared_memory_per_block_optin:
         raise ValueError("topk requires more dynamic shared memory than the device supports")
 
@@ -400,7 +401,7 @@ def build_schedule(
     Inputs:
         workspace:         MoKWorkspace
         config:            MoKConfig
-        top_experts:       int64 [num_local_tokens, topk]
+        top_experts:       int32 or int64 [num_local_tokens, topk]
         num_local_experts: int
 
     Outputs:
@@ -440,8 +441,8 @@ def build_schedule(
         raise ValueError("all_gather_top_experts_chunk_bytes must divide one rank's route-buffer bytes")
     if not top_experts.is_cuda or top_experts.device != workspace.device:
         raise ValueError("top_experts must be on the workspace CUDA device")
-    if top_experts.dtype != torch.int64:
-        raise TypeError("top_experts must have dtype torch.int64")
+    if top_experts.dtype not in (torch.int32, torch.int64):
+        raise TypeError("top_experts must have dtype torch.int32 or torch.int64")
     if not top_experts.is_contiguous():
         raise ValueError("top_experts must be contiguous")
     if tuple(top_experts.shape) != (workspace.num_local_tokens, workspace.topk):
@@ -449,7 +450,9 @@ def build_schedule(
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
 
-    top_experts_int32 = top_experts.to(torch.int32)
+    top_experts_int32 = (
+        top_experts if top_experts.dtype == torch.int32 else top_experts.to(torch.int32)
+    )
     all_gather_top_experts(
         top_experts_int32, workspace.all_gather_top_experts_buffer,
         workspace.all_gather_top_experts_buffer_multicast_ptr, workspace.ep_rank,
@@ -464,6 +467,7 @@ def build_schedule(
     return MoKSchedule(
         peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
         num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
+        top_experts=top_experts_int32,
     )
 
 
@@ -499,6 +503,7 @@ def validate_inputs(
     if grad_output is not None:
         tensors.append(("grad_output", grad_output, torch.bfloat16, expected_activation_shape))
     tensors.append(("router_weights", router_weights, torch.float32, (workspace.num_local_tokens, workspace.topk)))
+    tensors.append(("schedule.top_experts", schedule.top_experts, torch.int32, (workspace.num_local_tokens, workspace.topk)))
     for tensor_name, tensor, expected_dtype, expected_shape in tensors:
         if not tensor.is_cuda or tensor.device != workspace.device or tensor.dtype != expected_dtype or not tensor.is_contiguous():
             raise ValueError(f"{tensor_name} must be contiguous {expected_dtype} on the workspace CUDA device")
@@ -661,7 +666,12 @@ def forward(
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    output = fwd_epilogue(y_shared, workspace.combine_buffer, workspace.router_weight_buffer)
+    output = fwd_epilogue(
+        y_shared,
+        workspace.combine_buffer,
+        workspace.router_weight_buffer,
+        schedule.top_experts,
+    )
     return output, forward_context
 
 
@@ -941,7 +951,12 @@ def backward(
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    d_x = bwd_epilogue(d_x_shared, workspace.d_x_routed_buffer)
+    d_x = bwd_epilogue(
+        d_x_shared,
+        workspace.d_x_routed_buffer,
+        schedule.top_experts,
+    )
     d_router_weights = workspace.d_router_weight_buffer.clone()  # TODO: we can remove this
+    d_router_weights.masked_fill_(schedule.top_experts < 0, 0.0)
     return (d_x, d_router_weights, d_w_routed_gate, d_w_routed_up, d_w_routed_down,
             d_w_shared_gate, d_w_shared_up, d_w_shared_down)

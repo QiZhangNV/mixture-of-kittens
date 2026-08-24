@@ -64,7 +64,9 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
             hidden_size=hidden_dim,
             topk=topk,
         )
-        topk_experts = generate_topk_experts(rank, device, num_experts, topk, num_local_tokens)
+        topk_experts = generate_topk_experts(
+            rank, device, num_experts, topk, num_local_tokens
+        ).to(torch.int32)
 
         actual = functional.build_schedule(
             workspace,
@@ -215,7 +217,7 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
         ),
         (
             "top experts dtype",
-            {"top_experts": topk_experts.to(torch.int32)},
+            {"top_experts": topk_experts.to(torch.float32)},
             TypeError,
         ),
         (
@@ -462,6 +464,7 @@ def test_forward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         peer_token_idx=mok_schedule.peer_token_idx[:-256],
         num_tokens=mok_schedule.num_tokens,
         tokens_per_expert=mok_schedule.tokens_per_expert,
+        top_experts=mok_schedule.top_experts,
     )
     for failure_name, overrides, expected_exception in (
         ("config type", {"config": object()}, TypeError),
@@ -647,6 +650,9 @@ def test_forward_bf16(context: tuple[int, int, torch.device]) -> None:
         w_routed_down,
         _,
     ) = inputs
+    route_valid = (torch.arange(num_local_tokens, device=device) % 3 != 0).unsqueeze(1)
+    topk_experts.masked_fill_(~route_valid, -1)
+    router_weights.masked_fill_(~route_valid, 0.0)
     mok_schedule = functional.build_schedule(
         workspace,
         config,
@@ -716,6 +722,7 @@ def test_forward_bf16(context: tuple[int, int, torch.device]) -> None:
         peer_token_idx=mok_schedule.peer_token_idx[:-256],
         num_tokens=mok_schedule.num_tokens,
         tokens_per_expert=mok_schedule.tokens_per_expert,
+        top_experts=mok_schedule.top_experts,
     )
     for failure_name, overrides, expected_exception in (
         ("config type", {"config": object()}, TypeError),
@@ -1000,6 +1007,7 @@ def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         peer_token_idx=mok_schedule.peer_token_idx[:-256],
         num_tokens=mok_schedule.num_tokens,
         tokens_per_expert=mok_schedule.tokens_per_expert,
+        top_experts=mok_schedule.top_experts,
     )
     for failure_name, overrides, expected_exception in (
         ("config type", {"config": object()}, TypeError),
@@ -1173,6 +1181,9 @@ def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
         w_routed_down,
         d_output,
     ) = inputs
+    route_valid = (torch.arange(num_local_tokens, device=device) % 3 != 0).unsqueeze(1)
+    topk_experts.masked_fill_(~route_valid, -1)
+    router_weights.masked_fill_(~route_valid, 0.0)
     mok_schedule = functional.build_schedule(
         workspace,
         config,
@@ -1226,6 +1237,7 @@ def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
         peer_token_idx=mok_schedule.peer_token_idx[:-256],
         num_tokens=mok_schedule.num_tokens,
         tokens_per_expert=mok_schedule.tokens_per_expert,
+        top_experts=mok_schedule.top_experts,
     )
     for failure_name, overrides, expected_exception in (
         ("config type", {"config": object()}, TypeError),

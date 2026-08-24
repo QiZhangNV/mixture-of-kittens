@@ -1434,6 +1434,7 @@ def fwd_epilogue(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:
     """Combines shared and router-weighted routed expert outputs.
 
@@ -1441,6 +1442,7 @@ def fwd_epilogue(
         y_shared:       bfloat16 [num_local_tokens, hidden_size]
         combine_buffer: bfloat16 [num_local_tokens * topk, hidden_size]
         topk_weights:   float32 [num_local_tokens, topk]
+        top_experts:    int32 [num_local_tokens, topk], with -1 for invalid routes
 
     Outputs:
         output: bfloat16 [num_local_tokens, hidden_size]
@@ -1453,7 +1455,8 @@ def fwd_epilogue(
     if hidden_size <= 0 or hidden_size % 256 != 0:
         raise ValueError("hidden_size must be positive and divisible by 256")
     if (topk_weights.device != y_shared.device
-            or combine_buffer.device != y_shared.device):
+            or combine_buffer.device != y_shared.device
+            or top_experts.device != y_shared.device):
         raise ValueError("all tensors must be on the same CUDA device")
     if topk_weights.ndim != 2 or topk_weights.shape[0] != num_local_tokens:
         raise ValueError("topk_weights must have shape (num_local_tokens, topk)")
@@ -1462,20 +1465,26 @@ def fwd_epilogue(
         raise ValueError("topk must be in [1, 255]")
     if tuple(combine_buffer.shape) != (num_local_tokens * topk, hidden_size):
         raise ValueError("combine_buffer must have shape (num_local_tokens * topk, hidden_size)")
+    if (top_experts.dtype != torch.int32 or not top_experts.is_contiguous()
+            or tuple(top_experts.shape) != (num_local_tokens, topk)):
+        raise ValueError("top_experts must be contiguous int32 (num_local_tokens, topk)")
 
-    return _C.fwd_epilogue(y_shared, combine_buffer, topk_weights)
+
+    return _C.fwd_epilogue(y_shared, combine_buffer, topk_weights, top_experts)
 
 
 @torch.library.custom_op("mok::bwd_epilogue", mutates_args=())
 def bwd_epilogue(
     d_x_shared: torch.Tensor,
     d_x_routed_buffer: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:
     """Combines shared and routed input gradients.
 
     Inputs:
         d_x_shared:        bfloat16 [num_local_tokens, hidden_size]
         d_x_routed_buffer: bfloat16 [num_local_tokens * topk, hidden_size]
+        top_experts:       int32 [num_local_tokens, topk], with -1 for invalid routes
 
     Outputs:
         d_x: bfloat16 [num_local_tokens, hidden_size]
@@ -1487,8 +1496,9 @@ def bwd_epilogue(
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
     if hidden_size <= 0 or hidden_size % 256 != 0:
         raise ValueError("hidden_size must be positive and divisible by 256")
-    if d_x_routed_buffer.device != d_x_shared.device:
-        raise ValueError("d_x_routed_buffer must be on the same CUDA device")
+    if (d_x_routed_buffer.device != d_x_shared.device
+            or top_experts.device != d_x_shared.device):
+        raise ValueError("all tensors must be on the same CUDA device")
     if d_x_routed_buffer.ndim != 2:
         raise ValueError("d_x_routed_buffer must have shape "
                          "(num_local_tokens * topk, hidden_size)")
@@ -1498,5 +1508,12 @@ def bwd_epilogue(
             or d_x_routed_buffer.shape[0] > num_local_tokens * 255):
         raise ValueError("d_x_routed_buffer must have shape "
                          "(num_local_tokens * topk, hidden_size)")
+    topk = d_x_routed_buffer.shape[0] // num_local_tokens
+    if (top_experts.device != d_x_shared.device
+            or top_experts.dtype != torch.int32
+            or not top_experts.is_contiguous()
+            or tuple(top_experts.shape) != (num_local_tokens, topk)):
+        raise ValueError("top_experts must be contiguous int32 (num_local_tokens, topk)")
 
-    return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer)
+
+    return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer, top_experts)
