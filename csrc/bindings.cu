@@ -72,9 +72,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
     m.def("fwd_epilogue", &utils::fwd_epilogue::fwd_epilogue_entrypoint, "",
-          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
+          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"), pybind11::arg("top_experts"));
     m.def("bwd_epilogue", &utils::bwd_epilogue::bwd_epilogue_entrypoint, "",
-          pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"));
+          pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"), pybind11::arg("top_experts"));
     m.def("recompute_forward_context_mxfp8", &recompute_forward_context_mxfp8_entrypoint, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"), pybind11::arg("w_routed_gate_sc"),

@@ -261,8 +261,12 @@ def run_forward_reference_bf16(
     num_routes = num_local_tokens * topk
 
     topk_experts_flat = topk_experts.flatten()
-    destination_ranks = topk_experts_flat // num_local_experts
-    dispatch_order = torch.argsort(destination_ranks, stable=True)
+    valid_route_indices = (topk_experts_flat >= 0).nonzero().flatten()
+    valid_experts = topk_experts_flat[valid_route_indices]
+    destination_ranks = valid_experts // num_local_experts
+    dispatch_order = valid_route_indices[
+        torch.argsort(destination_ranks, stable=True)
+    ]
     send_counts = torch.bincount(destination_ranks, minlength=world_size)
     all_send_counts = torch.empty(world_size, world_size, dtype=torch.int64, device=x.device)
     dist.all_gather_into_tensor(all_send_counts, send_counts)
@@ -270,7 +274,9 @@ def run_forward_reference_bf16(
     recv_splits = all_send_counts[:, rank].tolist()
     num_recv = sum(recv_splits)
     send_x = x[dispatch_order // topk]
-    send_local_experts = (topk_experts_flat[dispatch_order] % num_local_experts).contiguous()
+    send_local_experts = (
+        topk_experts_flat[dispatch_order] % num_local_experts
+    ).contiguous()
     recv_x = all_to_all(send_x, num_recv, recv_splits, send_splits)
     recv_local_experts = all_to_all(send_local_experts, num_recv, recv_splits, send_splits)
 
@@ -284,8 +290,13 @@ def run_forward_reference_bf16(
         recv_output = recv_output.index_copy(
             0, rows, hidden_activations @ w_routed_down[expert_idx].T)
 
-    returned_output = all_to_all(recv_output, num_routes, send_splits, recv_splits)
-    combine_buffer = torch.empty_like(returned_output)
+    num_valid_routes = valid_route_indices.numel()
+    returned_output = all_to_all(
+        recv_output, num_valid_routes, send_splits, recv_splits
+    )
+    combine_buffer = torch.zeros(
+        num_routes, hidden, dtype=returned_output.dtype, device=x.device
+    )
     combine_buffer[dispatch_order] = returned_output
 
     gate_shared = x @ w_shared_gate.T
@@ -300,20 +311,30 @@ def run_fwd_epilogue_reference(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    top_experts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_local_tokens, hidden_size = y_shared.shape
     topk = topk_weights.shape[1]
     routed = combine_buffer.view(num_local_tokens, topk, hidden_size)
+    if top_experts is not None:
+        route_valid = top_experts >= 0
+        routed = torch.where(route_valid.unsqueeze(2), routed, 0.0)
+        topk_weights = torch.where(route_valid, topk_weights, 0.0)
     return (y_shared.float() + (routed.float() * topk_weights.unsqueeze(2)).sum(dim=1)).to(torch.bfloat16)
 
 
 def run_bwd_epilogue_reference(
     d_x_shared: torch.Tensor,
     d_x_routed_buffer: torch.Tensor,
+    top_experts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_local_tokens, hidden_size = d_x_shared.shape
     topk = d_x_routed_buffer.shape[0] // num_local_tokens
     d_x_routed = d_x_routed_buffer.view(num_local_tokens, topk, hidden_size)
+    if top_experts is not None:
+        d_x_routed = torch.where(
+            (top_experts >= 0).unsqueeze(2), d_x_routed, 0.0
+        )
     return (d_x_shared.float() + d_x_routed.float().sum(dim=1)).to(torch.bfloat16)
 
 
@@ -352,8 +373,12 @@ def run_reference_bf16(
 
     # Dispatch all-to-all
     topk_experts_flat = topk_experts.flatten()
-    destination_ranks = topk_experts_flat // num_local_experts
-    dispatch_order = torch.argsort(destination_ranks, stable=True)
+    valid_route_indices = (topk_experts_flat >= 0).nonzero().flatten()
+    valid_experts = topk_experts_flat[valid_route_indices]
+    destination_ranks = valid_experts // num_local_experts
+    dispatch_order = valid_route_indices[
+        torch.argsort(destination_ranks, stable=True)
+    ]
     send_counts = torch.bincount(destination_ranks, minlength=world_size)
     all_send_counts = torch.empty(world_size, world_size, dtype=torch.int64, device=x.device)
     dist.all_gather_into_tensor(all_send_counts, send_counts, group=group)
@@ -361,9 +386,15 @@ def run_reference_bf16(
     recv_splits = all_send_counts[:, rank].tolist()
     num_recv = sum(recv_splits)
     send_x = x[dispatch_order // topk]
-    send_local_experts = (topk_experts_flat[dispatch_order] % num_local_experts).contiguous()
-    recv_x = all_to_all(send_x, num_recv, recv_splits, send_splits, group=group).requires_grad_()
-    recv_local_experts = all_to_all(send_local_experts, num_recv, recv_splits, send_splits, group=group)
+    send_local_experts = (
+        topk_experts_flat[dispatch_order] % num_local_experts
+    ).contiguous()
+    recv_x = all_to_all(
+        send_x, num_recv, recv_splits, send_splits, group=group
+    ).requires_grad_()
+    recv_local_experts = all_to_all(
+        send_local_experts, num_recv, recv_splits, send_splits, group=group
+    )
 
     # Routed expert FFN
     w_routed_gate = w_routed_gate.detach().requires_grad_()
@@ -379,8 +410,13 @@ def run_reference_bf16(
         recv_output = recv_output.index_copy(0, rows, hidden_activations @ w_routed_down[expert_idx].T)
 
     # Routed token weighted sum
-    returned_output = all_to_all(recv_output.detach(), num_routes, send_splits, recv_splits, group=group)
-    flat_output = torch.empty_like(returned_output)
+    num_valid_routes = valid_route_indices.numel()
+    returned_output = all_to_all(
+        recv_output.detach(), num_valid_routes, send_splits, recv_splits, group=group
+    )
+    flat_output = torch.zeros(
+        num_routes, hidden, dtype=returned_output.dtype, device=x.device
+    )
     flat_output[dispatch_order] = returned_output
     routed_output = (flat_output.view(num_local_tokens, topk, hidden).float() * router_weights.unsqueeze(2)).sum(1)
 
@@ -407,8 +443,12 @@ def run_reference_bf16(
     )
 
     # Backward
-    returned_d_x = all_to_all(d_recv_x, num_routes, send_splits, recv_splits, group=group)
-    flat_d_x = torch.empty_like(returned_d_x)
+    returned_d_x = all_to_all(
+        d_recv_x, num_valid_routes, send_splits, recv_splits, group=group
+    )
+    flat_d_x = torch.zeros(
+        num_routes, hidden, dtype=returned_d_x.dtype, device=x.device
+    )
     flat_d_x[dispatch_order] = returned_d_x
     d_x_routed = flat_d_x.view(num_local_tokens, topk, hidden).float().sum(1)
     d_x_shared, d_w_shared_gate, d_w_shared_up, d_w_shared_down = torch.autograd.grad(
@@ -418,6 +458,7 @@ def run_reference_bf16(
     )
     d_x = (d_x_routed + d_x_shared.float()).to(torch.bfloat16)
     d_router_weights = (d_output.unsqueeze(1).float() * flat_output.view(num_local_tokens, topk, hidden).float()).sum(2)
+    d_router_weights.masked_fill_(topk_experts < 0, 0.0)
 
     return (
         output,             # [T, H]

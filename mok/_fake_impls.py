@@ -386,6 +386,7 @@ def _fwd_epilogue_fake(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:  # output
     return y_shared.new_empty(y_shared.shape)
 
@@ -394,5 +395,6 @@ def _fwd_epilogue_fake(
 def _bwd_epilogue_fake(
     d_x_shared: torch.Tensor,
     d_x_routed_buffer: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:  # d_x
     return d_x_shared.new_empty(d_x_shared.shape)
