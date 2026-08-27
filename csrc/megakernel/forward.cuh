@@ -322,7 +322,13 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_sc_storage_table = std::nullopt
 ) {
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
@@ -333,7 +339,21 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / config::MLP_Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / config::MLP_Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
+    const bool single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr();
+    const int num_local_experts = tokens_per_expert.size(0);
+    const bool split_weight_storage = w_routed_gate_storage_table.has_value();
+    const bool split_scale_storage = w_routed_gate_sc_storage_table.has_value();
+    TORCH_CHECK(
+        split_weight_storage == w_routed_up_storage_table.has_value() &&
+        split_weight_storage == w_routed_down_storage_table.has_value(),
+        "MoK: all three split MXFP8 weight descriptor tables must be provided together");
+    TORCH_CHECK(
+        split_scale_storage == w_routed_up_sc_storage_table.has_value() &&
+        split_scale_storage == w_routed_down_sc_storage_table.has_value(),
+        "MoK: all three split MXFP8 scale descriptor tables must be provided together");
+    TORCH_CHECK(split_weight_storage == split_scale_storage,
+                "MoK: split MXFP8 weight and scale descriptor tables must be provided together");
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl y_routed_recv_buffer_data;
@@ -391,14 +411,30 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
         .x_routed_send_buffer = x_routed_send_buffer_data,
         .y_routed_recv_buffer = y_routed_recv_buffer_data,
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_gate),
-        .w_routed_gate_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_gate_sc),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim, 0, 0,
+            w_routed_gate_storage_table, num_local_experts),
+        .w_routed_gate_sc = make_routed_scale_view(
+            w_routed_gate_sc,
+            (single_grouped_fc1 ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
+            0, 0, w_routed_gate_sc_storage_table, num_local_experts),
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_up),
-        .w_routed_up_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_up_sc),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim,
+            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0, 0,
+            w_routed_up_storage_table, num_local_experts),
+        .w_routed_up_sc = make_routed_scale_view(
+            w_routed_up_sc,
+            (single_grouped_fc1 ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
+            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0,
+            0, w_routed_up_sc_storage_table, num_local_experts),
         .w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down),
-        .w_routed_down = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_down),
-        .w_routed_down_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_down_sc),
+        .w_routed_down = make_routed_weight_view(
+            w_routed_down, hidden_dim, intermediate_dim, 0, 0,
+            w_routed_down_storage_table, num_local_experts),
+        .w_routed_down_sc = make_routed_scale_view(
+            w_routed_down_sc, hidden_dim / config::QUANT_Mb,
+            0, 0, w_routed_down_sc_storage_table, num_local_experts),
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
@@ -448,7 +484,10 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt
 ) {
     static_assert(!USE_MXFP8);
     const int num_local_tokens = x.size(0);
@@ -461,6 +500,8 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
     const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
+    const bool single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr();
+    const int num_local_experts = tokens_per_expert.size(0);
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl y_routed_recv_buffer_data;
@@ -508,13 +549,20 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
         .x_routed_send_buffer = x_routed_send_buffer_data,
         .y_routed_recv_buffer = y_routed_recv_buffer_data,
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_gate),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim, 0, 0,
+            w_routed_gate_storage_table, num_local_experts),
         .w_routed_gate_sc = {},
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_up),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim,
+            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0, 0,
+            w_routed_up_storage_table, num_local_experts),
         .w_routed_up_sc = {},
         .w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down),
-        .w_routed_down = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_down),
+        .w_routed_down = make_routed_weight_view(
+            w_routed_down, hidden_dim, intermediate_dim, 0, 0,
+            w_routed_down_storage_table, num_local_experts),
         .w_routed_down_sc = {},
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),

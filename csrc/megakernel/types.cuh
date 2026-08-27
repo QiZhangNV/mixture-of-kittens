@@ -43,10 +43,13 @@ struct config {
 
 // Grouped GEMM tiles
 using mlp_fp8_tile = st_fp8e4m3<config::MLP_Mb / 2, config::MLP_FP8_Kb>;
+// Native TE columnwise weights are consumed as a B-MN-major operand.
+using mlp_fp8_mn_tile = st_fp8e4m3<config::MLP_FP8_Kb, config::MLP_Nb / 2, true, 128>;
 using mlp_bf16_tile = st_bf<config::MLP_Mb / 2, config::MLP_BF16_Kb>;
 using mlp_bf16_t_tile = st_bf<config::MLP_BF16_Kb, config::MLP_Mb / 2>; // shared-expert BF16 K-major operand
 using mlp_sc_tile = st_fp8e8m0<32, 16, false>;
 using mlp_bf16_d_tile = st_bf<config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>;
+using mlp_fp32_d_tile = st_fl<config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>;
 using mlp_fp8_d_tile = st_fp8e4m3<config::MLP_Mb / 2, 32>;
 
 // MXFP8 quantize tiles
@@ -71,17 +74,240 @@ using router_weight_pgl = std::array<float *, NUM_DEVICES>;  // lightweight pgl
 using activation_bf16_pgl = std::array<bf16 *, NUM_DEVICES>; // lightweight pgl
 using weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_tile, mlp_bf16_t_tile>;
 using d_weight_bf16_gl = gl<bf16, 1, -1, -1, -1, mlp_bf16_d_tile>;
-using weight_fp8_gl = gl<fp8e4m3, 1, -1, -1, -1, mlp_fp8_tile>;
+using d_weight_fp32_gl = gl<float, 1, -1, -1, -1, mlp_fp32_d_tile>;
+using d_weight_gl = std::conditional_t<ACCUMULATE_WGRAD && !BF16_MAIN_GRAD,
+                                       d_weight_fp32_gl, d_weight_bf16_gl>;
+using weight_fp8_gl = gl<fp8e4m3, 1, -1, -1, -1, mlp_fp8_tile, mlp_fp8_mn_tile>;
 using sc_gl = gl<fp8e8m0, -1, -1, 32, 16, mlp_sc_tile>;
+
+// Logical matrix and scale views over contiguous physical storage. In
+// single-grouped FC1 mode gate and up share the native TE [E, 2I, H] rowwise
+// and columnwise payload tensors and differ only by their tile offsets. The
+// columnwise payload retains the original tensor shape but is quantized along
+// the other matrix axis. The TMA descriptor always describes the full tensor.
+template <typename GL>
+struct routed_matrix_view {
+    using identifier = ducks::gl::identifier;
+    GL storage;
+    // Optional table of one complete TK global-layout/TMA descriptor per
+    // expert. Dense/single-grouped weights leave this null and use the expert
+    // dimension of storage; split weights select one depth-1 layout after the
+    // grouped-GEMM task has resolved its expert.
+    const GL *expert_storages;
+    int logical_rows;
+    int logical_cols;
+    int logical_depth;
+    int row_tile_offset;
+    int col_tile_offset;
+
+    struct selected_view {
+        using identifier = ducks::gl::identifier;
+        const routed_matrix_view *parent;
+        int expert;
+
+        template <typename U, int axis>
+        __device__ inline const CUtensorMap *get_tma() const {
+            return parent->expert_storages == nullptr
+                ? parent->storage.template get_tma<U, axis>()
+                : parent->expert_storages[expert].template get_tma<U, axis>();
+        }
+    };
+
+    __host__ __device__ inline int batch() const { return storage.batch(); }
+    __host__ __device__ inline int depth() const { return logical_depth; }
+    __host__ __device__ inline int rows() const { return logical_rows; }
+    __host__ __device__ inline int cols() const { return logical_cols; }
+    __device__ inline selected_view select_expert(int expert) const {
+        return {this, expert};
+    }
+    __device__ inline int physical_expert(int logical_expert) const {
+        return expert_storages == nullptr ? logical_expert : 0;
+    }
+    template <typename U, int axis>
+    __device__ inline const CUtensorMap *get_tma() const {
+        return storage.template get_tma<U, axis>();
+    }
+};
+
+struct routed_scale_view {
+    using identifier = ducks::gl::identifier;
+    sc_gl storage;
+    // Optional table of one complete scale layout/TMA descriptor per expert.
+    // Contiguous/single-grouped scales leave this null and fold the expert
+    // into storage's first dimension. Split scales select a depth-1 layout
+    // after the grouped-GEMM task has resolved its expert.
+    const sc_gl *expert_storages;
+    int physical_row_blocks_per_expert;
+    int row_block_offset;
+    int col_block_offset;
+
+    struct selected_view {
+        using identifier = ducks::gl::identifier;
+        const routed_scale_view *parent;
+        int expert;
+
+        template <typename U, int axis>
+        __device__ inline const CUtensorMap *get_tma() const {
+            return parent->expert_storages == nullptr
+                ? parent->storage.template get_tma<U, axis>()
+                : parent->expert_storages[expert].template get_tma<U, axis>();
+        }
+    };
+
+    __device__ inline selected_view select_expert(int expert) const {
+        return {this, expert};
+    }
+    template <typename U, int axis>
+    __device__ inline const CUtensorMap *get_tma() const {
+        return storage.template get_tma<U, axis>();
+    }
+    __device__ inline int physical_row_block(int expert, int logical_row_block) const {
+        return (expert_storages == nullptr ? expert * physical_row_blocks_per_expert : 0)
+               + row_block_offset
+               + logical_row_block;
+    }
+    __device__ inline int physical_col_block(int logical_col_block) const {
+        return col_block_offset + logical_col_block;
+    }
+};
+
 using index_gl = gl<int, 1, 1, 1, -1>;
 using routed_bf16_gl = gl<bf16, 1, 1, -1, -1, mlp_bf16_tile, mlp_bf16_t_tile, mlp_bf16_d_tile, swiglu_tile, quant_bf16_tile>;
 using routed_activation_gl = std::conditional_t<USE_MXFP8, mlp_fp8_gl, routed_bf16_gl>;
 using routed_gate_up_gl = std::conditional_t<USE_MXFP8, gate_up_fp8_gl, routed_bf16_gl>;
-using routed_weight_gl = std::conditional_t<USE_MXFP8, weight_fp8_gl, weight_bf16_gl>;
+using routed_weight_storage_gl = std::conditional_t<USE_MXFP8, weight_fp8_gl, weight_bf16_gl>;
+using routed_weight_gl = routed_matrix_view<routed_weight_storage_gl>;
+using routed_d_weight_gl = routed_matrix_view<d_weight_gl>;
 
 struct unused_gl {};
 using routed_sc_gl = std::conditional_t<USE_MXFP8, sc_gl, unused_gl>;
+using routed_weight_sc_gl = std::conditional_t<USE_MXFP8, routed_scale_view, unused_gl>;
 using routed_transposed_gl = std::conditional_t<USE_MXFP8, mlp_fp8_gl, routed_bf16_gl>;
+
+static __host__ inline routed_weight_gl make_routed_weight_view(
+    const at::Tensor &tensor,
+    int logical_rows,
+    int logical_cols,
+    int row_tile_offset = 0,
+    int col_tile_offset = 0,
+    const std::optional<at::Tensor> &expert_storage_table = std::nullopt,
+    int logical_depth = -1
+) {
+    const int inferred_depth = tensor.dim() >= 3 ? tensor.size(tensor.dim() - 3) : 1;
+    const int depth = logical_depth < 0 ? inferred_depth : logical_depth;
+    const routed_weight_storage_gl *expert_storages = nullptr;
+    if (expert_storage_table.has_value()) {
+        const auto &table = *expert_storage_table;
+        TORCH_CHECK(table.is_cuda() && table.is_contiguous() && table.scalar_type() == at::kByte,
+                    "MoK split weight descriptor table must be contiguous CUDA uint8");
+        TORCH_CHECK(table.device() == tensor.device(),
+                    "MoK split weight descriptor table must be on the weight device");
+        TORCH_CHECK(table.numel() == static_cast<int64_t>(depth) * sizeof(routed_weight_storage_gl),
+                    "MoK split weight descriptor table has the wrong size");
+        expert_storages = reinterpret_cast<const routed_weight_storage_gl *>(table.data_ptr());
+    }
+    return {
+        kittens::py::tensor_to_gl<routed_weight_storage_gl>(tensor),
+        expert_storages, logical_rows, logical_cols, depth,
+        row_tile_offset, col_tile_offset
+    };
+}
+
+static __host__ inline routed_d_weight_gl make_routed_d_weight_view(
+    const at::Tensor &tensor,
+    int logical_rows,
+    int logical_cols,
+    int row_tile_offset = 0,
+    int col_tile_offset = 0,
+    const std::optional<at::Tensor> &expert_storage_table = std::nullopt,
+    int logical_depth = -1
+) {
+    const int inferred_depth = tensor.dim() >= 3 ? tensor.size(tensor.dim() - 3) : 1;
+    const int depth = logical_depth < 0 ? inferred_depth : logical_depth;
+    const d_weight_gl *expert_storages = nullptr;
+    if (expert_storage_table.has_value()) {
+        const auto &table = *expert_storage_table;
+        TORCH_CHECK(table.is_cuda() && table.is_contiguous() && table.scalar_type() == at::kByte,
+                    "MoK split wgrad descriptor table must be contiguous CUDA uint8");
+        TORCH_CHECK(table.device() == tensor.device(),
+                    "MoK split wgrad descriptor table must be on the gradient device");
+        TORCH_CHECK(table.numel() == static_cast<int64_t>(depth) * sizeof(d_weight_gl),
+                    "MoK split wgrad descriptor table has the wrong size");
+        expert_storages = reinterpret_cast<const d_weight_gl *>(table.data_ptr());
+    }
+    return {
+        kittens::py::tensor_to_gl<d_weight_gl>(tensor),
+        expert_storages, logical_rows, logical_cols, depth,
+        row_tile_offset, col_tile_offset
+    };
+}
+
+template <typename GL>
+static __host__ inline at::Tensor make_expert_storage_table(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    TORCH_CHECK(!expert_tensors.empty(), "MoK expert tensor list must not be empty");
+    const auto device = expert_tensors.front().device();
+    std::vector<GL> layouts;
+    layouts.reserve(expert_tensors.size());
+    for (const auto &tensor : expert_tensors) {
+        TORCH_CHECK(tensor.device() == device,
+                    "MoK expert tensors must all be on the same CUDA device");
+        layouts.emplace_back(kittens::py::tensor_to_gl<GL>(tensor));
+    }
+
+    const int64_t bytes = static_cast<int64_t>(layouts.size() * sizeof(GL));
+    auto host = at::empty(
+        {bytes},
+        at::TensorOptions().device(at::kCPU).dtype(at::kByte).pinned_memory(true));
+    std::memcpy(host.data_ptr(), layouts.data(), static_cast<size_t>(bytes));
+    auto table = at::empty(
+        {bytes},
+        at::TensorOptions().device(device).dtype(at::kByte));
+    table.copy_(host, /*non_blocking=*/true);
+    return table;
+}
+
+static __host__ inline at::Tensor make_routed_weight_storage_table(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    return make_expert_storage_table<routed_weight_storage_gl>(expert_tensors);
+}
+
+static __host__ inline at::Tensor make_routed_d_weight_storage_table(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    return make_expert_storage_table<d_weight_gl>(expert_tensors);
+}
+
+static __host__ inline at::Tensor make_routed_scale_storage_table(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    return make_expert_storage_table<sc_gl>(expert_tensors);
+}
+
+static __host__ inline routed_scale_view make_routed_scale_view(
+    const at::Tensor &tensor,
+    int physical_row_blocks_per_expert,
+    int row_block_offset = 0,
+    int col_block_offset = 0,
+    const std::optional<at::Tensor> &expert_storage_table = std::nullopt,
+    int logical_depth = 1
+) {
+    const sc_gl *expert_storages = nullptr;
+    if (expert_storage_table.has_value()) {
+        const auto &table = *expert_storage_table;
+        TORCH_CHECK(table.is_cuda() && table.is_contiguous() && table.scalar_type() == at::kByte,
+                    "MoK split scale descriptor table must be contiguous CUDA uint8");
+        TORCH_CHECK(table.device() == tensor.device(),
+                    "MoK split scale descriptor table must be on the scale device");
+        TORCH_CHECK(table.numel() == static_cast<int64_t>(logical_depth) * sizeof(sc_gl),
+                    "MoK split scale descriptor table has the wrong size");
+        expert_storages = reinterpret_cast<const sc_gl *>(table.data_ptr());
+    }
+    return {kittens::py::tensor_to_gl<sc_gl>(tensor), expert_storages,
+            physical_row_blocks_per_expert, row_block_offset, col_block_offset};
+}
 
 struct globals_fwd {
     mlp_bf16_gl x_shared;                     // (num_local_tokens, H) gate/up GEMM A
@@ -110,13 +336,13 @@ struct globals_fwd {
 
     weight_bf16_gl w_shared_gate;             // (I, H)
     routed_weight_gl w_routed_gate;           // (num_local_experts, I, H)
-    routed_sc_gl w_routed_gate_sc;            // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    routed_weight_sc_gl w_routed_gate_sc;     // MXFP8 only: logical gate view
     weight_bf16_gl w_shared_up;               // (I, H)
     routed_weight_gl w_routed_up;             // (num_local_experts, I, H)
-    routed_sc_gl w_routed_up_sc;              // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    routed_weight_sc_gl w_routed_up_sc;       // MXFP8 only: logical up view
     weight_bf16_gl w_shared_down;             // (H, I)
     routed_weight_gl w_routed_down;           // (num_local_experts, H, I)
-    routed_sc_gl w_routed_down_sc;            // MXFP8 only: (num_local_experts * H / 128, I / 128, 32, 16)
+    routed_weight_sc_gl w_routed_down_sc;     // MXFP8 only: logical down view
 
     index_gl schedule_peer_rank;              // (schedule_capacity,)
     index_gl schedule_peer_token_idx;         // (schedule_capacity,)
@@ -208,26 +434,26 @@ struct globals_bwd {
 
     // Weights
     routed_weight_gl w_routed_gate;                       // (num_local_experts, I, H) replay
-    routed_sc_gl w_routed_gate_sc;                        // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    routed_weight_sc_gl w_routed_gate_sc;                 // MXFP8 only: logical gate view
     routed_weight_gl w_routed_up;                         // (num_local_experts, I, H) replay
-    routed_sc_gl w_routed_up_sc;                          // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    routed_weight_sc_gl w_routed_up_sc;                   // MXFP8 only: logical up view
     weight_bf16_gl w_shared_gate;                         // (I, H)
     routed_weight_gl w_routed_gate_T;                     // MXFP8: transposed; BF16: normal (I, H)
-    routed_sc_gl w_routed_gate_T_sc;                      // MXFP8 only: (num_local_experts * H / 128, I / 128, 32, 16)
+    routed_weight_sc_gl w_routed_gate_T_sc;               // MXFP8 only: logical transposed gate view
     weight_bf16_gl w_shared_up;                           // (I, H)
     routed_weight_gl w_routed_up_T;                       // MXFP8: transposed; BF16: normal (I, H)
-    routed_sc_gl w_routed_up_T_sc;                        // MXFP8 only: (num_local_experts * H / 128, I / 128, 32, 16)
+    routed_weight_sc_gl w_routed_up_T_sc;                 // MXFP8 only: logical transposed up view
     weight_bf16_gl w_shared_down;                         // (H, I)
     routed_weight_gl w_routed_down_T;                     // MXFP8: transposed; BF16: normal (H, I)
-    routed_sc_gl w_routed_down_T_sc;                      // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    routed_weight_sc_gl w_routed_down_T_sc;               // MXFP8 only: logical transposed down view
 
     // Weight gradients
-    d_weight_bf16_gl d_w_shared_gate;                     // (I, H)
-    d_weight_bf16_gl d_w_routed_gate;                     // (num_local_experts, I, H)
-    d_weight_bf16_gl d_w_shared_up;                       // (I, H)
-    d_weight_bf16_gl d_w_routed_up;                       // (num_local_experts, I, H)
-    d_weight_bf16_gl d_w_shared_down;                     // (H, I)
-    d_weight_bf16_gl d_w_routed_down;                     // (num_local_experts, H, I)
+    d_weight_gl d_w_shared_gate;                          // (I, H)
+    routed_d_weight_gl d_w_routed_gate;                   // logical gate view
+    d_weight_gl d_w_shared_up;                            // (I, H)
+    routed_d_weight_gl d_w_routed_up;                     // logical up view
+    d_weight_gl d_w_shared_down;                          // (H, I)
+    routed_d_weight_gl d_w_routed_down;                   // logical down view
 
     // Schedules
     index_gl schedule_peer_rank;                          // (schedule_capacity,)
@@ -246,6 +472,7 @@ struct globals_bwd {
     index_gl replayed_hidden_ready;                       // (routed row blocks,) replayed swiglu -> wgrad down
     index_gl routed_buffers_done;                         // (num_macrobatches,) current macrobatch -> next macrobatch
 
+    const bool routed_weights_are_native_columnwise;
     const int topk;
     const float swiglu_limit;
     const int num_comm_sms;
@@ -301,10 +528,10 @@ struct globals_recompute_forward_context {
     // Weights
     weight_bf16_gl w_shared_gate;             // (I, H)
     routed_weight_gl w_routed_gate;           // (num_local_experts, I, H)
-    routed_sc_gl w_routed_gate_sc;            // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    routed_weight_sc_gl w_routed_gate_sc;     // MXFP8 only: logical gate view
     weight_bf16_gl w_shared_up;               // (I, H)
     routed_weight_gl w_routed_up;             // (num_local_experts, I, H)
-    routed_sc_gl w_routed_up_sc;              // MXFP8 only: (num_local_experts * I / 128, H / 128, 32, 16)
+    routed_weight_sc_gl w_routed_up_sc;       // MXFP8 only: logical up view
 
     // Schedules
     index_gl schedule_peer_rank;              // (schedule_capacity,)

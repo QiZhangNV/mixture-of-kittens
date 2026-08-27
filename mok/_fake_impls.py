@@ -31,8 +31,10 @@ def _schedule_fake(
     schedule_capacity: int,
     rank: int,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,  # schedule_peer_rank, schedule_peer_token_idx
-    torch.Tensor, torch.Tensor,  # num_tokens, tokens_per_expert
+    torch.Tensor,
+    torch.Tensor,  # schedule_peer_rank, schedule_peer_token_idx
+    torch.Tensor,
+    torch.Tensor,  # num_tokens, tokens_per_expert
 ]:
     return (
         topk_all.new_empty((schedule_capacity,), dtype=torch.int32),
@@ -48,19 +50,34 @@ def _mxfp8_quantize_fake(
     return_normal: bool,
     return_transposed: bool,
 ) -> tuple[
-    torch.Tensor | None, torch.Tensor | None,  # x_fp8, x_sc
-    torch.Tensor | None, torch.Tensor | None,  # x_fp8_t, x_sc_t
+    torch.Tensor | None,
+    torch.Tensor | None,  # x_fp8, x_sc
+    torch.Tensor | None,
+    torch.Tensor | None,  # x_fp8_t, x_sc_t
 ]:
     expert_count = x_bf16.shape[0] if x_bf16.ndim == 3 else 1
     rows = x_bf16.shape[-2]
     columns = x_bf16.shape[-1]
-    x_fp8_t_shape = ((expert_count, columns, rows)
-                     if x_bf16.ndim == 3 else (columns, rows))
+    x_fp8_t_shape = (
+        (expert_count, columns, rows) if x_bf16.ndim == 3 else (columns, rows)
+    )
     return (
-        x_bf16.new_empty(x_bf16.shape, dtype=torch.float8_e4m3fn) if return_normal else None,
-        x_bf16.new_empty((expert_count * rows // 128, columns // 128, 32, 16), dtype=torch.uint8) if return_normal else None,
-        x_bf16.new_empty(x_fp8_t_shape, dtype=torch.float8_e4m3fn) if return_transposed else None,
-        x_bf16.new_empty((expert_count * columns // 128, rows // 128, 32, 16), dtype=torch.uint8) if return_transposed else None,
+        x_bf16.new_empty(x_bf16.shape, dtype=torch.float8_e4m3fn)
+        if return_normal
+        else None,
+        x_bf16.new_empty(
+            (expert_count * rows // 128, columns // 128, 32, 16), dtype=torch.uint8
+        )
+        if return_normal
+        else None,
+        x_bf16.new_empty(x_fp8_t_shape, dtype=torch.float8_e4m3fn)
+        if return_transposed
+        else None,
+        x_bf16.new_empty(
+            (expert_count * columns // 128, rows // 128, 32, 16), dtype=torch.uint8
+        )
+        if return_transposed
+        else None,
     )
 
 
@@ -88,27 +105,52 @@ def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
+    w_routed_gate_sc_storage_table: torch.Tensor | None = None,
+    w_routed_up_sc_storage_table: torch.Tensor | None = None,
+    w_routed_down_sc_storage_table: torch.Tensor | None = None,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
-    torch.Tensor, torch.Tensor,  # y_shared, y_routed
+    torch.Tensor,
+    torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
+    torch.Tensor,
+    torch.Tensor,  # y_shared, y_routed
 ]:
     num_local_tokens, hidden_size = x.shape
     intermediate_size = w_shared_gate.shape[0]
     return (
         x.new_empty((hidden_size, macrobatch_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8
+        ),
         x.new_empty((num_local_tokens, intermediate_size)),
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (macrobatch_size // 128, intermediate_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
         x.new_empty((num_local_tokens, intermediate_size)),
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (macrobatch_size // 128, intermediate_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
         x.new_empty((num_local_tokens, intermediate_size)),
         x.new_empty((intermediate_size, macrobatch_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((intermediate_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (intermediate_size // 128, macrobatch_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
         x.new_empty(x.shape),
         x.new_empty((macrobatch_size, hidden_size)),
     )
@@ -135,12 +177,19 @@ def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
     intermediate_size = w_shared_gate.shape[0]
@@ -177,25 +226,43 @@ def _recompute_forward_context_mxfp8_fake(
     macrobatch_size: int,
     minibatch_size: int,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
+    torch.Tensor,
+    torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
 ]:
     num_local_tokens, hidden_size = x.shape
     intermediate_size = w_shared_gate.shape[0]
     return (
         x.new_empty((hidden_size, macrobatch_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8
+        ),
         x.new_empty((num_local_tokens, intermediate_size)),
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (macrobatch_size // 128, intermediate_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
         x.new_empty((num_local_tokens, intermediate_size)),
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (macrobatch_size // 128, intermediate_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
         x.new_empty((num_local_tokens, intermediate_size)),
         x.new_empty((intermediate_size, macrobatch_size), dtype=torch.float8_e4m3fn),
-        x.new_empty((intermediate_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
+        x.new_empty(
+            (intermediate_size // 128, macrobatch_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
     )
 
 
@@ -218,9 +285,12 @@ def _recompute_forward_context_bf16_fake(
     minibatch_size: int,
 ) -> tuple[
     torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
     intermediate_size = w_shared_gate.shape[0]
@@ -280,15 +350,26 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    routed_weights_are_native_columnwise: bool = False,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,  # d_x_shared, d_x_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # d_up_shared, d_up_fp8_routed, d_up_sc_routed
-    torch.Tensor, torch.Tensor,  # d_hidden_shared, d_hidden_routed
-    torch.Tensor, torch.Tensor,  # d_y_fp8_routed, d_y_sc_routed
-    torch.Tensor, torch.Tensor,  # d_w_shared_gate, d_w_routed_gate
-    torch.Tensor, torch.Tensor,  # d_w_shared_up, d_w_routed_up
-    torch.Tensor, torch.Tensor,  # d_w_shared_down, d_w_routed_down
+    torch.Tensor,
+    torch.Tensor,  # d_x_shared, d_x_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,  # d_up_shared, d_up_fp8_routed, d_up_sc_routed
+    torch.Tensor,
+    torch.Tensor,  # d_hidden_shared, d_hidden_routed
+    torch.Tensor,
+    torch.Tensor,  # d_y_fp8_routed, d_y_sc_routed
+    torch.Tensor,
+    torch.Tensor,  # d_w_shared_gate, d_w_routed_gate
+    torch.Tensor,
+    torch.Tensor,  # d_w_shared_up, d_w_routed_up
+    torch.Tensor,
+    torch.Tensor,  # d_w_shared_down, d_w_routed_down
 ]:
     num_local_tokens, hidden_size = x.shape
     num_local_experts = w_routed_gate.shape[0]
@@ -297,15 +378,27 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
         d_y_buffer.new_empty((num_local_tokens, hidden_size)),
         d_y_buffer.new_empty((macrobatch_size, hidden_size)),
         d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
-        d_y_buffer.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
-        d_y_buffer.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
+        d_y_buffer.new_empty(
+            (macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn
+        ),
+        d_y_buffer.new_empty(
+            (macrobatch_size // 128, intermediate_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
         d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
-        d_y_buffer.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
-        d_y_buffer.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
+        d_y_buffer.new_empty(
+            (macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn
+        ),
+        d_y_buffer.new_empty(
+            (macrobatch_size // 128, intermediate_size // 128, 32, 16),
+            dtype=torch.uint8,
+        ),
         d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
         d_y_buffer.new_empty((macrobatch_size, intermediate_size)),
         d_y_buffer.new_empty((macrobatch_size, hidden_size), dtype=torch.float8_e4m3fn),
-        d_y_buffer.new_empty((macrobatch_size // 128, hidden_size // 128, 32, 16), dtype=torch.uint8),
+        d_y_buffer.new_empty(
+            (macrobatch_size // 128, hidden_size // 128, 32, 16), dtype=torch.uint8
+        ),
         d_y_buffer.new_empty((intermediate_size, hidden_size)),
         d_y_buffer.new_empty((num_local_experts, intermediate_size, hidden_size)),
         d_y_buffer.new_empty((intermediate_size, hidden_size)),
@@ -350,14 +443,21 @@ def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
     macrobatch_size: int,
     minibatch_size: int,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
     torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
     num_local_experts = w_routed_gate.shape[0]

@@ -4,12 +4,13 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     const std::conditional_t<IS_WGRAD, std::conditional_t<IS_SHARED, wgrad_bf16_gl, routed_activation_gl>,
                                        std::conditional_t<IS_SHARED, weight_bf16_gl, routed_weight_gl>> &b_gmem,
     const routed_sc_gl *a_sc_gmem,          // routed MXFP8 only
-    const routed_sc_gl *b_sc_gmem,          // routed MXFP8 only
+    const std::conditional_t<IS_WGRAD, routed_sc_gl, routed_weight_sc_gl> *b_sc_gmem,
     const std::conditional_t<IS_SHARED, mlp_bf16_gl, routed_activation_gl> *a2_gmem, // accumulated second GEMM
     const std::conditional_t<IS_SHARED, weight_bf16_gl, routed_weight_gl> *b2_gmem,
     const routed_sc_gl *a2_sc_gmem,         // routed MXFP8 only
-    const routed_sc_gl *b2_sc_gmem,         // routed MXFP8 only
-    const std::conditional_t<IS_WGRAD, d_weight_bf16_gl, epi_bf16_gl> &d_gmem,
+    const std::conditional_t<IS_WGRAD, routed_sc_gl, routed_weight_sc_gl> *b2_sc_gmem,
+    const std::conditional_t<IS_WGRAD, std::conditional_t<IS_SHARED, d_weight_gl,
+                                                                  routed_d_weight_gl>, epi_bf16_gl> &d_gmem,
     const routed_gate_up_gl *d_routed_gmem, // routed gate/up saved activation
     const routed_sc_gl *d_sc_gmem,          // routed MXFP8 only
     const index_gl &tokens_per_expert,
@@ -46,7 +47,8 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
     using a_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile,
                                       std::conditional_t<IS_WGRAD, mlp_bf16_t_tile, mlp_bf16_tile>>;
-    using b_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile,
+    using b_tile = std::conditional_t<USE_ROUTED_MXFP8,
+                                      std::conditional_t<IS_AB, mlp_fp8_mn_tile, mlp_fp8_tile>,
                                       std::conditional_t<IS_WGRAD || IS_AB, mlp_bf16_t_tile, mlp_bf16_tile>>;
     constexpr int MLP_Kb = USE_ROUTED_MXFP8 ? config::MLP_FP8_Kb : config::MLP_BF16_Kb;
 
@@ -56,8 +58,10 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     auto (&b_sc_smem)[config::MLP_LOAD_PIPE_DEPTH][2] = *reinterpret_cast<mlp_sc_tile (*)[config::MLP_LOAD_PIPE_DEPTH][2]>(smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem));
     auto (&d_bf16_smem)[config::MLP_NUM_BF16_D_TILES] = *reinterpret_cast<mlp_bf16_d_tile (*)[config::MLP_NUM_BF16_D_TILES]>((smem_base_addr + sizeof(a_smem) + sizeof(b_smem) + sizeof(a_sc_smem) + sizeof(b_sc_smem) + 1023) & ~uint64_t(1023));
     auto &d_fp8_smem                                  = *reinterpret_cast<mlp_fp8_d_tile *>(&d_bf16_smem[2]);
+    auto &d_fp32_smem                                 = *reinterpret_cast<mlp_fp32_d_tile *>(&d_bf16_smem[0]);
     auto (&d_sc_smem)[2]                              = *reinterpret_cast<mlp_sc_tile (*)[2]>(reinterpret_cast<uint64_t>(&d_fp8_smem) + sizeof(d_fp8_smem));
     static_assert(config::MLP_NUM_BF16_D_TILES >= 3);
+    static_assert(sizeof(mlp_fp32_d_tile) <= 2 * sizeof(mlp_bf16_d_tile));
     static_assert(sizeof(mlp_fp8_d_tile) + 2 * sizeof(mlp_sc_tile) <= sizeof(mlp_bf16_d_tile));
 
     const int col_blocks = ((IS_WGRAD && !USE_ROUTED_MXFP8) || IS_AB) ? b_gmem.cols() / config::MLP_Nb : b_gmem.rows() / config::MLP_Nb;
@@ -173,10 +177,26 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     const int k_block = idx < first_gemm_iters ? idx : idx - first_gemm_iters;
                     wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
                     tma::cluster::load_async(a_smem[input_ring], a_gmem_curr, {tile_coord.x * 2 + cta_rank, k_block},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                    if constexpr (IS_AB)
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                    else
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    if constexpr (IS_SHARED || IS_WGRAD) {
+                        if constexpr (IS_AB)
+                            tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        else
+                            tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    } else if constexpr (IS_AB) {
+                        const auto selected_b = b_gmem_curr.select_expert(tile_coord.z);
+                        tma::cluster::load_async(b_smem[input_ring], selected_b,
+                            {b_gmem_curr.physical_expert(tile_coord.z),
+                             k_block + b_gmem_curr.row_tile_offset,
+                             tile_coord.y * 2 + cta_rank + b_gmem_curr.col_tile_offset},
+                            gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    } else {
+                        const auto selected_b = b_gmem_curr.select_expert(tile_coord.z);
+                        tma::cluster::load_async(b_smem[input_ring], selected_b,
+                            {b_gmem_curr.physical_expert(tile_coord.z),
+                             tile_coord.y * 2 + cta_rank + b_gmem_curr.row_tile_offset,
+                             k_block + b_gmem_curr.col_tile_offset},
+                            gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    }
                     update_phasebit<1>(gemm_bitfield, input_ring);
                     input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                 }
@@ -199,11 +219,23 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     for (int idx = 0; idx < iters_per_task; ++idx) {
                         wait(gemm_scales_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
                         const sc_gl &a_sc_curr = idx < first_gemm_iters ? *a_sc_gmem : *a2_sc_gmem;
-                        const sc_gl &b_sc_curr = idx < first_gemm_iters ? *b_sc_gmem : *b2_sc_gmem;
+                        const auto &b_sc_curr = idx < first_gemm_iters ? *b_sc_gmem : *b2_sc_gmem;
                         const auto &b_gmem_curr = idx < first_gemm_iters ? b_gmem : *b2_gmem;
                         const int k_block = idx < first_gemm_iters ? idx : idx - first_gemm_iters;
                         tma::cluster::load_async(a_sc_smem[input_ring], a_sc_curr, {tile_coord.x * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], b_sc_curr, {tile_coord.z * (b_gmem_curr.rows() / config::QUANT_Mb) + tile_coord.y * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                        if constexpr (IS_WGRAD) {
+                            tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], b_sc_curr,
+                                {tile_coord.z * (b_gmem_curr.rows() / config::QUANT_Mb)
+                                     + tile_coord.y * 2 + cta_rank,
+                                 k_block, 0, 0},
+                                gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                        } else {
+                            const auto selected_b_sc = b_sc_curr.select_expert(tile_coord.z);
+                            tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], selected_b_sc,
+                                {b_sc_curr.physical_row_block(tile_coord.z, tile_coord.y * 2 + cta_rank),
+                                 b_sc_curr.physical_col_block(k_block), 0, 0},
+                                gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                        }
                         update_phasebit<1>(gemm_bitfield, input_ring);
                         input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                     }
@@ -227,14 +259,29 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     load_mxnv_scale_async2(b_sc_tt_subtile_1, b_sc_smem[input_ring][1], gemm_scales_finished[input_ring]);
                     tma::expect_bytes(gemm_inputs_arrived[input_ring], config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
                     wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
-                    if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring],
-                                           a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
-                                           b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
-                                           gemm_inputs_finished[input_ring]);
-                    else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring],
-                                           a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
-                                           b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
-                                           gemm_inputs_finished[input_ring]);
+                    if constexpr (IS_AB) {
+                        if (idx == 0)
+                            mm2_AB(
+                                d_tt, a_smem[input_ring], b_smem[input_ring],
+                                a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                gemm_inputs_finished[input_ring]);
+                        else
+                            mma2_AB(
+                                d_tt, a_smem[input_ring], b_smem[input_ring],
+                                a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                gemm_inputs_finished[input_ring]);
+                    } else {
+                        if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring],
+                                               a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                               b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                               gemm_inputs_finished[input_ring]);
+                        else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring],
+                                               a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                               b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                               gemm_inputs_finished[input_ring]);
+                    }
                 } else {
                     tma::expect_bytes(gemm_inputs_arrived[input_ring], config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
                     wait(gemm_inputs_arrived[input_ring], get_phasebit<0>(gemm_bitfield, input_ring));
@@ -259,6 +306,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
         wait(gemm_outputs_arrived, get_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH));
         update_phasebit<0>(gemm_bitfield, config::MLP_LOAD_PIPE_DEPTH);
         auto store_bf16 = [&]() {
+          if constexpr (!(IS_WGRAD && ACCUMULATE_WGRAD && !BF16_MAIN_GRAD)) {
             rt_bf<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg[config::MLP_EPI_PIPE_DEPTH];
             #pragma unroll
             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i)
@@ -281,18 +329,57 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
                 warpgroup::sync(1);
                 if constexpr (IS_WGRAD) {
-                    if (is_first_wgrad_contribution)
-                        warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
-                    else
-                        // Macrobatches are serialized by routed_buffers_done, so additions occur in a fixed order, preserving determinism
-                        warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {tile_coord.z, 2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
+                    int row_tile = 2 * tile_coord.x + cta_rank;
+                    int col_tile = config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i;
+                    if constexpr (!IS_SHARED) {
+                        row_tile += d_gmem.row_tile_offset;
+                        col_tile += d_gmem.col_tile_offset;
+                    }
+                    if constexpr (ACCUMULATE_WGRAD) {
+                        // main_grad already contains contributions from earlier
+                        // microbatches, so every contribution is additive.
+                        if constexpr (IS_SHARED) {
+                            warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                                d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                                {tile_coord.z, row_tile, col_tile});
+                        } else {
+                            const auto selected_d = d_gmem.select_expert(tile_coord.z);
+                            warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                                selected_d, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                                {d_gmem.physical_expert(tile_coord.z), row_tile, col_tile});
+                        }
+                    } else if (is_first_wgrad_contribution) {
+                        if constexpr (IS_SHARED) {
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                                d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                                {tile_coord.z, row_tile, col_tile});
+                        } else {
+                            const auto selected_d = d_gmem.select_expert(tile_coord.z);
+                            warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                                selected_d, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                                {d_gmem.physical_expert(tile_coord.z), row_tile, col_tile});
+                        }
+                    } else {
+                        // Macrobatches are serialized, preserving a fixed add order.
+                        if constexpr (IS_SHARED) {
+                            warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                                d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                                {tile_coord.z, row_tile, col_tile});
+                        } else {
+                            const auto selected_d = d_gmem.select_expert(tile_coord.z);
+                            warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                                selected_d, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES],
+                                {d_gmem.physical_expert(tile_coord.z), row_tile, col_tile});
+                        }
+                    }
                 } else {
                     warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], {2 * tile_coord.x + cta_rank, config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i});
                 }
             }
             warpgroup::tma::store_async_read_wait();
+          }
         };
-        if constexpr (USE_ROUTED_MXFP8) {
+        if constexpr (USE_ROUTED_MXFP8 && !(IS_WGRAD && ACCUMULATE_WGRAD)) {
           if (d_routed_gmem != nullptr) {
             constexpr int NUM_MXFP8_BLOCKS = config::MLP_Nb / 32;
             const int tile_row = warpgroup::laneid();
@@ -361,7 +448,44 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             store_bf16();
           }
         } else {
-            store_bf16();
+            if constexpr (IS_WGRAD && ACCUMULATE_WGRAD && !BF16_MAIN_GRAD) {
+                // The Tensor Core accumulator is already FP32. Keep it FP32 and use
+                // TMA reduction stores to accumulate directly into MCore main_grad,
+                // avoiding the BF16 temporary-gradient write/read round trip.
+                // Reuse one register tile. Keeping four FP32 epilogue tiles live
+                // at once causes multi-kilobyte local-memory spills.
+                rt_fl<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg;
+                #pragma unroll 1
+                for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
+                    warpgroup::load_async(d_reg, d_tt.template subtile<tt<float, config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>>(0, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH * i));
+                    tensor_load_wait();
+                    warpgroup::sync(1);
+                    // One FP32 staging tile stays within the existing SMEM budget.
+                    warpgroup::tma::store_async_read_wait();
+                    warpgroup::sync(1);
+                    warpgroup::store(d_fp32_smem, d_reg);
+                    warpgroup::sync(1);
+                    int row_tile = 2 * tile_coord.x + cta_rank;
+                    int col_tile = config::MLP_EPI_PIPE_DEPTH * tile_coord.y + i;
+                    if constexpr (!IS_SHARED) {
+                        row_tile += d_gmem.row_tile_offset;
+                        col_tile += d_gmem.col_tile_offset;
+                    }
+                    if constexpr (IS_SHARED) {
+                        warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                            d_gmem, d_fp32_smem, {tile_coord.z, row_tile, col_tile});
+                    } else {
+                        const auto selected_d = d_gmem.select_expert(tile_coord.z);
+                        warpgroup::tma::store_add_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                            selected_d, d_fp32_smem,
+                            {d_gmem.physical_expert(tile_coord.z), row_tile, col_tile});
+                    }
+                }
+                warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+                warpgroup::tma::store_async_read_wait();
+            } else {
+                store_bf16();
+            }
         }
         epilogue_group::sync(4);
         if (epilogue_group::warpid() == 0 && warp::elect_leader()) {

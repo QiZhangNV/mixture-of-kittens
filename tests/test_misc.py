@@ -133,9 +133,7 @@ def _run_e2e_case(
     if grad_seed is None:
         grad_generator = generator
     else:
-        grad_generator = torch.Generator(device=device).manual_seed(
-            grad_seed + rank
-        )
+        grad_generator = torch.Generator(device=device).manual_seed(grad_seed + rank)
     d_output = (
         torch.randn(
             num_local_tokens,
@@ -176,7 +174,7 @@ def _run_e2e_case(
 
     for precision in precisions:
         if precision == "bf16":
-            output, forward_context = functional.forward(
+            output, forward_context = functional._forward_gate_up(
                 config,
                 workspace,
                 schedule,
@@ -189,7 +187,7 @@ def _run_e2e_case(
                 w_routed_up,
                 w_routed_down,
             )
-            gradients = functional.backward(
+            gradients = functional._backward_gate_up(
                 config,
                 workspace,
                 schedule,
@@ -243,7 +241,7 @@ def _run_e2e_case(
                     w_routed_down_t_sc,
                 )
             )
-            output, forward_context = functional.forward(
+            output, forward_context = functional._forward_gate_up(
                 config,
                 workspace,
                 schedule,
@@ -256,7 +254,7 @@ def _run_e2e_case(
                 (w_routed_up_fp8, w_routed_up_sc),
                 (w_routed_down_fp8, w_routed_down_sc),
             )
-            gradients = functional.backward(
+            gradients = functional._backward_gate_up(
                 config,
                 workspace,
                 schedule,
@@ -312,9 +310,7 @@ def _run_e2e_case(
             result_flat = result.float().reshape(-1)
             denominator = expected_flat.norm() * result_flat.norm()
             if float(denominator.item()) <= 1e-12:
-                local_cosine = (
-                    1.0 if torch.equal(expected_flat, result_flat) else 0.0
-                )
+                local_cosine = 1.0 if torch.equal(expected_flat, result_flat) else 0.0
             else:
                 local_cosine = float(
                     ((expected_flat @ result_flat) / denominator).item()
@@ -423,8 +419,7 @@ def test_ep1_on_each_rank(
 ) -> None:
     rank, world_size, device = context
     singleton_groups = [
-        dist.new_group(ranks=[group_rank])
-        for group_rank in range(world_size)
+        dist.new_group(ranks=[group_rank]) for group_rank in range(world_size)
     ]
     ep_group = singleton_groups[rank]
     assert isinstance(ep_group, dist.ProcessGroup)
@@ -490,9 +485,7 @@ def test_ep1_on_each_rank(
             == workspace.all_gather_top_experts_buffer.data_ptr()
         )
         assert workspace.barrier_buffer_handle is None
-        assert workspace.barrier_buffer_ptrs == [
-            workspace.barrier_buffer.data_ptr()
-        ]
+        assert workspace.barrier_buffer_ptrs == [workspace.barrier_buffer.data_ptr()]
         assert (
             workspace.barrier_buffer_multicast_ptr
             == workspace.barrier_buffer.data_ptr()
@@ -568,7 +561,9 @@ def test_e2e_fixed_first_topk_experts_default_capacity(
                 topk,
                 device=device,
                 dtype=torch.int64,
-            ).expand(512, topk).contiguous(),
+            )
+            .expand(512, topk)
+            .contiguous(),
         )
     finally:
         functional.clear_workspace_cache()
@@ -654,8 +649,7 @@ def test_ep_subgroups_do_not_use_world(
 
     functional.clear_workspace_cache()
     subgroup_ranks = [
-        list(range(start, start + 4))
-        for start in range(0, world_size, 4)
+        list(range(start, start + 4)) for start in range(0, world_size, 4)
     ]
     subgroups = [dist.new_group(ranks=ranks) for ranks in subgroup_ranks]
     subgroup_index = rank // 4
@@ -677,18 +671,18 @@ def test_ep_subgroups_do_not_use_world(
             topk=topk,
         )
         routes = (
-            torch.arange(512 * topk, device=device, dtype=torch.int64)
-            + subgroup_rank
-        ).remainder(4 * num_local_experts).view(512, topk)
+            (torch.arange(512 * topk, device=device, dtype=torch.int64) + subgroup_rank)
+            .remainder(4 * num_local_experts)
+            .view(512, topk)
+        )
         schedule = functional.build_schedule(
             workspace,
             config,
             routes,
             num_local_experts=num_local_experts,
         )
-        valid_peer_ranks = (
-            (schedule.peer_rank == -1)
-            | ((schedule.peer_rank >= 0) & (schedule.peer_rank < 4))
+        valid_peer_ranks = (schedule.peer_rank == -1) | (
+            (schedule.peer_rank >= 0) & (schedule.peer_rank < 4)
         )
 
         assert workspace.group_name == subgroup.group_name
@@ -998,7 +992,7 @@ def test_fake_tensor_metadata(
             mxfp8_forward[-2],
             workspace.combine_buffer,
             router_weights,
-            schedule.top_experts,
+            top_experts,
         )
         _assert_metadata(
             (output,),
@@ -1096,7 +1090,7 @@ def test_fake_tensor_metadata(
         d_x = ops.bwd_epilogue(
             mxfp8_backward[0],
             workspace.d_x_routed_buffer,
-            schedule.top_experts,
+            top_experts,
         )
         _assert_metadata(
             (d_x,),
@@ -1371,7 +1365,7 @@ def test_compile_fullgraph(
                     num_local_experts=num_local_experts,
                 )
                 if precision == "bf16":
-                    output, forward_context = functional.forward(
+                    output, forward_context = functional._forward_gate_up(
                         config,
                         workspace,
                         schedule,
@@ -1384,7 +1378,7 @@ def test_compile_fullgraph(
                         routed_up,
                         routed_down,
                     )
-                    gradients = functional.backward(
+                    gradients = functional._backward_gate_up(
                         config,
                         workspace,
                         schedule,
@@ -1419,7 +1413,7 @@ def test_compile_fullgraph(
                     routed_down_t_fp8,
                     routed_down_t_sc,
                 ) = ops.mxfp8_quantize(routed_down, True, True)
-                output, forward_context = functional.forward(
+                output, forward_context = functional._forward_gate_up(
                     config,
                     workspace,
                     schedule,
@@ -1432,7 +1426,7 @@ def test_compile_fullgraph(
                     (routed_up_fp8, routed_up_sc),
                     (routed_down_fp8, routed_down_sc),
                 )
-                gradients = functional.backward(
+                gradients = functional._backward_gate_up(
                     config,
                     workspace,
                     schedule,
@@ -1590,6 +1584,7 @@ def test_compile_fullgraph_recomputed_forward_context(
                     (num_local_experts,),
                     torch.int32,
                 ),
+                top_experts=tensor((num_local_tokens, topk), torch.int32),
             )
             x = tensor((num_local_tokens, hidden_size), torch.bfloat16)
             router_weights = tensor(
@@ -1661,7 +1656,7 @@ def test_compile_fullgraph_recomputed_forward_context(
                 shared_up: torch.Tensor,
                 shared_down: torch.Tensor,
             ) -> tuple[torch.Tensor, ...]:
-                forward_context = functional.recompute_forward_context(
+                forward_context = functional._recompute_forward_context_gate_up(
                     config,
                     workspace,
                     schedule,
@@ -1671,7 +1666,7 @@ def test_compile_fullgraph_recomputed_forward_context(
                     routed_gate_forward,
                     routed_up_forward,
                 )
-                return functional.backward(
+                return functional._backward_gate_up(
                     config,
                     workspace,
                     schedule,
@@ -1950,8 +1945,7 @@ def test_epilogues_support_more_than_max_grid_y_tokens(
         dtype=torch.float32,
     )
 
-    top_experts = torch.zeros(
-        num_local_tokens, 1, dtype=torch.int32, device=device)
+    top_experts = torch.zeros(num_local_tokens, 1, dtype=torch.int32, device=device)
     output = ops.fwd_epilogue(shared, routed, topk_weights, top_experts)
     assert torch.all(output == 1.5)
 

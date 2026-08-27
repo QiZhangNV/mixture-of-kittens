@@ -335,13 +335,21 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 if (routed_task_idx < num_routed_tasks && minibatch_task_idx < minibatch_routed_dgrad_down_tasks) {
                     // Dgrad down: d_hidden_routed = d_y_routed @ w_routed_down
                     const int task_idx = minibatch_task_idx;
-                    expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_y_fp8_routed, g.w_routed_down_T, &g.d_y_sc_routed, &g.w_routed_down_T_sc, nullptr, nullptr, nullptr, nullptr,
-                                               g.d_hidden_routed, nullptr, nullptr,
-                                               g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
-                                               d_tt, a_sc_tt, b_sc_tt,
-                                               gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                               num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
+                    if (g.routed_weights_are_native_columnwise) {
+                        expert_grouped_gemm_kernel<false, false, true>(g.d_y_fp8_routed, g.w_routed_down_T, &g.d_y_sc_routed, &g.w_routed_down_T_sc, nullptr, nullptr, nullptr, nullptr,
+                                                   g.d_hidden_routed, nullptr, nullptr,
+                                                   g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
+                                                   d_tt, a_sc_tt, b_sc_tt,
+                                                   gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                                   num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                                   0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
+                    } else {
+                        expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_y_fp8_routed, g.w_routed_down_T, &g.d_y_sc_routed, &g.w_routed_down_T_sc, nullptr, nullptr, nullptr, nullptr,
+                                                   g.d_hidden_routed, nullptr, nullptr, g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
+                                                   d_tt, a_sc_tt, b_sc_tt, gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                                   num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                                   0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
+                    }
                 } else if (routed_task_idx < num_routed_tasks &&
                            minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks) {
                     // Routed Swiglu backward
@@ -358,14 +366,23 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 } else if (routed_task_idx < num_routed_tasks) {
                     // Dgrad gate+up: d_x_routed = d_gate @ w_routed_gate + d_up @ w_routed_up
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks - minibatch_routed_swiglu_bwd_tasks;
-                    expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_gate_fp8_routed, g.w_routed_gate_T, &g.d_gate_sc_routed, &g.w_routed_gate_T_sc,
-                                               &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,
-                                               g.d_x_routed, nullptr, nullptr,
-                                               g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, &g.d_x_routed_ready, buffer_done,
-                                               d_tt, a_sc_tt, b_sc_tt,
-                                               gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                               num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                    if (g.routed_weights_are_native_columnwise) {
+                        expert_grouped_gemm_kernel<false, false, true>(g.d_gate_fp8_routed, g.w_routed_gate_T, &g.d_gate_sc_routed, &g.w_routed_gate_T_sc,
+                                                   &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,
+                                                   g.d_x_routed, nullptr, nullptr,
+                                                   g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, &g.d_x_routed_ready, buffer_done,
+                                                   d_tt, a_sc_tt, b_sc_tt,
+                                                   gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                                   num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                                   0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                    } else {
+                        expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_gate_fp8_routed, g.w_routed_gate_T, &g.d_gate_sc_routed, &g.w_routed_gate_T_sc,
+                                                   &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,
+                                                   g.d_x_routed, nullptr, nullptr, g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, &g.d_x_routed_ready, buffer_done,
+                                                   d_tt, a_sc_tt, b_sc_tt, gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                                   num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                                   0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                    }
                 } else if (routed_task_idx < num_routed_tasks + wgrad_matrix_tasks) {
                     // Wgrad down: d_w_routed_down += d_y_routed^T @ hidden_routed
                     const int task_idx = routed_task_idx - num_routed_tasks;
@@ -499,18 +516,61 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    bool routed_weights_are_native_columnwise,
+    const at::Tensor *main_grad_shared_gate = nullptr,
+    const at::Tensor *main_grad_routed_gate = nullptr,
+    const at::Tensor *main_grad_shared_up = nullptr,
+    const at::Tensor *main_grad_routed_up = nullptr,
+    const at::Tensor *main_grad_shared_down = nullptr,
+    const at::Tensor *main_grad_routed_down = nullptr,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_T_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_T_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_T_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_T_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_T_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_T_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt
 ) {
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
     const int hidden_dim = x.size(1);
     const int intermediate_dim = w_shared_gate.size(0);
-    const int num_local_experts = w_routed_gate.size(0);
+    const int num_local_experts = tokens_per_expert.size(0);
     const int num_global_minibatches = (schedule_capacity + minibatch_size - 1) / minibatch_size;
     const int num_macrobatches = (schedule_capacity + macrobatch_size - 1) / macrobatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
     const int intermediate_dim_col_blocks = intermediate_dim / config::MLP_Nb;
+    const bool single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr();
+    const bool single_grouped_fc1_T =
+        w_routed_gate_T.data_ptr() == w_routed_up_T.data_ptr();
+    const bool split_weight_storage = w_routed_gate_storage_table.has_value();
+    TORCH_CHECK(
+        split_weight_storage == w_routed_up_storage_table.has_value() &&
+        split_weight_storage == w_routed_gate_T_storage_table.has_value() &&
+        split_weight_storage == w_routed_up_T_storage_table.has_value() &&
+        split_weight_storage == w_routed_down_T_storage_table.has_value(),
+        "MoK: all five split MXFP8 weight descriptor tables must be provided together");
+    const bool split_scale_storage = w_routed_gate_sc_storage_table.has_value();
+    TORCH_CHECK(
+        split_scale_storage == w_routed_up_sc_storage_table.has_value() &&
+        split_scale_storage == w_routed_gate_T_sc_storage_table.has_value() &&
+        split_scale_storage == w_routed_up_T_sc_storage_table.has_value() &&
+        split_scale_storage == w_routed_down_T_sc_storage_table.has_value(),
+        "MoK: all five split MXFP8 scale descriptor tables must be provided together");
+    TORCH_CHECK(split_scale_storage == split_weight_storage,
+                "MoK: split MXFP8 weight and scale descriptor tables must be provided together");
+    TORCH_CHECK(!routed_weights_are_native_columnwise ||
+                (single_grouped_fc1 && single_grouped_fc1_T),
+                "MoK: native columnwise weights require single-grouped FC1 aliases");
+
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl d_y_buffer_data;
@@ -554,12 +614,93 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     at::Tensor d_up_shared = at::empty_like(d_hidden_shared);
     at::Tensor d_x_shared = at::empty({num_local_tokens, hidden_dim}, d_y_buffer.options());
     at::Tensor d_x_routed = at::empty({macrobatch_size, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_shared_gate = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_gate = at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_shared_up = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_up = at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_shared_down = at::empty({hidden_dim, intermediate_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_down = at::empty({num_local_experts, hidden_dim, intermediate_dim}, d_y_buffer.options());
+    at::Tensor d_w_shared_gate;
+    at::Tensor d_w_routed_gate;
+    at::Tensor d_w_shared_up;
+    at::Tensor d_w_routed_up;
+    at::Tensor d_w_shared_down;
+    at::Tensor d_w_routed_down;
+    if constexpr (ACCUMULATE_WGRAD) {
+        TORCH_CHECK(main_grad_shared_gate && main_grad_routed_gate && main_grad_shared_up &&
+                    main_grad_routed_up && main_grad_shared_down && main_grad_routed_down,
+                    "MoK: all six main_grad tensors are required for fused accumulation");
+        auto validate_main_grad = [&](const at::Tensor &main_grad,
+                                      const std::vector<int64_t> &expected_shape,
+                                      const char *name) {
+            TORCH_CHECK(main_grad.is_cuda(), "MoK: ", name, " must be a CUDA tensor");
+            constexpr at::ScalarType expected_dtype =
+                BF16_MAIN_GRAD ? at::kBFloat16 : at::kFloat;
+            TORCH_CHECK(main_grad.scalar_type() == expected_dtype,
+                        "MoK: ", name, " must have dtype ",
+                        BF16_MAIN_GRAD ? "bfloat16" : "float32");
+            TORCH_CHECK(main_grad.sizes().vec() == expected_shape,
+                        "MoK: ", name, " has the wrong shape");
+            TORCH_CHECK(main_grad.device() == x.device(),
+                        "MoK: ", name, " must be on the input device");
+            TORCH_CHECK(main_grad.is_contiguous(),
+                        "MoK: ", name, " must be contiguous");
+        };
+        validate_main_grad(*main_grad_shared_gate,
+                           {intermediate_dim, hidden_dim}, "main_grad_shared_gate");
+        validate_main_grad(*main_grad_shared_up,
+                           {intermediate_dim, hidden_dim}, "main_grad_shared_up");
+        const bool split_main_grads = main_grad_routed_gate_storage_table.has_value();
+        TORCH_CHECK(
+            split_main_grads == main_grad_routed_up_storage_table.has_value() &&
+            split_main_grads == main_grad_routed_down_storage_table.has_value(),
+            "MoK: all three split main-grad descriptor tables must be provided together");
+        TORCH_CHECK(split_main_grads == split_weight_storage,
+                    "MoK: split weight and main-grad descriptor tables must be provided together");
+        const bool single_grouped_main_grad =
+            main_grad_routed_gate->data_ptr() == main_grad_routed_up->data_ptr();
+        if (split_main_grads) {
+            TORCH_CHECK(single_grouped_main_grad,
+                        "MoK: split FC1 gate/up main-grad representatives must alias");
+            validate_main_grad(*main_grad_routed_gate,
+                               {2 * intermediate_dim, hidden_dim},
+                               "split_main_grad_routed_fc1");
+            validate_main_grad(*main_grad_routed_up,
+                               {2 * intermediate_dim, hidden_dim},
+                               "split_main_grad_routed_fc1_up_alias");
+        } else if (single_grouped_main_grad) {
+            validate_main_grad(*main_grad_routed_gate,
+                               {num_local_experts, 2 * intermediate_dim, hidden_dim},
+                               "main_grad_routed_fc1");
+            validate_main_grad(*main_grad_routed_up,
+                               {num_local_experts, 2 * intermediate_dim, hidden_dim},
+                               "main_grad_routed_fc1_up_alias");
+        } else {
+            validate_main_grad(*main_grad_routed_gate,
+                               {num_local_experts, intermediate_dim, hidden_dim},
+                               "main_grad_routed_gate");
+            validate_main_grad(*main_grad_routed_up,
+                               {num_local_experts, intermediate_dim, hidden_dim},
+                               "main_grad_routed_up");
+        }
+        validate_main_grad(*main_grad_shared_down,
+                           {hidden_dim, intermediate_dim}, "main_grad_shared_down");
+        validate_main_grad(
+            *main_grad_routed_down,
+            split_main_grads
+                ? std::vector<int64_t>{hidden_dim, intermediate_dim}
+                : std::vector<int64_t>{num_local_experts, hidden_dim, intermediate_dim},
+            "main_grad_routed_down");
+        d_w_shared_gate = *main_grad_shared_gate;
+        d_w_routed_gate = *main_grad_routed_gate;
+        d_w_shared_up = *main_grad_shared_up;
+        d_w_routed_up = *main_grad_routed_up;
+        d_w_shared_down = *main_grad_shared_down;
+        d_w_routed_down = *main_grad_routed_down;
+    } else {
+        TORCH_CHECK(!split_weight_storage,
+                    "MoK: split routed weights require fused wgrad accumulation");
+        d_w_shared_gate = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
+        d_w_routed_gate = at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
+        d_w_shared_up = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
+        d_w_routed_up = at::empty({num_local_experts, intermediate_dim, hidden_dim}, d_y_buffer.options());
+        d_w_shared_down = at::empty({hidden_dim, intermediate_dim}, d_y_buffer.options());
+        d_w_routed_down = at::empty({num_local_experts, hidden_dim, intermediate_dim}, d_y_buffer.options());
+    }
 
     // Counters
     at::Tensor d_y_routed_ready = at::zeros({num_global_minibatches}, tokens_per_expert.options());
@@ -617,25 +758,72 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         .d_router_weight_buffer = d_router_weight_buffer_data,
         .router_weights = kittens::py::tensor_to_gl<router_weight_gl>(router_weights),
         .d_router_weight_partials = kittens::py::tensor_to_gl<d_router_weight_partials_gl>(d_router_weight_partials),
-        .w_routed_gate = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_gate),
-        .w_routed_gate_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_gate_sc),
-        .w_routed_up = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_up),
-        .w_routed_up_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_up_sc),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim, 0, 0,
+            w_routed_gate_storage_table, num_local_experts),
+        .w_routed_gate_sc = make_routed_scale_view(
+            w_routed_gate_sc,
+            (single_grouped_fc1 ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
+            0, 0, w_routed_gate_sc_storage_table, num_local_experts),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim,
+            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0, 0,
+            w_routed_up_storage_table, num_local_experts),
+        .w_routed_up_sc = make_routed_scale_view(
+            w_routed_up_sc,
+            (single_grouped_fc1 ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
+            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0,
+            0, w_routed_up_sc_storage_table, num_local_experts),
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate_T = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_gate_T),
-        .w_routed_gate_T_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_gate_T_sc),
+        .w_routed_gate_T = routed_weights_are_native_columnwise
+            ? make_routed_weight_view(
+                w_routed_gate_T, intermediate_dim, hidden_dim, 0, 0,
+                w_routed_gate_T_storage_table, num_local_experts)
+            : make_routed_weight_view(
+                w_routed_gate_T, hidden_dim, intermediate_dim, 0, 0,
+                w_routed_gate_T_storage_table, num_local_experts),
+        .w_routed_gate_T_sc = make_routed_scale_view(
+            w_routed_gate_T_sc, hidden_dim / config::QUANT_Mb,
+            0, 0, w_routed_gate_T_sc_storage_table, num_local_experts),
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up_T = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_up_T),
-        .w_routed_up_T_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_up_T_sc),
+        .w_routed_up_T = routed_weights_are_native_columnwise
+            ? make_routed_weight_view(
+                w_routed_up_T, intermediate_dim, hidden_dim,
+                intermediate_dim / config::QUANT_Mb, 0,
+                w_routed_up_T_storage_table, num_local_experts)
+            : make_routed_weight_view(
+                w_routed_up_T, hidden_dim, intermediate_dim, 0,
+                single_grouped_fc1_T ? intermediate_dim / config::QUANT_Mb : 0,
+                w_routed_up_T_storage_table, num_local_experts),
+        .w_routed_up_T_sc = make_routed_scale_view(
+            w_routed_up_T_sc, hidden_dim / config::QUANT_Mb, 0,
+            single_grouped_fc1_T ? intermediate_dim / config::QUANT_Mb : 0,
+            w_routed_up_T_sc_storage_table, num_local_experts),
         .w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down),
-        .w_routed_down_T = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_down_T),
-        .w_routed_down_T_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_down_T_sc),
-        .d_w_shared_gate = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_gate),
-        .d_w_routed_gate = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_gate),
-        .d_w_shared_up = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_up),
-        .d_w_routed_up = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_up),
-        .d_w_shared_down = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_down),
-        .d_w_routed_down = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_down),
+        .w_routed_down_T = routed_weights_are_native_columnwise
+            ? make_routed_weight_view(
+                w_routed_down_T, hidden_dim, intermediate_dim, 0, 0,
+                w_routed_down_T_storage_table, num_local_experts)
+            : make_routed_weight_view(
+                w_routed_down_T, intermediate_dim, hidden_dim, 0, 0,
+                w_routed_down_T_storage_table, num_local_experts),
+        .w_routed_down_T_sc = make_routed_scale_view(
+            w_routed_down_T_sc, intermediate_dim / config::QUANT_Mb,
+            0, 0, w_routed_down_T_sc_storage_table, num_local_experts),
+        .d_w_shared_gate = kittens::py::tensor_to_gl<d_weight_gl>(d_w_shared_gate),
+        .d_w_routed_gate = make_routed_d_weight_view(
+            d_w_routed_gate, intermediate_dim, hidden_dim, 0, 0,
+            main_grad_routed_gate_storage_table, num_local_experts),
+        .d_w_shared_up = kittens::py::tensor_to_gl<d_weight_gl>(d_w_shared_up),
+        .d_w_routed_up = make_routed_d_weight_view(
+            d_w_routed_up, intermediate_dim, hidden_dim,
+            d_w_routed_gate.data_ptr() == d_w_routed_up.data_ptr()
+                ? intermediate_dim / config::QUANT_Mb : 0,
+            0, main_grad_routed_up_storage_table, num_local_experts),
+        .d_w_shared_down = kittens::py::tensor_to_gl<d_weight_gl>(d_w_shared_down),
+        .d_w_routed_down = make_routed_d_weight_view(
+            d_w_routed_down, hidden_dim, intermediate_dim, 0, 0,
+            main_grad_routed_down_storage_table, num_local_experts),
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
@@ -649,6 +837,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         .replayed_gate_up_ready = kittens::py::tensor_to_gl<index_gl>(replayed_gate_up_ready),
         .replayed_hidden_ready = kittens::py::tensor_to_gl<index_gl>(replayed_hidden_ready),
         .routed_buffers_done = kittens::py::tensor_to_gl<index_gl>(routed_buffers_done),
+        .routed_weights_are_native_columnwise = routed_weights_are_native_columnwise,
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
         .num_comm_sms = num_comm_sms,
@@ -660,6 +849,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
+    if constexpr (!ACCUMULATE_WGRAD) {
 
     utils::zero_empty_routed_wgrads::globals g_zerw {
         .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
@@ -670,6 +860,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     };
 
     utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
+    }
 
     return {d_x_shared, d_x_routed,
             d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
@@ -713,19 +904,37 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    const at::Tensor *main_grad_shared_gate = nullptr,
+    const at::Tensor *main_grad_routed_gate = nullptr,
+    const at::Tensor *main_grad_shared_up = nullptr,
+    const at::Tensor *main_grad_routed_up = nullptr,
+    const at::Tensor *main_grad_shared_down = nullptr,
+    const at::Tensor *main_grad_routed_down = nullptr,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt
 ) {
     static_assert(!USE_MXFP8);
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
     const int hidden_dim = x.size(1);
     const int intermediate_dim = w_shared_gate.size(0);
-    const int num_local_experts = w_routed_gate.size(0);
+    const int num_local_experts = tokens_per_expert.size(0);
     const int num_global_minibatches = (schedule_capacity + minibatch_size - 1) / minibatch_size;
     const int num_macrobatches = (schedule_capacity + macrobatch_size - 1) / macrobatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
     const int intermediate_dim_col_blocks = intermediate_dim / config::MLP_Nb;
+    const bool single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr();
+    const bool split_weight_storage = w_routed_gate_storage_table.has_value();
+    TORCH_CHECK(
+        split_weight_storage == w_routed_up_storage_table.has_value() &&
+        split_weight_storage == w_routed_down_storage_table.has_value(),
+        "MoK: all three split BF16 weight descriptor tables must be provided together");
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl d_y_buffer_data;
@@ -751,12 +960,93 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     at::Tensor d_up_routed = at::empty_like(d_hidden_routed);
     at::Tensor d_x_shared = at::empty({num_local_tokens, hidden_dim}, d_y_buffer.options());
     at::Tensor d_x_routed = at::empty({macrobatch_size, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_shared_gate = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_gate = at::empty(w_routed_gate.sizes(), w_routed_gate.options());
-    at::Tensor d_w_shared_up = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_up = at::empty(w_routed_up.sizes(), w_routed_up.options());
-    at::Tensor d_w_shared_down = at::empty({hidden_dim, intermediate_dim}, d_y_buffer.options());
-    at::Tensor d_w_routed_down = at::empty(w_routed_down.sizes(), w_routed_down.options());
+    at::Tensor d_w_shared_gate;
+    at::Tensor d_w_routed_gate;
+    at::Tensor d_w_shared_up;
+    at::Tensor d_w_routed_up;
+    at::Tensor d_w_shared_down;
+    at::Tensor d_w_routed_down;
+    if constexpr (ACCUMULATE_WGRAD) {
+        TORCH_CHECK(main_grad_shared_gate && main_grad_routed_gate && main_grad_shared_up &&
+                    main_grad_routed_up && main_grad_shared_down && main_grad_routed_down,
+                    "MoK: all six main_grad tensors are required for fused accumulation");
+        auto validate_main_grad = [&](const at::Tensor &main_grad,
+                                      const at::Tensor &weight,
+                                      const char *name) {
+            TORCH_CHECK(main_grad.is_cuda(), "MoK: ", name, " must be a CUDA tensor");
+            constexpr at::ScalarType expected_dtype =
+                BF16_MAIN_GRAD ? at::kBFloat16 : at::kFloat;
+            TORCH_CHECK(main_grad.scalar_type() == expected_dtype,
+                        "MoK: ", name, " must have dtype ",
+                        BF16_MAIN_GRAD ? "bfloat16" : "float32");
+            TORCH_CHECK(main_grad.sizes() == weight.sizes(),
+                        "MoK: ", name, " shape does not match weight shape");
+            TORCH_CHECK(main_grad.device() == weight.device(),
+                        "MoK: ", name, " must be on the weight device");
+            TORCH_CHECK(main_grad.is_contiguous(),
+                        "MoK: ", name, " must be contiguous");
+        };
+        validate_main_grad(*main_grad_shared_gate, w_shared_gate, "main_grad_shared_gate");
+        validate_main_grad(*main_grad_shared_up, w_shared_up, "main_grad_shared_up");
+        const bool split_main_grads = main_grad_routed_gate_storage_table.has_value();
+        TORCH_CHECK(
+            split_main_grads == main_grad_routed_up_storage_table.has_value() &&
+            split_main_grads == main_grad_routed_down_storage_table.has_value(),
+            "MoK: all three split main-grad descriptor tables must be provided together");
+        TORCH_CHECK(split_main_grads == split_weight_storage,
+                    "MoK: split weight and main-grad descriptor tables must be provided together");
+        const bool single_grouped_main_grad =
+            main_grad_routed_gate->data_ptr() == main_grad_routed_up->data_ptr();
+        if (split_main_grads) {
+            TORCH_CHECK(single_grouped_main_grad,
+                        "MoK: split FC1 gate/up main-grad representatives must alias");
+            const std::vector<int64_t> split_fc1_shape{
+                2 * intermediate_dim, hidden_dim};
+            TORCH_CHECK(main_grad_routed_gate->sizes().vec() == split_fc1_shape,
+                        "MoK: split main_grad_routed_fc1 has the wrong shape");
+            validate_main_grad(*main_grad_routed_gate, *main_grad_routed_gate,
+                               "split_main_grad_routed_fc1");
+            validate_main_grad(*main_grad_routed_up, *main_grad_routed_gate,
+                               "split_main_grad_routed_fc1_up_alias");
+        } else if (single_grouped_main_grad) {
+            const std::vector<int64_t> combined_fc1_shape{
+                num_local_experts, 2 * intermediate_dim, hidden_dim};
+            TORCH_CHECK(main_grad_routed_gate->sizes().vec() == combined_fc1_shape,
+                        "MoK: main_grad_routed_fc1 has the wrong shape");
+            validate_main_grad(*main_grad_routed_gate, *main_grad_routed_gate,
+                               "main_grad_routed_fc1");
+            validate_main_grad(*main_grad_routed_up, *main_grad_routed_gate,
+                               "main_grad_routed_fc1_up_alias");
+        } else {
+            validate_main_grad(*main_grad_routed_gate, w_routed_gate,
+                               "main_grad_routed_gate");
+            validate_main_grad(*main_grad_routed_up, w_routed_up,
+                               "main_grad_routed_up");
+        }
+        validate_main_grad(*main_grad_shared_down, w_shared_down, "main_grad_shared_down");
+        if (split_main_grads) {
+            const std::vector<int64_t> split_down_shape{
+                hidden_dim, intermediate_dim};
+            TORCH_CHECK(main_grad_routed_down->sizes().vec() == split_down_shape,
+                        "MoK: split main_grad_routed_down has the wrong shape");
+        }
+        validate_main_grad(*main_grad_routed_down, w_routed_down, "main_grad_routed_down");
+        d_w_shared_gate = *main_grad_shared_gate;
+        d_w_routed_gate = *main_grad_routed_gate;
+        d_w_shared_up = *main_grad_shared_up;
+        d_w_routed_up = *main_grad_routed_up;
+        d_w_shared_down = *main_grad_shared_down;
+        d_w_routed_down = *main_grad_routed_down;
+    } else {
+        TORCH_CHECK(!split_weight_storage,
+                    "MoK: split routed weights require fused wgrad accumulation");
+        d_w_shared_gate = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
+        d_w_routed_gate = at::empty(w_routed_gate.sizes(), w_routed_gate.options());
+        d_w_shared_up = at::empty({intermediate_dim, hidden_dim}, d_y_buffer.options());
+        d_w_routed_up = at::empty(w_routed_up.sizes(), w_routed_up.options());
+        d_w_shared_down = at::empty({hidden_dim, intermediate_dim}, d_y_buffer.options());
+        d_w_routed_down = at::empty(w_routed_down.sizes(), w_routed_down.options());
+    }
 
     at::Tensor d_y_routed_ready = at::zeros({num_global_minibatches}, tokens_per_expert.options());
     at::Tensor d_hidden_ready = at::zeros({(shared_row_blocks + routed_row_blocks) * intermediate_dim_col_blocks}, tokens_per_expert.options());
@@ -813,25 +1103,48 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .d_router_weight_buffer = d_router_weight_buffer_data,
         .router_weights = kittens::py::tensor_to_gl<router_weight_gl>(router_weights),
         .d_router_weight_partials = kittens::py::tensor_to_gl<d_router_weight_partials_gl>(d_router_weight_partials),
-        .w_routed_gate = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_gate),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim, 0, 0,
+            w_routed_gate_storage_table, num_local_experts),
         .w_routed_gate_sc = {},
-        .w_routed_up = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_up),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim,
+            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0, 0,
+            w_routed_up_storage_table, num_local_experts),
         .w_routed_up_sc = {},
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate_T = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_gate),
+        .w_routed_gate_T = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim, 0, 0,
+            w_routed_gate_storage_table, num_local_experts),
         .w_routed_gate_T_sc = {},
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up_T = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_up),
+        .w_routed_up_T = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim,
+            // BF16 dgrad consumes the normal [I, H] payload through the
+            // K-major 64x128 TMA tile, so this offset is measured in
+            // MLP_BF16_Kb rows rather than the forward 128-row tile.
+            single_grouped_fc1 ? intermediate_dim / config::MLP_BF16_Kb : 0, 0,
+            w_routed_up_storage_table, num_local_experts),
         .w_routed_up_T_sc = {},
         .w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down),
-        .w_routed_down_T = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_down),
+        .w_routed_down_T = make_routed_weight_view(
+            w_routed_down, hidden_dim, intermediate_dim, 0, 0,
+            w_routed_down_storage_table, num_local_experts),
         .w_routed_down_T_sc = {},
-        .d_w_shared_gate = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_gate),
-        .d_w_routed_gate = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_gate),
-        .d_w_shared_up = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_up),
-        .d_w_routed_up = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_up),
-        .d_w_shared_down = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_shared_down),
-        .d_w_routed_down = kittens::py::tensor_to_gl<d_weight_bf16_gl>(d_w_routed_down),
+        .d_w_shared_gate = kittens::py::tensor_to_gl<d_weight_gl>(d_w_shared_gate),
+        .d_w_routed_gate = make_routed_d_weight_view(
+            d_w_routed_gate, intermediate_dim, hidden_dim, 0, 0,
+            main_grad_routed_gate_storage_table, num_local_experts),
+        .d_w_shared_up = kittens::py::tensor_to_gl<d_weight_gl>(d_w_shared_up),
+        .d_w_routed_up = make_routed_d_weight_view(
+            d_w_routed_up, intermediate_dim, hidden_dim,
+            d_w_routed_gate.data_ptr() == d_w_routed_up.data_ptr()
+                ? intermediate_dim / config::QUANT_Mb : 0,
+            0, main_grad_routed_up_storage_table, num_local_experts),
+        .d_w_shared_down = kittens::py::tensor_to_gl<d_weight_gl>(d_w_shared_down),
+        .d_w_routed_down = make_routed_d_weight_view(
+            d_w_routed_down, hidden_dim, intermediate_dim, 0, 0,
+            main_grad_routed_down_storage_table, num_local_experts),
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
@@ -856,6 +1169,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
+    if constexpr (!ACCUMULATE_WGRAD) {
 
     utils::zero_empty_routed_wgrads::globals g_zerw {
         .d_w_routed_gate = reinterpret_cast<uint16_t *>(d_w_routed_gate.data_ptr<at::BFloat16>()),
@@ -867,6 +1181,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
 
     utils::zero_empty_routed_wgrads::zero_empty_routed_wgrads_kernel<<<dim3(128, num_local_experts), 256, 0, at::cuda::getCurrentCUDAStream()>>>(g_zerw);
 
+    }
     return {d_x_shared, d_x_routed, d_gate_shared, d_gate_routed, d_up_shared, d_up_routed,
             d_hidden_shared, d_hidden_routed, d_y_routed,
             d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down};
