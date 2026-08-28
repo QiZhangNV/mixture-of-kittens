@@ -57,12 +57,19 @@ class MoKForwardContext:
 class SplitRoutedWeight:
     """One logical routed matrix stored in independent per-expert allocations.
 
-    ``data`` is a representative expert tensor used for dtype/shape metadata;
-    ``storage_table`` contains one TK/TMA layout per local expert and owns no
-    weight payload. MXFP8 callers additionally provide one tcgen05-layout
-    scale tensor per expert plus a descriptor table, and the native or legacy
-    columnwise payload used by dgrad. ``scale_tensors`` fields retain ownership
-    of generated scale layouts; descriptor tables do not own their payloads.
+    ``data`` and ``scale`` are representative expert tensors required by the
+    Tensor-based custom-op interface; the descriptor tables select the actual
+    expert allocation at runtime. The tables own neither payload nor scale
+    storage. MCore parameters already own every data payload, so no parallel
+    ``data_tensors`` collection is needed. In contrast, the tcgen05-layout
+    scales are generated specifically for MOK and have no other owner, so
+    ``scale_tensors`` retains every expert scale for the descriptor lifetime.
+
+    MXFP8 backward also provides a columnwise payload through the transposed
+    fields. ``native_columnwise=False`` means the legacy payload is physically
+    transposed and uses the ABt dgrad path. ``native_columnwise=True`` means it
+    is TE's native columnwise-quantized payload in the original logical matrix
+    shape and uses the AB dgrad path without materializing a transpose.
 
     Gate and up may intentionally share the same full ``[2I, H]`` data,
     descriptor table, and scale tensor. MoK then applies its existing logical
@@ -454,10 +461,8 @@ def build_schedule(
         workspace.all_gather_top_experts_buffer, num_local_experts,
         workspace.schedule_capacity, workspace.ep_rank)
     return MoKSchedule(
-        peer_rank=schedule_peer_rank,
-        peer_token_idx=schedule_peer_token_idx,
-        num_tokens=num_tokens,
-        tokens_per_expert=tokens_per_expert,
+        peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
+        num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
         top_experts=top_experts_int32,
     )
 
@@ -494,22 +499,9 @@ def validate_inputs(
     if grad_output is not None:
         tensors.append(("grad_output", grad_output, torch.bfloat16, expected_activation_shape))
     if router_weights is not None:
-        tensors.append(
-            (
-                "router_weights",
-                router_weights,
-                torch.float32,
-                (workspace.num_local_tokens, workspace.topk),
-            )
-        )
-    tensors.append(
-        (
-            "schedule.top_experts",
-            schedule.top_experts,
-            torch.int32,
-            (workspace.num_local_tokens, workspace.topk),
-        )
-    )
+        tensors.append(("router_weights", router_weights, torch.float32, (workspace.num_local_tokens, workspace.topk)))
+    tensors.append(("schedule.top_experts", schedule.top_experts, torch.int32,
+                    (workspace.num_local_tokens, workspace.topk)))
     for tensor_name, tensor, expected_dtype, expected_shape in tensors:
         if not tensor.is_cuda or tensor.device != workspace.device or tensor.dtype != expected_dtype or not tensor.is_contiguous():
             raise ValueError(f"{tensor_name} must be contiguous {expected_dtype} on the workspace CUDA device")
@@ -544,6 +536,12 @@ def forward(
 ]:
     """Runs the MoE forward pass.
 
+    Routed weights use one of three representations:
+      * ``torch.Tensor``: contiguous single-grouped BF16 payload.
+      * ``(data, scale)``: contiguous single-grouped MXFP8 forward payload.
+      * ``SplitRoutedWeight``: descriptor-backed non-single BF16 or MXFP8
+        payloads stored in independent per-expert allocations.
+
     Inputs:
         config:              MoKConfig
         workspace:           MoKWorkspace
@@ -564,9 +562,6 @@ def forward(
     """
     validate_inputs(config, workspace, schedule, x, router_weights)
 
-    shared_fc2_weights = shared_down_weights
-    routed_fc2_weights = routed_down_weights
-
     workspace.x_buffer.copy_(x)  # TODO: we can remove this
     workspace.router_weight_buffer.copy_(router_weights)
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
@@ -575,7 +570,7 @@ def forward(
     split_weights = isinstance(routed_gate_weights, SplitRoutedWeight)
     if split_weights != isinstance(
         routed_up_weights, SplitRoutedWeight
-    ) or split_weights != isinstance(routed_fc2_weights, SplitRoutedWeight):
+    ) or split_weights != isinstance(routed_down_weights, SplitRoutedWeight):
         raise TypeError(
             "routed gate/up/down weights must use the same storage representation"
         )
@@ -585,7 +580,7 @@ def forward(
         else isinstance(routed_gate_weights, tuple)
     )
     if split_weights:
-        split_triplet = (routed_gate_weights, routed_up_weights, routed_fc2_weights)
+        split_triplet = (routed_gate_weights, routed_up_weights, routed_down_weights)
         if any(
             (weight.scale is not None) != routed_precision_is_mxfp8
             for weight in split_triplet
@@ -602,22 +597,22 @@ def forward(
             routed_gate_weights_sc = routed_gate_weights.scale
             routed_up_weights_fp8 = routed_up_weights.data
             routed_up_weights_sc = routed_up_weights.scale
-            routed_fc2_weights_fp8 = routed_fc2_weights.data
-            routed_fc2_weights_sc = routed_fc2_weights.scale
+            routed_down_weights_fp8 = routed_down_weights.data
+            routed_down_weights_sc = routed_down_weights.scale
             routed_storage_tables = (
                 routed_gate_weights.storage_table,
                 routed_up_weights.storage_table,
-                routed_fc2_weights.storage_table,
+                routed_down_weights.storage_table,
             )
             routed_scale_storage_tables = (
                 routed_gate_weights.scale_storage_table,
                 routed_up_weights.scale_storage_table,
-                routed_fc2_weights.scale_storage_table,
+                routed_down_weights.scale_storage_table,
             )
         else:
             routed_gate_weights_fp8, routed_gate_weights_sc = routed_gate_weights
             routed_up_weights_fp8, routed_up_weights_sc = routed_up_weights
-            routed_fc2_weights_fp8, routed_fc2_weights_sc = routed_fc2_weights
+            routed_down_weights_fp8, routed_down_weights_sc = routed_down_weights
             routed_storage_tables = (None, None, None)
             routed_scale_storage_tables = (None, None, None)
         (
@@ -645,9 +640,9 @@ def forward(
             shared_up_weights,
             routed_up_weights_fp8,
             routed_up_weights_sc,
-            shared_fc2_weights,
-            routed_fc2_weights_fp8,
-            routed_fc2_weights_sc,
+            shared_down_weights,
+            routed_down_weights_fp8,
+            routed_down_weights_sc,
             schedule.peer_rank,
             schedule.peer_token_idx,
             schedule.num_tokens,
@@ -673,16 +668,16 @@ def forward(
         if split_weights:
             routed_gate_data = routed_gate_weights.data
             routed_up_data = routed_up_weights.data
-            routed_fc2_data = routed_fc2_weights.data
+            routed_down_data = routed_down_weights.data
             routed_storage_tables = (
                 routed_gate_weights.storage_table,
                 routed_up_weights.storage_table,
-                routed_fc2_weights.storage_table,
+                routed_down_weights.storage_table,
             )
         else:
             routed_gate_data = routed_gate_weights
             routed_up_data = routed_up_weights
-            routed_fc2_data = routed_fc2_weights
+            routed_down_data = routed_down_weights
             routed_storage_tables = (None, None, None)
         (
             x_routed,
@@ -703,8 +698,8 @@ def forward(
             routed_gate_data,
             shared_up_weights,
             routed_up_data,
-            shared_fc2_weights,
-            routed_fc2_data,
+            shared_down_weights,
+            routed_down_data,
             schedule.peer_rank,
             schedule.peer_token_idx,
             schedule.num_tokens,
@@ -726,18 +721,10 @@ def forward(
             hidden_routed=hidden_routed,
         )
 
-    barrier_all(
-        workspace.barrier_buffer,
-        workspace.barrier_buffer_ptrs,
-        workspace.barrier_buffer_multicast_ptr,
-        workspace.barrier_target,
-    )
-    output = fwd_epilogue(
-        y_shared,
-        workspace.combine_buffer,
-        workspace.router_weight_buffer,
-        schedule.top_experts,
-    )
+    barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
+                workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
+    output = fwd_epilogue(y_shared, workspace.combine_buffer,
+                          workspace.router_weight_buffer, schedule.top_experts)
     return output, forward_context
 
 
@@ -754,6 +741,9 @@ def recompute_forward_context(
 ) -> MoKForwardContext:
     """Recomputes the intermediates needed by the MoK backward pass.
 
+    ``SplitRoutedWeight`` is intentionally unsupported here because the
+    recompute custom ops do not yet accept per-expert descriptor tables.
+
     Inputs:
         config:              MoKConfig
         workspace:           MoKWorkspace
@@ -769,6 +759,12 @@ def recompute_forward_context(
         forward_context: MoKForwardContext
     """
     validate_inputs(config, workspace, schedule, x)
+    # Fail explicitly instead of passing a descriptor-backed object to the
+    # contiguous BF16 custom op.
+    if isinstance(routed_gate_weights, SplitRoutedWeight) or isinstance(
+        routed_up_weights, SplitRoutedWeight
+    ):
+        raise TypeError("recompute_forward_context does not support SplitRoutedWeight")
     if isinstance(routed_gate_weights, tuple) != isinstance(routed_up_weights, tuple):
         raise TypeError("routed gate and up weights must use the same precision representation")
     if isinstance(routed_gate_weights, tuple) and (len(routed_gate_weights) != 2 or len(routed_up_weights) != 2):
@@ -864,6 +860,12 @@ def backward(
 ]:
     """Runs the MoE backward pass.
 
+    Contiguous BF16 weights use ``torch.Tensor``. Contiguous MXFP8 gate/up
+    weights use either the legacy four-tensor tuple or the native-columnwise
+    five-item tuple; down uses the corresponding two- or three-item tuple.
+    Descriptor-backed non-single BF16/MXFP8 weights use
+    ``SplitRoutedWeight``.
+
     Inputs:
         config:              MoKConfig
         workspace:           MoKWorkspace
@@ -879,11 +881,22 @@ def backward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 tensor tuple
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 tensor tuple
         swiglu_limit:        float | None
-        main_grads:          optional FP32 or BF16 buffers ordered as shared gate,
-                             routed gate, shared up, routed up, shared down,
-                             routed down; wgrad is accumulated in-place
+        main_grads:          optional BF16/FP32 buffers in MOK ABI order:
+                             shared gate, routed gate, shared up, routed up,
+                             shared down, routed down. If provided, wgrad is
+                             accumulated in-place instead of returned freshly.
+        main_grad_storage_tables:
+                             None for contiguous single-grouped main grads;
+                             for non-single weights, descriptor tables ordered
+                             as routed gate, routed up, routed down. Gate/up may
+                             share the same combined-FC1 table.
 
     Outputs:
+        The six returned weight-gradient entries are fresh gradients when
+        ``main_grads is None``; otherwise they alias the supplied accumulation
+        buffers. For split weights, routed entries are representative tensors
+        while the storage tables address every expert buffer.
+
         d_x:                   bfloat16 [num_local_tokens, hidden_size]
         d_router_weights:      float32 [num_local_tokens, topk]
         d_routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size]
@@ -894,24 +907,18 @@ def backward(
         d_shared_down_weights: bfloat16 [hidden_size, intermediate_size]
     """
     validate_inputs(config, workspace, schedule, x, router_weights, grad_output)
-    shared_fc2_weights = shared_down_weights
-    routed_fc2_weights = routed_down_weights
     if not isinstance(forward_context, MoKForwardContext):
         raise TypeError("forward_context must be a MoKForwardContext")
 
-    workspace.d_y_buffer.copy_(grad_output)  # TODO: we can remove this
-    workspace.x_buffer.copy_(x)  # TODO: we can remove this
-    workspace.router_weight_buffer.copy_(router_weights)  # TODO: we can remove this
-    barrier_all(
-        workspace.barrier_buffer,
-        workspace.barrier_buffer_ptrs,
-        workspace.barrier_buffer_multicast_ptr,
-        workspace.barrier_target,
-    )
+    workspace.d_y_buffer.copy_(grad_output)                # TODO: we can remove this
+    workspace.x_buffer.copy_(x)                            # TODO: we can remove this
+    workspace.router_weight_buffer.copy_(router_weights)   # TODO: we can remove this
+    barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
+                workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     split_weights = isinstance(routed_gate_weights, SplitRoutedWeight)
     if split_weights != isinstance(
         routed_up_weights, SplitRoutedWeight
-    ) or split_weights != isinstance(routed_fc2_weights, SplitRoutedWeight):
+    ) or split_weights != isinstance(routed_down_weights, SplitRoutedWeight):
         raise TypeError(
             "routed gate/up/down weights must use the same storage representation"
         )
@@ -928,10 +935,12 @@ def backward(
     )
     if routed_precision_is_mxfp8:
         if split_weights:
+            # Non-single MXFP8: each expert's rowwise/columnwise payload and
+            # scale are selected through descriptor tables.
             split_triplet = (
                 routed_gate_weights,
                 routed_up_weights,
-                routed_fc2_weights,
+                routed_down_weights,
             )
             if any(weight.scale is None for weight in split_triplet):
                 raise ValueError("all split MXFP8 routed weights must provide scales")
@@ -963,23 +972,26 @@ def backward(
             routed_up_weights_sc = routed_up_weights.scale
             routed_up_weights_t_fp8 = routed_up_weights.transposed_data
             routed_up_weights_t_sc = routed_up_weights.transposed_scale
-            routed_fc2_weights_t_fp8 = routed_fc2_weights.transposed_data
-            routed_fc2_weights_t_sc = routed_fc2_weights.transposed_scale
+            routed_down_weights_t_fp8 = routed_down_weights.transposed_data
+            routed_down_weights_t_sc = routed_down_weights.transposed_scale
             weight_storage_tables = (
                 routed_gate_weights.storage_table,
                 routed_up_weights.storage_table,
                 routed_gate_weights.transposed_storage_table,
                 routed_up_weights.transposed_storage_table,
-                routed_fc2_weights.transposed_storage_table,
+                routed_down_weights.transposed_storage_table,
             )
             scale_storage_tables = (
                 routed_gate_weights.scale_storage_table,
                 routed_up_weights.scale_storage_table,
                 routed_gate_weights.transposed_scale_storage_table,
                 routed_up_weights.transposed_scale_storage_table,
-                routed_fc2_weights.transposed_scale_storage_table,
+                routed_down_weights.transposed_scale_storage_table,
             )
         elif len(routed_gate_weights) == 5:
+            # Single-grouped MXFP8 with TE-native columnwise payloads:
+            # gate/up=(row, row_scale, column, column_scale, True),
+            # down=(column, column_scale, True).
             (
                 routed_gate_weights_fp8,
                 routed_gate_weights_sc,
@@ -987,7 +999,7 @@ def backward(
                 routed_gate_weights_t_sc,
                 routed_weights_are_native_columnwise,
             ) = routed_gate_weights
-            if len(routed_up_weights) != 5 or len(routed_fc2_weights) != 3:
+            if len(routed_up_weights) != 5 or len(routed_down_weights) != 3:
                 raise ValueError(
                     "native-columnwise MXFP8 gate/up/down tuples must have lengths 5/5/3"
                 )
@@ -999,19 +1011,22 @@ def backward(
                 routed_up_is_native_columnwise,
             ) = routed_up_weights
             (
-                routed_fc2_weights_t_fp8,
-                routed_fc2_weights_t_sc,
-                routed_fc2_is_native_columnwise,
-            ) = routed_fc2_weights
+                routed_down_weights_t_fp8,
+                routed_down_weights_t_sc,
+                routed_down_is_native_columnwise,
+            ) = routed_down_weights
             if (
                 routed_weights_are_native_columnwise is not True
                 or routed_up_is_native_columnwise is not True
-                or routed_fc2_is_native_columnwise is not True
+                or routed_down_is_native_columnwise is not True
             ):
                 raise ValueError("all native-columnwise MXFP8 flags must be True")
             weight_storage_tables = None
             scale_storage_tables = None
         elif len(routed_gate_weights) == 4:
+            # Legacy single-grouped MXFP8 with explicitly transposed payloads:
+            # gate/up=(row, row_scale, transposed, transposed_scale),
+            # down=(transposed, transposed_scale).
             (
                 routed_gate_weights_fp8,
                 routed_gate_weights_sc,
@@ -1024,7 +1039,7 @@ def backward(
                 routed_up_weights_t_fp8,
                 routed_up_weights_t_sc,
             ) = routed_up_weights
-            routed_fc2_weights_t_fp8, routed_fc2_weights_t_sc = routed_fc2_weights
+            routed_down_weights_t_fp8, routed_down_weights_t_sc = routed_down_weights
             routed_weights_are_native_columnwise = False
             weight_storage_tables = None
             scale_storage_tables = None
@@ -1049,9 +1064,9 @@ def backward(
             shared_up_weights,
             routed_up_weights_t_fp8,
             routed_up_weights_t_sc,
-            shared_fc2_weights,
-            routed_fc2_weights_t_fp8,
-            routed_fc2_weights_t_sc,
+            shared_down_weights,
+            routed_down_weights_t_fp8,
+            routed_down_weights_t_sc,
             x_fp8_t_routed,
             x_sc_t_routed,
             forward_context.gate_shared,
@@ -1081,6 +1096,7 @@ def backward(
             routed_weights_are_native_columnwise,
         )
         if main_grads is None:
+            # Original MOK API: materialize and return six fresh weight gradients.
             (
                 d_x_shared,
                 d_x_routed,
@@ -1098,10 +1114,12 @@ def backward(
                 d_w_routed_gate,
                 d_w_shared_up,
                 d_w_routed_up,
-                d_w_shared_fc2,
-                d_w_routed_fc2,
+                d_w_shared_down,
+                d_w_routed_down,
             ) = dispatch_mlp_swiglu_combine_bwd_mxfp8(*mxfp8_bwd_args)
         else:
+            # Fused accumulation: mutate the six supplied main-grad buffers.
+            # Descriptor tables are present only for non-single expert storage.
             (
                 d_x_shared,
                 d_x_routed,
@@ -1127,32 +1145,34 @@ def backward(
                 d_w_routed_gate,
                 d_w_shared_up,
                 d_w_routed_up,
-                d_w_shared_fc2,
-                d_w_routed_fc2,
+                d_w_shared_down,
+                d_w_routed_down,
             ) = main_grads
     else:
+        # BF16 has no scale or rowwise/columnwise representation pair.
         if split_weights:
+            # Non-single BF16: select each expert payload through descriptors.
             if any(
                 weight.scale is not None
                 for weight in (
                     routed_gate_weights,
                     routed_up_weights,
-                    routed_fc2_weights,
+                    routed_down_weights,
                 )
             ):
                 raise ValueError("split BF16 routed weights must not provide scales")
             routed_gate_data = routed_gate_weights.data
             routed_up_data = routed_up_weights.data
-            routed_fc2_data = routed_fc2_weights.data
+            routed_down_data = routed_down_weights.data
             weight_storage_tables = (
                 routed_gate_weights.storage_table,
                 routed_up_weights.storage_table,
-                routed_fc2_weights.storage_table,
+                routed_down_weights.storage_table,
             )
         else:
             routed_gate_data = routed_gate_weights
             routed_up_data = routed_up_weights
-            routed_fc2_data = routed_fc2_weights
+            routed_down_data = routed_down_weights
             weight_storage_tables = None
         x_routed = forward_context.x_routed
         gate_routed = forward_context.gate_routed
@@ -1171,8 +1191,8 @@ def backward(
             routed_gate_data,
             shared_up_weights,
             routed_up_data,
-            shared_fc2_weights,
-            routed_fc2_data,
+            shared_down_weights,
+            routed_down_data,
             x_routed,
             forward_context.gate_shared,
             gate_routed,
@@ -1193,6 +1213,7 @@ def backward(
             config.minibatch_size,
         )
         if main_grads is None:
+            # Original MOK API: materialize and return six fresh weight gradients.
             (
                 d_x_shared,
                 d_x_routed,
@@ -1207,10 +1228,12 @@ def backward(
                 d_w_routed_gate,
                 d_w_shared_up,
                 d_w_routed_up,
-                d_w_shared_fc2,
-                d_w_routed_fc2,
+                d_w_shared_down,
+                d_w_routed_down,
             ) = dispatch_mlp_swiglu_combine_bwd_bf16(*bwd_args)
         else:
+            # Fused accumulation: mutate the six supplied main-grad buffers.
+            # Descriptor tables are present only for non-single expert storage.
             (
                 d_x_shared,
                 d_x_routed,
@@ -1232,32 +1255,23 @@ def backward(
                 d_w_routed_gate,
                 d_w_shared_up,
                 d_w_routed_up,
-                d_w_shared_fc2,
-                d_w_routed_fc2,
+                d_w_shared_down,
+                d_w_routed_down,
             ) = main_grads
 
-    barrier_all(
-        workspace.barrier_buffer,
-        workspace.barrier_buffer_ptrs,
-        workspace.barrier_buffer_multicast_ptr,
-        workspace.barrier_target,
-    )
-    d_x = bwd_epilogue(
-        d_x_shared,
-        workspace.d_x_routed_buffer,
-        schedule.top_experts,
-    )
-    d_router_weights = (
-        workspace.d_router_weight_buffer.clone()
-    )  # TODO: we can remove this
+    barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
+                workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
+    d_x = bwd_epilogue(d_x_shared, workspace.d_x_routed_buffer,
+                       schedule.top_experts)
+    d_router_weights = workspace.d_router_weight_buffer.clone()  # TODO: we can remove this
     d_router_weights.masked_fill_(schedule.top_experts < 0, 0.0)
     return (
         d_x,
         d_router_weights,
         d_w_routed_gate,
         d_w_routed_up,
-        d_w_routed_fc2,
+        d_w_routed_down,
         d_w_shared_gate,
         d_w_shared_up,
-        d_w_shared_fc2,
+        d_w_shared_down,
     )
