@@ -2,7 +2,6 @@ from typing import Any
 
 import torch
 
-
 from . import _C
 
 
@@ -1617,6 +1616,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
             raise ValueError(f"{tensor_name} must be on {x.device}")
     if schedule_peer_rank.device != x.device:
         raise ValueError(f"schedule_peer_rank must be on {x.device}")
+
     return _C.dispatch_mlp_swiglu_combine_bwd_bf16(
         d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
         router_weight_buffer, router_weight_buffer_ptrs,

@@ -46,13 +46,7 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
     rank, world_size, device = context
     for shape, params in itertools.product(shapes(world_size), mok_params()):
         shape_name, num_experts, hidden_dim, _, topk, num_local_tokens = shape
-        (
-            params_name,
-            fwd_num_comm_sms,
-            bwd_num_comm_sms,
-            minibatch_size,
-            macrobatch_size,
-        ) = params
+        params_name, fwd_num_comm_sms, bwd_num_comm_sms, minibatch_size, macrobatch_size = params
         assert num_experts % world_size == 0
         num_local_experts = num_experts // world_size
         config = functional.MoKConfig(
@@ -90,11 +84,8 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
         valid_tokens = reference[0] >= 0
         for name, expected, result in (
             ("peer_rank", reference[0], actual.peer_rank),
-            (
-                "peer_token_idx",
-                reference[1][valid_tokens],
-                actual.peer_token_idx[valid_tokens],
-            ),
+            ("peer_token_idx", reference[1][valid_tokens],
+             actual.peer_token_idx[valid_tokens]),
             ("num_tokens", reference[2], actual.num_tokens),
             ("tokens_per_expert", reference[3], actual.tokens_per_expert),
         ):
@@ -128,8 +119,7 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
         topk=topk,
     )
     topk_experts = generate_topk_experts(
-        rank, device, num_experts, topk, num_local_tokens
-    )
+        rank, device, num_experts, topk, num_local_tokens)
 
     actual = functional.build_schedule(
         workspace,
@@ -137,7 +127,8 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
         topk_experts,
         num_local_experts=num_local_experts,
     )
-    topk_all = run_all_gather_top_experts_reference(topk_experts.to(torch.int32))
+    topk_all = run_all_gather_top_experts_reference(
+        topk_experts.to(torch.int32))
     reference = run_schedule_reference(
         topk_all,
         num_local_experts,
@@ -147,11 +138,8 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
     valid_tokens = reference[0] >= 0
     for name, expected, result in (
         ("peer_rank", reference[0], actual.peer_rank),
-        (
-            "peer_token_idx",
-            reference[1][valid_tokens],
-            actual.peer_token_idx[valid_tokens],
-        ),
+        ("peer_token_idx", reference[1][valid_tokens],
+         actual.peer_token_idx[valid_tokens]),
         ("num_tokens", reference[2], actual.num_tokens),
         ("tokens_per_expert", reference[3], actual.tokens_per_expert),
     ):
@@ -174,67 +162,57 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
         ("config type", {"config": object()}, TypeError),
         (
             "forward communication SMs",
-            {
-                "config": functional.MoKConfig(
-                    fwd_num_comm_sms=1,
-                    bwd_num_comm_sms=2,
-                    minibatch_size=256,
-                    macrobatch_size=256,
-                    all_gather_top_experts_chunk_bytes=16,
-                )
-            },
+            {"config": functional.MoKConfig(
+                fwd_num_comm_sms=1,
+                bwd_num_comm_sms=2,
+                minibatch_size=256,
+                macrobatch_size=256,
+                all_gather_top_experts_chunk_bytes=16,
+            )},
             ValueError,
         ),
         (
             "backward communication SMs",
-            {
-                "config": functional.MoKConfig(
-                    fwd_num_comm_sms=2,
-                    bwd_num_comm_sms=1,
-                    minibatch_size=256,
-                    macrobatch_size=256,
-                    all_gather_top_experts_chunk_bytes=16,
-                )
-            },
+            {"config": functional.MoKConfig(
+                fwd_num_comm_sms=2,
+                bwd_num_comm_sms=1,
+                minibatch_size=256,
+                macrobatch_size=256,
+                all_gather_top_experts_chunk_bytes=16,
+            )},
             ValueError,
         ),
         (
             "minibatch alignment",
-            {
-                "config": functional.MoKConfig(
-                    fwd_num_comm_sms=2,
-                    bwd_num_comm_sms=2,
-                    minibatch_size=128,
-                    macrobatch_size=256,
-                    all_gather_top_experts_chunk_bytes=16,
-                )
-            },
+            {"config": functional.MoKConfig(
+                fwd_num_comm_sms=2,
+                bwd_num_comm_sms=2,
+                minibatch_size=128,
+                macrobatch_size=256,
+                all_gather_top_experts_chunk_bytes=16,
+            )},
             ValueError,
         ),
         (
             "macrobatch multiple",
-            {
-                "config": functional.MoKConfig(
-                    fwd_num_comm_sms=2,
-                    bwd_num_comm_sms=2,
-                    minibatch_size=256,
-                    macrobatch_size=384,
-                    all_gather_top_experts_chunk_bytes=16,
-                )
-            },
+            {"config": functional.MoKConfig(
+                fwd_num_comm_sms=2,
+                bwd_num_comm_sms=2,
+                minibatch_size=256,
+                macrobatch_size=384,
+                all_gather_top_experts_chunk_bytes=16,
+            )},
             ValueError,
         ),
         (
             "all-gather chunk alignment",
-            {
-                "config": functional.MoKConfig(
-                    fwd_num_comm_sms=2,
-                    bwd_num_comm_sms=2,
-                    minibatch_size=256,
-                    macrobatch_size=256,
-                    all_gather_top_experts_chunk_bytes=15,
-                )
-            },
+            {"config": functional.MoKConfig(
+                fwd_num_comm_sms=2,
+                bwd_num_comm_sms=2,
+                minibatch_size=256,
+                macrobatch_size=256,
+                all_gather_top_experts_chunk_bytes=15,
+            )},
             ValueError,
         ),
         (
@@ -259,24 +237,9 @@ def test_build_schedule(context: tuple[int, int, torch.device]) -> None:
 
 def test_forward_mxfp8(context: tuple[int, int, torch.device]) -> None:
     rank, world_size, device = context
-    for shape, mok_param, swiglu_param in itertools.product(
-        shapes(world_size), mok_params(), swiglu_params()
-    ):
-        (
-            shape_name,
-            num_experts,
-            hidden_dim,
-            intermediate_dim,
-            topk,
-            num_local_tokens,
-        ) = shape
-        (
-            mok_param_name,
-            fwd_num_comm_sms,
-            bwd_num_comm_sms,
-            minibatch_size,
-            macrobatch_size,
-        ) = mok_param
+    for shape, mok_param, swiglu_param in itertools.product(shapes(world_size), mok_params(), swiglu_params()):
+        shape_name, num_experts, hidden_dim, intermediate_dim, topk, num_local_tokens = shape
+        mok_param_name, fwd_num_comm_sms, bwd_num_comm_sms, minibatch_size, macrobatch_size = mok_param
         swiglu_param_name, swiglu_limit = swiglu_param
         assert num_experts % world_size == 0
         num_local_experts = num_experts // world_size
@@ -323,15 +286,11 @@ def test_forward_mxfp8(context: tuple[int, int, torch.device]) -> None:
             topk_experts,
             num_local_experts=num_local_experts,
         )
-        w_routed_gate_fp8, w_routed_gate_sc, _, _ = mxfp8_quantize(
-            w_routed_gate, True, False
-        )
+        w_routed_gate_fp8, w_routed_gate_sc, _, _ = mxfp8_quantize(w_routed_gate, True, False)
         w_routed_up_fp8, w_routed_up_sc, _, _ = mxfp8_quantize(w_routed_up, True, False)
-        w_routed_down_fp8, w_routed_down_sc, _, _ = mxfp8_quantize(
-            w_routed_down, True, False
-        )
+        w_routed_down_fp8, w_routed_down_sc, _, _ = mxfp8_quantize(w_routed_down, True, False)
 
-        output, forward_context = functional._forward_gate_up(
+        output, forward_context = functional.forward(
             config,
             workspace,
             mok_schedule,
@@ -439,13 +398,9 @@ def test_forward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         topk_experts,
         num_local_experts=num_local_experts,
     )
-    w_routed_gate_fp8, w_routed_gate_sc, _, _ = mxfp8_quantize(
-        w_routed_gate, True, False
-    )
+    w_routed_gate_fp8, w_routed_gate_sc, _, _ = mxfp8_quantize(w_routed_gate, True, False)
     w_routed_up_fp8, w_routed_up_sc, _, _ = mxfp8_quantize(w_routed_up, True, False)
-    w_routed_down_fp8, w_routed_down_sc, _, _ = mxfp8_quantize(
-        w_routed_down, True, False
-    )
+    w_routed_down_fp8, w_routed_down_sc, _, _ = mxfp8_quantize(w_routed_down, True, False)
     valid_kwargs = {
         "config": config,
         "workspace": workspace,
@@ -460,7 +415,7 @@ def test_forward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         "routed_down_weights": (w_routed_down_fp8, w_routed_down_sc),
     }
 
-    output, forward_context = functional._forward_gate_up(**valid_kwargs)
+    output, forward_context = functional.forward(**valid_kwargs)
     (
         reference_combine_buffer,
         reference_gate_shared,
@@ -534,7 +489,7 @@ def test_forward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         ),
     ):
         try:
-            functional._forward_gate_up(**(valid_kwargs | overrides))
+            functional.forward(**(valid_kwargs | overrides))
         except expected_exception:
             pass
         else:
@@ -545,24 +500,9 @@ def test_recompute_forward_context_mxfp8(
     context: tuple[int, int, torch.device],
 ) -> None:
     rank, world_size, device = context
-    for shape, mok_param, swiglu_param in itertools.product(
-        shapes(world_size), mok_params(), swiglu_params()
-    ):
-        (
-            shape_name,
-            num_experts,
-            hidden_dim,
-            intermediate_dim,
-            topk,
-            num_local_tokens,
-        ) = shape
-        (
-            mok_param_name,
-            fwd_num_comm_sms,
-            bwd_num_comm_sms,
-            minibatch_size,
-            macrobatch_size,
-        ) = mok_param
+    for shape, mok_param, swiglu_param in itertools.product(shapes(world_size), mok_params(), swiglu_params()):
+        shape_name, num_experts, hidden_dim, intermediate_dim, topk, num_local_tokens = shape
+        mok_param_name, fwd_num_comm_sms, bwd_num_comm_sms, minibatch_size, macrobatch_size = mok_param
         swiglu_param_name, swiglu_limit = swiglu_param
         assert num_experts % world_size == 0
         num_local_experts = num_experts // world_size
@@ -610,14 +550,13 @@ def test_recompute_forward_context_mxfp8(
             num_local_experts=num_local_experts,
         )
         w_routed_gate_fp8, w_routed_gate_sc, _, _ = mxfp8_quantize(
-            w_routed_gate, True, False
-        )
-        w_routed_up_fp8, w_routed_up_sc, _, _ = mxfp8_quantize(w_routed_up, True, False)
+            w_routed_gate, True, False)
+        w_routed_up_fp8, w_routed_up_sc, _, _ = mxfp8_quantize(
+            w_routed_up, True, False)
         w_routed_down_fp8, w_routed_down_sc, _, _ = mxfp8_quantize(
-            w_routed_down, True, False
-        )
+            w_routed_down, True, False)
 
-        _, expected = functional._forward_gate_up(
+        _, expected = functional.forward(
             config,
             workspace,
             mok_schedule,
@@ -631,7 +570,7 @@ def test_recompute_forward_context_mxfp8(
             (w_routed_down_fp8, w_routed_down_sc),
             swiglu_limit,
         )
-        actual = functional._recompute_forward_context_gate_up(
+        actual = functional.recompute_forward_context(
             config,
             workspace,
             mok_schedule,
@@ -750,9 +689,8 @@ def test_recompute_forward_context_mxfp8(
         w_routed_down,
         _,
     ) = inputs
-    topk_experts = (
-        torch.arange(num_local_tokens, device=device).remainder(num_experts).view(-1, 1)
-    )
+    topk_experts = torch.arange(
+        num_local_tokens, device=device).remainder(num_experts).view(-1, 1)
     mok_schedule = functional.build_schedule(
         workspace,
         config,
@@ -761,13 +699,13 @@ def test_recompute_forward_context_mxfp8(
     )
     assert int(mok_schedule.num_tokens.item()) > config.macrobatch_size
     w_routed_gate_fp8, w_routed_gate_sc, _, _ = mxfp8_quantize(
-        w_routed_gate, True, False
-    )
-    w_routed_up_fp8, w_routed_up_sc, _, _ = mxfp8_quantize(w_routed_up, True, False)
+        w_routed_gate, True, False)
+    w_routed_up_fp8, w_routed_up_sc, _, _ = mxfp8_quantize(
+        w_routed_up, True, False)
     w_routed_down_fp8, w_routed_down_sc, _, _ = mxfp8_quantize(
         w_routed_down, True, False
     )
-    _, expected = functional._forward_gate_up(
+    _, expected = functional.forward(
         config,
         workspace,
         mok_schedule,
@@ -790,7 +728,7 @@ def test_recompute_forward_context_mxfp8(
         "routed_gate_weights": (w_routed_gate_fp8, w_routed_gate_sc),
         "routed_up_weights": (w_routed_up_fp8, w_routed_up_sc),
     }
-    actual = functional._recompute_forward_context_gate_up(**valid_kwargs)
+    actual = functional.recompute_forward_context(**valid_kwargs)
     assert isinstance(expected.x_routed, tuple)
     assert isinstance(expected.gate_routed, tuple)
     assert isinstance(expected.up_routed, tuple)
@@ -875,7 +813,7 @@ def test_recompute_forward_context_mxfp8(
         ),
     ):
         try:
-            functional._recompute_forward_context_gate_up(**(valid_kwargs | overrides))
+            functional.recompute_forward_context(**(valid_kwargs | overrides))
         except expected_exception:
             pass
         else:
@@ -884,24 +822,9 @@ def test_recompute_forward_context_mxfp8(
 
 def test_forward_bf16(context: tuple[int, int, torch.device]) -> None:
     rank, world_size, device = context
-    for shape, mok_param, swiglu_param in itertools.product(
-        shapes(world_size), mok_params(), swiglu_params()
-    ):
-        (
-            shape_name,
-            num_experts,
-            hidden_dim,
-            intermediate_dim,
-            topk,
-            num_local_tokens,
-        ) = shape
-        (
-            mok_param_name,
-            fwd_num_comm_sms,
-            bwd_num_comm_sms,
-            minibatch_size,
-            macrobatch_size,
-        ) = mok_param
+    for shape, mok_param, swiglu_param in itertools.product(shapes(world_size), mok_params(), swiglu_params()):
+        shape_name, num_experts, hidden_dim, intermediate_dim, topk, num_local_tokens = shape
+        mok_param_name, fwd_num_comm_sms, bwd_num_comm_sms, minibatch_size, macrobatch_size = mok_param
         swiglu_param_name, swiglu_limit = swiglu_param
         assert num_experts % world_size == 0
         num_local_experts = num_experts // world_size
@@ -949,7 +872,7 @@ def test_forward_bf16(context: tuple[int, int, torch.device]) -> None:
             num_local_experts=num_local_experts,
         )
 
-        output, forward_context = functional._forward_gate_up(
+        output, forward_context = functional.forward(
             config,
             workspace,
             mok_schedule,
@@ -1074,7 +997,7 @@ def test_forward_bf16(context: tuple[int, int, torch.device]) -> None:
         "routed_down_weights": w_routed_down,
     }
 
-    output, forward_context = functional._forward_gate_up(**valid_kwargs)
+    output, forward_context = functional.forward(**valid_kwargs)
     (
         reference_combine_buffer,
         reference_gate_shared,
@@ -1148,7 +1071,7 @@ def test_forward_bf16(context: tuple[int, int, torch.device]) -> None:
         ),
     ):
         try:
-            functional._forward_gate_up(**(valid_kwargs | overrides))
+            functional.forward(**(valid_kwargs | overrides))
         except expected_exception:
             pass
         else:
@@ -1159,24 +1082,9 @@ def test_recompute_forward_context_bf16(
     context: tuple[int, int, torch.device],
 ) -> None:
     rank, world_size, device = context
-    for shape, mok_param, swiglu_param in itertools.product(
-        shapes(world_size), mok_params(), swiglu_params()
-    ):
-        (
-            shape_name,
-            num_experts,
-            hidden_dim,
-            intermediate_dim,
-            topk,
-            num_local_tokens,
-        ) = shape
-        (
-            mok_param_name,
-            fwd_num_comm_sms,
-            bwd_num_comm_sms,
-            minibatch_size,
-            macrobatch_size,
-        ) = mok_param
+    for shape, mok_param, swiglu_param in itertools.product(shapes(world_size), mok_params(), swiglu_params()):
+        shape_name, num_experts, hidden_dim, intermediate_dim, topk, num_local_tokens = shape
+        mok_param_name, fwd_num_comm_sms, bwd_num_comm_sms, minibatch_size, macrobatch_size = mok_param
         swiglu_param_name, swiglu_limit = swiglu_param
         assert num_experts % world_size == 0
         num_local_experts = num_experts // world_size
@@ -1224,7 +1132,7 @@ def test_recompute_forward_context_bf16(
             num_local_experts=num_local_experts,
         )
 
-        _, expected = functional._forward_gate_up(
+        _, expected = functional.forward(
             config,
             workspace,
             mok_schedule,
@@ -1238,7 +1146,7 @@ def test_recompute_forward_context_bf16(
             w_routed_down,
             swiglu_limit,
         )
-        actual = functional._recompute_forward_context_gate_up(
+        actual = functional.recompute_forward_context(
             config,
             workspace,
             mok_schedule,
@@ -1268,11 +1176,7 @@ def test_recompute_forward_context_bf16(
                 actual.gate_routed[:valid_rows],
             ),
             ("up_shared", expected.up_shared, actual.up_shared),
-            (
-                "up_routed",
-                expected.up_routed[:valid_rows],
-                actual.up_routed[:valid_rows],
-            ),
+            ("up_routed", expected.up_routed[:valid_rows], actual.up_routed[:valid_rows]),
             ("hidden_shared", expected.hidden_shared, actual.hidden_shared),
             (
                 "hidden_routed",
@@ -1332,9 +1236,8 @@ def test_recompute_forward_context_bf16(
         w_routed_down,
         _,
     ) = inputs
-    topk_experts = (
-        torch.arange(num_local_tokens, device=device).remainder(num_experts).view(-1, 1)
-    )
+    topk_experts = torch.arange(
+        num_local_tokens, device=device).remainder(num_experts).view(-1, 1)
     mok_schedule = functional.build_schedule(
         workspace,
         config,
@@ -1342,7 +1245,7 @@ def test_recompute_forward_context_bf16(
         num_local_experts=num_local_experts,
     )
     assert int(mok_schedule.num_tokens.item()) > config.macrobatch_size
-    _, expected = functional._forward_gate_up(
+    _, expected = functional.forward(
         config,
         workspace,
         mok_schedule,
@@ -1365,7 +1268,7 @@ def test_recompute_forward_context_bf16(
         "routed_gate_weights": w_routed_gate,
         "routed_up_weights": w_routed_up,
     }
-    actual = functional._recompute_forward_context_gate_up(**valid_kwargs)
+    actual = functional.recompute_forward_context(**valid_kwargs)
     assert isinstance(expected.x_routed, torch.Tensor)
     assert isinstance(expected.gate_routed, torch.Tensor)
     assert isinstance(expected.up_routed, torch.Tensor)
@@ -1421,7 +1324,7 @@ def test_recompute_forward_context_bf16(
         ),
     ):
         try:
-            functional._recompute_forward_context_gate_up(**(valid_kwargs | overrides))
+            functional.recompute_forward_context(**(valid_kwargs | overrides))
         except expected_exception:
             pass
         else:
@@ -1430,24 +1333,9 @@ def test_recompute_forward_context_bf16(
 
 def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
     rank, world_size, device = context
-    for shape, mok_param, swiglu_param in itertools.product(
-        shapes(world_size), mok_params(), swiglu_params()
-    ):
-        (
-            shape_name,
-            num_experts,
-            hidden_dim,
-            intermediate_dim,
-            topk,
-            num_local_tokens,
-        ) = shape
-        (
-            mok_param_name,
-            fwd_num_comm_sms,
-            bwd_num_comm_sms,
-            minibatch_size,
-            macrobatch_size,
-        ) = mok_param
+    for shape, mok_param, swiglu_param in itertools.product(shapes(world_size), mok_params(), swiglu_params()):
+        shape_name, num_experts, hidden_dim, intermediate_dim, topk, num_local_tokens = shape
+        mok_param_name, fwd_num_comm_sms, bwd_num_comm_sms, minibatch_size, macrobatch_size = mok_param
         swiglu_param_name, swiglu_limit = swiglu_param
         assert num_experts % world_size == 0
         num_local_experts = num_experts // world_size
@@ -1512,7 +1400,7 @@ def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
             w_routed_down_t_fp8,
             w_routed_down_t_sc,
         ) = mxfp8_quantize(w_routed_down, True, True)
-        _, forward_context = functional._forward_gate_up(
+        _, forward_context = functional.forward(
             config,
             workspace,
             mok_schedule,
@@ -1527,7 +1415,7 @@ def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
             swiglu_limit,
         )
 
-        actual = functional._backward_gate_up(
+        actual = functional.backward(
             config,
             workspace,
             mok_schedule,
@@ -1636,7 +1524,7 @@ def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         w_routed_down_t_fp8,
         w_routed_down_t_sc,
     ) = mxfp8_quantize(w_routed_down, True, True)
-    _, forward_context = functional._forward_gate_up(
+    _, forward_context = functional.forward(
         config,
         workspace,
         mok_schedule,
@@ -1678,7 +1566,7 @@ def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         ),
     }
 
-    actual = functional._backward_gate_up(**valid_kwargs)
+    actual = functional.backward(**valid_kwargs)
     reference = run_reference_bf16(*inputs)[1:]
     for name, expected, result in zip(
         BACKWARD_RESULT_NAMES, reference, actual, strict=True
@@ -1725,7 +1613,7 @@ def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
         ),
     ):
         try:
-            functional._backward_gate_up(**(valid_kwargs | overrides))
+            functional.backward(**(valid_kwargs | overrides))
         except expected_exception:
             pass
         else:
@@ -1734,24 +1622,9 @@ def test_backward_mxfp8(context: tuple[int, int, torch.device]) -> None:
 
 def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
     rank, world_size, device = context
-    for shape, mok_param, swiglu_param in itertools.product(
-        shapes(world_size), mok_params(), swiglu_params()
-    ):
-        (
-            shape_name,
-            num_experts,
-            hidden_dim,
-            intermediate_dim,
-            topk,
-            num_local_tokens,
-        ) = shape
-        (
-            mok_param_name,
-            fwd_num_comm_sms,
-            bwd_num_comm_sms,
-            minibatch_size,
-            macrobatch_size,
-        ) = mok_param
+    for shape, mok_param, swiglu_param in itertools.product(shapes(world_size), mok_params(), swiglu_params()):
+        shape_name, num_experts, hidden_dim, intermediate_dim, topk, num_local_tokens = shape
+        mok_param_name, fwd_num_comm_sms, bwd_num_comm_sms, minibatch_size, macrobatch_size = mok_param
         swiglu_param_name, swiglu_limit = swiglu_param
         assert num_experts % world_size == 0
         num_local_experts = num_experts // world_size
@@ -1798,7 +1671,7 @@ def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
             topk_experts,
             num_local_experts=num_local_experts,
         )
-        _, forward_context = functional._forward_gate_up(
+        _, forward_context = functional.forward(
             config,
             workspace,
             mok_schedule,
@@ -1813,7 +1686,7 @@ def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
             swiglu_limit,
         )
 
-        actual = functional._backward_gate_up(
+        actual = functional.backward(
             config,
             workspace,
             mok_schedule,
@@ -1894,7 +1767,7 @@ def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
         topk_experts,
         num_local_experts=num_local_experts,
     )
-    _, forward_context = functional._forward_gate_up(
+    _, forward_context = functional.forward(
         config,
         workspace,
         mok_schedule,
@@ -1923,7 +1796,7 @@ def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
         "routed_down_weights": w_routed_down,
     }
 
-    actual = functional._backward_gate_up(**valid_kwargs)
+    actual = functional.backward(**valid_kwargs)
     reference = run_reference_bf16(*inputs)[1:]
     for name, expected, result in zip(
         BACKWARD_RESULT_NAMES, reference, actual, strict=True
@@ -1970,7 +1843,7 @@ def test_backward_bf16(context: tuple[int, int, torch.device]) -> None:
         ),
     ):
         try:
-            functional._backward_gate_up(**(valid_kwargs | overrides))
+            functional.backward(**(valid_kwargs | overrides))
         except expected_exception:
             pass
         else:

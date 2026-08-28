@@ -178,10 +178,10 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
                     tma::cluster::load_async(a_smem[input_ring], a_gmem_curr, {tile_coord.x * 2 + cta_rank, k_block},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                     if constexpr (IS_SHARED || IS_WGRAD) {
-                        if constexpr (IS_AB)
-                            tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        else
-                            tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    if constexpr (IS_AB)
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    else
+                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                     } else if constexpr (IS_AB) {
                         const auto selected_b = b_gmem_curr.select_expert(tile_coord.z);
                         tma::cluster::load_async(b_smem[input_ring], selected_b,
@@ -273,14 +273,14 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                                 b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
                                 gemm_inputs_finished[input_ring]);
                     } else {
-                        if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring],
-                                               a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
-                                               b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
-                                               gemm_inputs_finished[input_ring]);
-                        else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring],
-                                               a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
-                                               b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
-                                               gemm_inputs_finished[input_ring]);
+                    if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring],
+                                           a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                           b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                           gemm_inputs_finished[input_ring]);
+                    else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring],
+                                           a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                           b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                           gemm_inputs_finished[input_ring]);
                     }
                 } else {
                     tma::expect_bytes(gemm_inputs_arrived[input_ring], config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
@@ -483,9 +483,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 }
                 warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
                 warpgroup::tma::store_async_read_wait();
-            } else {
-                store_bf16();
-            }
+        } else {
+            store_bf16();
+        }
         }
         epilogue_group::sync(4);
         if (epilogue_group::warpid() == 0 && warp::elect_leader()) {

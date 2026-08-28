@@ -83,7 +83,7 @@ def test_e2e_bf16(context: tuple[int, int, torch.device]) -> None:
             num_local_experts=num_local_experts,
         )
 
-        bf16_output, forward_context = functional._forward_gate_up(
+        bf16_output, forward_context = functional.forward(
             config,
             workspace,
             schedule,
@@ -96,7 +96,7 @@ def test_e2e_bf16(context: tuple[int, int, torch.device]) -> None:
             w_routed_up,
             w_routed_down,
         )
-        bf16_gradients = functional._backward_gate_up(
+        bf16_gradients = functional.backward(
             config,
             workspace,
             schedule,
@@ -178,7 +178,7 @@ def test_e2e_bf16_recomputed_forward_context(
             num_local_experts=num_local_experts,
         )
 
-        bf16_output, discarded_forward_context = functional._forward_gate_up(
+        bf16_output, discarded_forward_context = functional.forward(
             config,
             workspace,
             schedule,
@@ -192,7 +192,7 @@ def test_e2e_bf16_recomputed_forward_context(
             w_routed_down,
         )
         del discarded_forward_context
-        forward_context = functional._recompute_forward_context_gate_up(
+        forward_context = functional.recompute_forward_context(
             config,
             workspace,
             schedule,
@@ -202,7 +202,7 @@ def test_e2e_bf16_recomputed_forward_context(
             w_routed_gate,
             w_routed_up,
         )
-        bf16_gradients = functional._backward_gate_up(
+        bf16_gradients = functional.backward(
             config,
             workspace,
             schedule,
@@ -306,7 +306,7 @@ def test_e2e_mxfp8(context: tuple[int, int, torch.device]) -> None:
             w_routed_down_t_sc,
         ) = mxfp8_quantize(w_routed_down, True, True)
 
-        mxfp8_output, forward_context = functional._forward_gate_up(
+        mxfp8_output, forward_context = functional.forward(
             config,
             workspace,
             schedule,
@@ -319,7 +319,7 @@ def test_e2e_mxfp8(context: tuple[int, int, torch.device]) -> None:
             (w_routed_up_fp8, w_routed_up_sc),
             (w_routed_down_fp8, w_routed_down_sc),
         )
-        mxfp8_gradients = functional._backward_gate_up(
+        mxfp8_gradients = functional.backward(
             config,
             workspace,
             schedule,
@@ -433,7 +433,7 @@ def test_e2e_mxfp8_recomputed_forward_context(
             w_routed_down_t_sc,
         ) = mxfp8_quantize(w_routed_down, True, True)
 
-        mxfp8_output, discarded_forward_context = functional._forward_gate_up(
+        mxfp8_output, discarded_forward_context = functional.forward(
             config,
             workspace,
             schedule,
@@ -447,7 +447,7 @@ def test_e2e_mxfp8_recomputed_forward_context(
             (w_routed_down_fp8, w_routed_down_sc),
         )
         del discarded_forward_context
-        forward_context = functional._recompute_forward_context_gate_up(
+        forward_context = functional.recompute_forward_context(
             config,
             workspace,
             schedule,
@@ -457,7 +457,7 @@ def test_e2e_mxfp8_recomputed_forward_context(
             (w_routed_gate_fp8, w_routed_gate_sc),
             (w_routed_up_fp8, w_routed_up_sc),
         )
-        mxfp8_gradients = functional._backward_gate_up(
+        mxfp8_gradients = functional.backward(
             config,
             workspace,
             schedule,

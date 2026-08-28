@@ -609,11 +609,11 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
             return dispatch_for_main_grad.template operator()<false>();
         }
         return dispatch_mlp_swiglu_combiner<EP_SIZE, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
-            d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
-            router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
-            w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-            x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
-            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
+                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
+                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
             topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             w_routed_gate_storage_table, w_routed_up_storage_table,

@@ -274,9 +274,7 @@ def run_forward_reference_bf16(
     recv_splits = all_send_counts[:, rank].tolist()
     num_recv = sum(recv_splits)
     send_x = x[dispatch_order // topk]
-    send_local_experts = (
-        topk_experts_flat[dispatch_order] % num_local_experts
-    ).contiguous()
+    send_local_experts = (topk_experts_flat[dispatch_order] % num_local_experts).contiguous()
     recv_x = all_to_all(send_x, num_recv, recv_splits, send_splits)
     recv_local_experts = all_to_all(send_local_experts, num_recv, recv_splits, send_splits)
 
@@ -386,15 +384,9 @@ def run_reference_bf16(
     recv_splits = all_send_counts[:, rank].tolist()
     num_recv = sum(recv_splits)
     send_x = x[dispatch_order // topk]
-    send_local_experts = (
-        topk_experts_flat[dispatch_order] % num_local_experts
-    ).contiguous()
-    recv_x = all_to_all(
-        send_x, num_recv, recv_splits, send_splits, group=group
-    ).requires_grad_()
-    recv_local_experts = all_to_all(
-        send_local_experts, num_recv, recv_splits, send_splits, group=group
-    )
+    send_local_experts = (topk_experts_flat[dispatch_order] % num_local_experts).contiguous()
+    recv_x = all_to_all(send_x, num_recv, recv_splits, send_splits, group=group).requires_grad_()
+    recv_local_experts = all_to_all(send_local_experts, num_recv, recv_splits, send_splits, group=group)
 
     # Routed expert FFN
     w_routed_gate = w_routed_gate.detach().requires_grad_()

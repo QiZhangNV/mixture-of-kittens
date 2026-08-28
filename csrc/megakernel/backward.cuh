@@ -337,12 +337,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                     const int task_idx = minibatch_task_idx;
                     if (g.routed_weights_are_native_columnwise) {
                         expert_grouped_gemm_kernel<false, false, true>(g.d_y_fp8_routed, g.w_routed_down_T, &g.d_y_sc_routed, &g.w_routed_down_T_sc, nullptr, nullptr, nullptr, nullptr,
-                                                   g.d_hidden_routed, nullptr, nullptr,
-                                                   g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
-                                                   d_tt, a_sc_tt, b_sc_tt,
-                                                   gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                                   num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                                   0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
+                                               g.d_hidden_routed, nullptr, nullptr,
+                                               g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
+                                               d_tt, a_sc_tt, b_sc_tt,
+                                               gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                               num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                               0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
                     } else {
                         expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_y_fp8_routed, g.w_routed_down_T, &g.d_y_sc_routed, &g.w_routed_down_T_sc, nullptr, nullptr, nullptr, nullptr,
                                                    g.d_hidden_routed, nullptr, nullptr, g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
@@ -368,13 +368,13 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks - minibatch_routed_swiglu_bwd_tasks;
                     if (g.routed_weights_are_native_columnwise) {
                         expert_grouped_gemm_kernel<false, false, true>(g.d_gate_fp8_routed, g.w_routed_gate_T, &g.d_gate_sc_routed, &g.w_routed_gate_T_sc,
-                                                   &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,
-                                                   g.d_x_routed, nullptr, nullptr,
-                                                   g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, &g.d_x_routed_ready, buffer_done,
-                                                   d_tt, a_sc_tt, b_sc_tt,
-                                                   gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
-                                                   num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                                   0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                                               &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,
+                                               g.d_x_routed, nullptr, nullptr,
+                                               g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, &g.d_x_routed_ready, buffer_done,
+                                               d_tt, a_sc_tt, b_sc_tt,
+                                               gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
+                                               num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
+                                               0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
                     } else {
                         expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_gate_fp8_routed, g.w_routed_gate_T, &g.d_gate_sc_routed, &g.w_routed_gate_T_sc,
                                                    &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,

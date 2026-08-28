@@ -162,7 +162,7 @@ def test_split_routed_weights_match_dense(
         torch.zeros_like(w_shared_down, dtype=torch.float32),
         dense_down_main_grad,
     )
-    dense_output, dense_context = functional._forward_gate_up(
+    dense_output, dense_context = functional.forward(
         config,
         workspace,
         schedule,
@@ -175,7 +175,7 @@ def test_split_routed_weights_match_dense(
         dense_forward_up,
         dense_forward_down,
     )
-    dense_backward = functional._backward_gate_up(
+    dense_backward = functional.backward(
         config,
         workspace,
         schedule,
@@ -212,7 +212,7 @@ def test_split_routed_weights_match_dense(
         torch.zeros_like(w_shared_down, dtype=torch.float32),
         split_down_main_grads[0],
     )
-    split_output, split_context = functional._forward_gate_up(
+    split_output, split_context = functional.forward(
         config,
         workspace,
         schedule,
@@ -225,7 +225,7 @@ def test_split_routed_weights_match_dense(
         split_fc1,
         split_down,
     )
-    split_backward = functional._backward_gate_up(
+    split_backward = functional.backward(
         config,
         workspace,
         schedule,

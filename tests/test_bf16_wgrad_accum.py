@@ -171,7 +171,7 @@ def test_wgrad_accumulates_directly_into_main_grad(
         raise ValueError("MOK_TEST_NUM_ACCUMULATIONS must be positive")
 
     for _ in range(num_accumulations):
-        output, forward_context = functional._forward_gate_up(
+        output, forward_context = functional.forward(
             config,
             workspace,
             schedule,
@@ -184,7 +184,7 @@ def test_wgrad_accumulates_directly_into_main_grad(
             forward_routed_up,
             forward_routed_down,
         )
-        d_x, d_router_weights, *_ = functional._backward_gate_up(
+        d_x, d_router_weights, *_ = functional.backward(
             config,
             workspace,
             schedule,
