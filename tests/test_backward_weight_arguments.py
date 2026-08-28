@@ -8,14 +8,14 @@ def _tensor() -> torch.Tensor:
     return torch.empty(0)
 
 
-def test_normalize_contiguous_backward_weights() -> None:
+def test_parse_contiguous_backward_weight_arguments() -> None:
     gate, up, down = _tensor(), _tensor(), _tensor()
-    normalized = functional._normalize_backward_weights(gate, up, down, None, None)
-    assert isinstance(normalized, functional._BF16BackwardWeights)
-    assert normalized.gate_data is gate
-    assert normalized.up_data is up
-    assert normalized.down_data is down
-    assert normalized.storage_tables is None
+    parsed = functional._parse_backward_weight_arguments(gate, up, down, None, None)
+    assert isinstance(parsed, functional._BF16BackwardWeightArgs)
+    assert parsed.gate_data is gate
+    assert parsed.up_data is up
+    assert parsed.down_data is down
+    assert parsed.storage_tables is None
 
     gate_row, gate_row_scale, gate_column, gate_column_scale = (
         _tensor(),
@@ -30,14 +30,14 @@ def test_normalize_contiguous_backward_weights() -> None:
         _tensor(),
     )
     down_column, down_column_scale = _tensor(), _tensor()
-    legacy = functional._normalize_backward_weights(
+    legacy = functional._parse_backward_weight_arguments(
         (gate_row, gate_row_scale, gate_column, gate_column_scale),
         (up_row, up_row_scale, up_column, up_column_scale),
         (down_column, down_column_scale),
         None,
         None,
     )
-    assert isinstance(legacy, functional._MXFP8BackwardWeights)
+    assert isinstance(legacy, functional._MXFP8BackwardWeightArgs)
     assert legacy.gate_row_data is gate_row
     assert legacy.gate_column_data is gate_column
     assert legacy.up_row_data is up_row
@@ -47,21 +47,21 @@ def test_normalize_contiguous_backward_weights() -> None:
     assert legacy.storage_tables is None
     assert legacy.scale_storage_tables is None
 
-    native = functional._normalize_backward_weights(
+    native = functional._parse_backward_weight_arguments(
         (gate_row, gate_row_scale, gate_column, gate_column_scale, True),
         (up_row, up_row_scale, up_column, up_column_scale, True),
         (down_column, down_column_scale, True),
         None,
         None,
     )
-    assert isinstance(native, functional._MXFP8BackwardWeights)
+    assert isinstance(native, functional._MXFP8BackwardWeightArgs)
     assert native.gate_column_data is gate_column
     assert native.up_column_data is up_column
     assert native.down_column_data is down_column
     assert native.native_columnwise is True
 
 
-def test_normalize_split_backward_weights() -> None:
+def test_parse_split_backward_weight_arguments() -> None:
     main_grad = _tensor()
     main_grad_tables = (_tensor(), _tensor(), _tensor())
 
@@ -71,12 +71,12 @@ def test_normalize_split_backward_weights() -> None:
         functional.SplitRoutedWeight(data, table)
         for data, table in zip(bf16_data, bf16_tables, strict=True)
     )
-    bf16 = functional._normalize_backward_weights(
+    bf16 = functional._parse_backward_weight_arguments(
         *bf16_weights,
         (main_grad,),
         main_grad_tables,
     )
-    assert isinstance(bf16, functional._BF16BackwardWeights)
+    assert isinstance(bf16, functional._BF16BackwardWeightArgs)
     assert bf16.gate_data is bf16_data[0]
     assert bf16.up_data is bf16_data[1]
     assert bf16.down_data is bf16_data[2]
@@ -102,14 +102,14 @@ def test_normalize_split_backward_weights() -> None:
             )
         )
     gate, up, down = split_weights
-    mxfp8 = functional._normalize_backward_weights(
+    mxfp8 = functional._parse_backward_weight_arguments(
         gate,
         up,
         down,
         (main_grad,),
         main_grad_tables,
     )
-    assert isinstance(mxfp8, functional._MXFP8BackwardWeights)
+    assert isinstance(mxfp8, functional._MXFP8BackwardWeightArgs)
     assert mxfp8.gate_row_data is gate.data
     assert mxfp8.gate_column_data is gate.transposed_data
     assert mxfp8.up_row_data is up.data
@@ -146,9 +146,9 @@ def test_normalize_split_backward_weights() -> None:
     )
 
 
-def test_normalize_backward_weights_rejects_mixed_encodings() -> None:
+def test_parse_backward_weight_arguments_rejects_mixed_encodings() -> None:
     with pytest.raises(TypeError, match="same storage representation"):
-        functional._normalize_backward_weights(
+        functional._parse_backward_weight_arguments(
             _tensor(),
             (_tensor(), _tensor(), _tensor(), _tensor()),
             _tensor(),

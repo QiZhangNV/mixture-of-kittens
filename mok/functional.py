@@ -90,8 +90,8 @@ class SplitRoutedWeight:
 
 
 @dataclass(frozen=True, slots=True)
-class _BF16BackwardWeights:
-    """Normalized BF16 routed-weight arguments for ``backward``."""
+class _BF16BackwardWeightArgs:
+    """Parsed BF16 routed-weight arguments for ``backward``."""
 
     gate_data: torch.Tensor
     up_data: torch.Tensor
@@ -100,8 +100,8 @@ class _BF16BackwardWeights:
 
 
 @dataclass(frozen=True, slots=True)
-class _MXFP8BackwardWeights:
-    """Normalized MXFP8 routed-weight arguments for ``backward``."""
+class _MXFP8BackwardWeightArgs:
+    """Parsed MXFP8 routed-weight arguments for ``backward``."""
 
     gate_row_data: torch.Tensor
     gate_row_scale: torch.Tensor
@@ -859,14 +859,14 @@ def recompute_forward_context(
     )
 
 
-def _normalize_backward_weights(
+def _parse_backward_weight_arguments(
     routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     routed_down_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     main_grads: tuple[torch.Tensor, ...] | None,
     main_grad_storage_tables: tuple[torch.Tensor, ...] | None,
-) -> _BF16BackwardWeights | _MXFP8BackwardWeights:
-    """Normalize all public routed-weight encodings used by ``backward``.
+) -> _BF16BackwardWeightArgs | _MXFP8BackwardWeightArgs:
+    """Parse all public routed-weight encodings used by ``backward``.
 
     Tuple-length compatibility is intentionally confined to this boundary.
     The backward implementation below consumes only named fields.
@@ -894,7 +894,7 @@ def _normalize_backward_weights(
         if not split_is_mxfp8:
             if any(weight.scale is not None for weight in split_triplet):
                 raise ValueError("split BF16 routed weights must not provide scales")
-            return _BF16BackwardWeights(
+            return _BF16BackwardWeightArgs(
                 gate_data=split_gate.data,
                 up_data=split_up.data,
                 down_data=split_down.data,
@@ -926,7 +926,7 @@ def _normalize_backward_weights(
             raise ValueError(
                 "split MXFP8 routed weights must agree on columnwise layout"
             )
-        return _MXFP8BackwardWeights(
+        return _MXFP8BackwardWeightArgs(
             gate_row_data=split_gate.data,
             gate_row_scale=split_gate.scale,
             gate_column_data=split_gate.transposed_data,
@@ -967,7 +967,7 @@ def _normalize_backward_weights(
             for weight in (routed_gate_weights, routed_up_weights, routed_down_weights)
         ):
             raise TypeError("contiguous BF16 routed weights must be torch.Tensor objects")
-        return _BF16BackwardWeights(
+        return _BF16BackwardWeightArgs(
             gate_data=routed_gate_weights,
             up_data=routed_up_weights,
             down_data=routed_down_weights,
@@ -1007,7 +1007,7 @@ def _normalize_backward_weights(
             or down_native_columnwise is not True
         ):
             raise ValueError("all native-columnwise MXFP8 flags must be True")
-        return _MXFP8BackwardWeights(
+        return _MXFP8BackwardWeightArgs(
             gate_row_data=gate_row_data,
             gate_row_scale=gate_row_scale,
             gate_column_data=gate_column_data,
@@ -1044,7 +1044,7 @@ def _normalize_backward_weights(
             up_column_scale,
         ) = routed_up_weights
         down_column_data, down_column_scale = routed_down_weights
-        return _MXFP8BackwardWeights(
+        return _MXFP8BackwardWeightArgs(
             gate_row_data=gate_row_data,
             gate_row_scale=gate_row_scale,
             gate_column_data=gate_column_data,
@@ -1160,14 +1160,14 @@ def backward(
     workspace.router_weight_buffer.copy_(router_weights)   # TODO: we can remove this
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    normalized_weights = _normalize_backward_weights(
+    weight_args = _parse_backward_weight_arguments(
         routed_gate_weights,
         routed_up_weights,
         routed_down_weights,
         main_grads,
         main_grad_storage_tables,
     )
-    if isinstance(normalized_weights, _MXFP8BackwardWeights):
+    if isinstance(weight_args, _MXFP8BackwardWeightArgs):
         x_fp8_t_routed, x_sc_t_routed = forward_context.x_routed
         gate_fp8_routed, gate_sc_routed = forward_context.gate_routed
         up_fp8_routed, up_sc_routed = forward_context.up_routed
@@ -1182,14 +1182,14 @@ def backward(
             workspace.d_router_weight_buffer,
             workspace.d_router_weight_buffer_ptrs,
             shared_gate_weights,
-            normalized_weights.gate_column_data,
-            normalized_weights.gate_column_scale,
+            weight_args.gate_column_data,
+            weight_args.gate_column_scale,
             shared_up_weights,
-            normalized_weights.up_column_data,
-            normalized_weights.up_column_scale,
+            weight_args.up_column_data,
+            weight_args.up_column_scale,
             shared_down_weights,
-            normalized_weights.down_column_data,
-            normalized_weights.down_column_scale,
+            weight_args.down_column_data,
+            weight_args.down_column_scale,
             x_fp8_t_routed,
             x_sc_t_routed,
             forward_context.gate_shared,
@@ -1203,10 +1203,10 @@ def backward(
             hidden_sc_t_routed,
             workspace.x_buffer,
             workspace.x_buffer_ptrs,
-            normalized_weights.gate_row_data,
-            normalized_weights.gate_row_scale,
-            normalized_weights.up_row_data,
-            normalized_weights.up_row_scale,
+            weight_args.gate_row_data,
+            weight_args.gate_row_scale,
+            weight_args.up_row_data,
+            weight_args.up_row_scale,
             schedule.peer_rank,
             schedule.peer_token_idx,
             schedule.num_tokens,
@@ -1216,7 +1216,7 @@ def backward(
             config.bwd_num_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
-            normalized_weights.native_columnwise,
+            weight_args.native_columnwise,
         )
         if main_grads is None:
             # Original MOK API: materialize and return six fresh weight gradients.
@@ -1259,8 +1259,8 @@ def backward(
             ) = dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
                 *mxfp8_bwd_args,
                 main_grads=main_grads,
-                weight_storage_tables=normalized_weights.storage_tables,
-                scale_storage_tables=normalized_weights.scale_storage_tables,
+                weight_storage_tables=weight_args.storage_tables,
+                scale_storage_tables=weight_args.scale_storage_tables,
                 main_grad_storage_tables=main_grad_storage_tables,
             )
             (
@@ -1287,11 +1287,11 @@ def backward(
             workspace.d_router_weight_buffer,
             workspace.d_router_weight_buffer_ptrs,
             shared_gate_weights,
-            normalized_weights.gate_data,
+            weight_args.gate_data,
             shared_up_weights,
-            normalized_weights.up_data,
+            weight_args.up_data,
             shared_down_weights,
-            normalized_weights.down_data,
+            weight_args.down_data,
             x_routed,
             forward_context.gate_shared,
             gate_routed,
@@ -1346,7 +1346,7 @@ def backward(
             ) = dispatch_mlp_swiglu_combine_bwd_bf16_accum(
                 *bwd_args,
                 main_grads=main_grads,
-                weight_storage_tables=normalized_weights.storage_tables,
+                weight_storage_tables=weight_args.storage_tables,
                 main_grad_storage_tables=main_grad_storage_tables,
             )
             (
