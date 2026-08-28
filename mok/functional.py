@@ -89,6 +89,47 @@ class SplitRoutedWeight:
     native_columnwise: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _BF16BackwardWeights:
+    """Normalized BF16 routed-weight arguments for ``backward``."""
+
+    gate_data: torch.Tensor
+    up_data: torch.Tensor
+    down_data: torch.Tensor
+    storage_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _MXFP8BackwardWeights:
+    """Normalized MXFP8 routed-weight arguments for ``backward``."""
+
+    gate_row_data: torch.Tensor
+    gate_row_scale: torch.Tensor
+    gate_column_data: torch.Tensor
+    gate_column_scale: torch.Tensor
+    up_row_data: torch.Tensor
+    up_row_scale: torch.Tensor
+    up_column_data: torch.Tensor
+    up_column_scale: torch.Tensor
+    down_column_data: torch.Tensor
+    down_column_scale: torch.Tensor
+    native_columnwise: bool
+    storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None
+    scale_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None
+
+
 @dataclass(slots=True)
 class MoKWorkspace:
     group_name: str                                   # () str
@@ -818,6 +859,210 @@ def recompute_forward_context(
     )
 
 
+def _normalize_backward_weights(
+    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    routed_down_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    main_grads: tuple[torch.Tensor, ...] | None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None,
+) -> _BF16BackwardWeights | _MXFP8BackwardWeights:
+    """Normalize all public routed-weight encodings used by ``backward``.
+
+    Tuple-length compatibility is intentionally confined to this boundary.
+    The backward implementation below consumes only named fields.
+    """
+    split_weights = isinstance(routed_gate_weights, SplitRoutedWeight)
+    if split_weights != isinstance(
+        routed_up_weights, SplitRoutedWeight
+    ) or split_weights != isinstance(routed_down_weights, SplitRoutedWeight):
+        raise TypeError(
+            "routed gate/up/down weights must use the same storage representation"
+        )
+    if split_weights and main_grads is None:
+        raise ValueError("split routed weights require fused main-grad accumulation")
+    if (main_grad_storage_tables is not None) != split_weights:
+        raise ValueError(
+            "split routed weights require three split main-grad storage tables"
+        )
+
+    if split_weights:
+        split_gate = routed_gate_weights
+        split_up = routed_up_weights
+        split_down = routed_down_weights
+        split_triplet = (split_gate, split_up, split_down)
+        split_is_mxfp8 = split_gate.scale is not None
+        if not split_is_mxfp8:
+            if any(weight.scale is not None for weight in split_triplet):
+                raise ValueError("split BF16 routed weights must not provide scales")
+            return _BF16BackwardWeights(
+                gate_data=split_gate.data,
+                up_data=split_up.data,
+                down_data=split_down.data,
+                storage_tables=(
+                    split_gate.storage_table,
+                    split_up.storage_table,
+                    split_down.storage_table,
+                ),
+            )
+
+        if any(weight.scale is None for weight in split_triplet):
+            raise ValueError("all split MXFP8 routed weights must provide scales")
+        if any(
+            weight.transposed_data is None
+            or weight.transposed_scale is None
+            or weight.transposed_storage_table is None
+            or weight.scale_storage_table is None
+            or weight.transposed_scale_storage_table is None
+            for weight in split_triplet
+        ):
+            raise ValueError(
+                "split MXFP8 routed weights require rowwise/columnwise data, "
+                "scales, and descriptors"
+            )
+        native_columnwise_values = {
+            weight.native_columnwise for weight in split_triplet
+        }
+        if len(native_columnwise_values) != 1:
+            raise ValueError(
+                "split MXFP8 routed weights must agree on columnwise layout"
+            )
+        return _MXFP8BackwardWeights(
+            gate_row_data=split_gate.data,
+            gate_row_scale=split_gate.scale,
+            gate_column_data=split_gate.transposed_data,
+            gate_column_scale=split_gate.transposed_scale,
+            up_row_data=split_up.data,
+            up_row_scale=split_up.scale,
+            up_column_data=split_up.transposed_data,
+            up_column_scale=split_up.transposed_scale,
+            down_column_data=split_down.transposed_data,
+            down_column_scale=split_down.transposed_scale,
+            native_columnwise=split_gate.native_columnwise,
+            storage_tables=(
+                split_gate.storage_table,
+                split_up.storage_table,
+                split_gate.transposed_storage_table,
+                split_up.transposed_storage_table,
+                split_down.transposed_storage_table,
+            ),
+            scale_storage_tables=(
+                split_gate.scale_storage_table,
+                split_up.scale_storage_table,
+                split_gate.transposed_scale_storage_table,
+                split_up.transposed_scale_storage_table,
+                split_down.transposed_scale_storage_table,
+            ),
+        )
+
+    tuple_weights = isinstance(routed_gate_weights, tuple)
+    if tuple_weights != isinstance(
+        routed_up_weights, tuple
+    ) or tuple_weights != isinstance(routed_down_weights, tuple):
+        raise TypeError(
+            "routed gate/up/down weights must use the same storage representation"
+        )
+    if not tuple_weights:
+        if not all(
+            isinstance(weight, torch.Tensor)
+            for weight in (routed_gate_weights, routed_up_weights, routed_down_weights)
+        ):
+            raise TypeError("contiguous BF16 routed weights must be torch.Tensor objects")
+        return _BF16BackwardWeights(
+            gate_data=routed_gate_weights,
+            up_data=routed_up_weights,
+            down_data=routed_down_weights,
+            storage_tables=None,
+        )
+
+    if len(routed_gate_weights) == 5:
+        # Single-grouped MXFP8 with TE-native columnwise payloads:
+        # gate/up=(row, row_scale, column, column_scale, True),
+        # down=(column, column_scale, True).
+        if len(routed_up_weights) != 5 or len(routed_down_weights) != 3:
+            raise ValueError(
+                "native-columnwise MXFP8 gate/up/down tuples must have lengths 5/5/3"
+            )
+        (
+            gate_row_data,
+            gate_row_scale,
+            gate_column_data,
+            gate_column_scale,
+            gate_native_columnwise,
+        ) = routed_gate_weights
+        (
+            up_row_data,
+            up_row_scale,
+            up_column_data,
+            up_column_scale,
+            up_native_columnwise,
+        ) = routed_up_weights
+        (
+            down_column_data,
+            down_column_scale,
+            down_native_columnwise,
+        ) = routed_down_weights
+        if (
+            gate_native_columnwise is not True
+            or up_native_columnwise is not True
+            or down_native_columnwise is not True
+        ):
+            raise ValueError("all native-columnwise MXFP8 flags must be True")
+        return _MXFP8BackwardWeights(
+            gate_row_data=gate_row_data,
+            gate_row_scale=gate_row_scale,
+            gate_column_data=gate_column_data,
+            gate_column_scale=gate_column_scale,
+            up_row_data=up_row_data,
+            up_row_scale=up_row_scale,
+            up_column_data=up_column_data,
+            up_column_scale=up_column_scale,
+            down_column_data=down_column_data,
+            down_column_scale=down_column_scale,
+            native_columnwise=True,
+            storage_tables=None,
+            scale_storage_tables=None,
+        )
+
+    if len(routed_gate_weights) == 4:
+        # Legacy single-grouped MXFP8 with explicitly transposed payloads:
+        # gate/up=(row, row_scale, transposed, transposed_scale),
+        # down=(transposed, transposed_scale).
+        if len(routed_up_weights) != 4 or len(routed_down_weights) != 2:
+            raise ValueError(
+                "legacy MXFP8 gate/up/down tuples must have lengths 4/4/2"
+            )
+        (
+            gate_row_data,
+            gate_row_scale,
+            gate_column_data,
+            gate_column_scale,
+        ) = routed_gate_weights
+        (
+            up_row_data,
+            up_row_scale,
+            up_column_data,
+            up_column_scale,
+        ) = routed_up_weights
+        down_column_data, down_column_scale = routed_down_weights
+        return _MXFP8BackwardWeights(
+            gate_row_data=gate_row_data,
+            gate_row_scale=gate_row_scale,
+            gate_column_data=gate_column_data,
+            gate_column_scale=gate_column_scale,
+            up_row_data=up_row_data,
+            up_row_scale=up_row_scale,
+            up_column_data=up_column_data,
+            up_column_scale=up_column_scale,
+            down_column_data=down_column_data,
+            down_column_scale=down_column_scale,
+            native_columnwise=False,
+            storage_tables=None,
+            scale_storage_tables=None,
+        )
+
+    raise ValueError("MXFP8 gate weight tuple must contain four or five values")
+
+
 def backward(
     config: MoKConfig,
     workspace: MoKWorkspace,
@@ -915,136 +1160,14 @@ def backward(
     workspace.router_weight_buffer.copy_(router_weights)   # TODO: we can remove this
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    split_weights = isinstance(routed_gate_weights, SplitRoutedWeight)
-    if split_weights != isinstance(
-        routed_up_weights, SplitRoutedWeight
-    ) or split_weights != isinstance(routed_down_weights, SplitRoutedWeight):
-        raise TypeError(
-            "routed gate/up/down weights must use the same storage representation"
-        )
-    if split_weights and main_grads is None:
-        raise ValueError("split routed weights require fused main-grad accumulation")
-    if (main_grad_storage_tables is not None) != split_weights:
-        raise ValueError(
-            "split routed weights require three split main-grad storage tables"
-        )
-    routed_precision_is_mxfp8 = (
-        routed_gate_weights.scale is not None
-        if split_weights
-        else isinstance(routed_gate_weights, tuple)
+    normalized_weights = _normalize_backward_weights(
+        routed_gate_weights,
+        routed_up_weights,
+        routed_down_weights,
+        main_grads,
+        main_grad_storage_tables,
     )
-    if routed_precision_is_mxfp8:
-        if split_weights:
-            # Non-single MXFP8: each expert's rowwise/columnwise payload and
-            # scale are selected through descriptor tables.
-            split_triplet = (
-                routed_gate_weights,
-                routed_up_weights,
-                routed_down_weights,
-            )
-            if any(weight.scale is None for weight in split_triplet):
-                raise ValueError("all split MXFP8 routed weights must provide scales")
-            if any(
-                weight.transposed_data is None
-                or weight.transposed_scale is None
-                or weight.transposed_storage_table is None
-                or weight.scale_storage_table is None
-                or weight.transposed_scale_storage_table is None
-                for weight in split_triplet
-            ):
-                raise ValueError(
-                    "split MXFP8 routed weights require rowwise/columnwise data, "
-                    "scales, and descriptors"
-                )
-            native_columnwise_values = {
-                weight.native_columnwise for weight in split_triplet
-            }
-            if len(native_columnwise_values) != 1:
-                raise ValueError(
-                    "split MXFP8 routed weights must agree on columnwise layout"
-                )
-            routed_weights_are_native_columnwise = routed_gate_weights.native_columnwise
-            routed_gate_weights_fp8 = routed_gate_weights.data
-            routed_gate_weights_sc = routed_gate_weights.scale
-            routed_gate_weights_t_fp8 = routed_gate_weights.transposed_data
-            routed_gate_weights_t_sc = routed_gate_weights.transposed_scale
-            routed_up_weights_fp8 = routed_up_weights.data
-            routed_up_weights_sc = routed_up_weights.scale
-            routed_up_weights_t_fp8 = routed_up_weights.transposed_data
-            routed_up_weights_t_sc = routed_up_weights.transposed_scale
-            routed_down_weights_t_fp8 = routed_down_weights.transposed_data
-            routed_down_weights_t_sc = routed_down_weights.transposed_scale
-            weight_storage_tables = (
-                routed_gate_weights.storage_table,
-                routed_up_weights.storage_table,
-                routed_gate_weights.transposed_storage_table,
-                routed_up_weights.transposed_storage_table,
-                routed_down_weights.transposed_storage_table,
-            )
-            scale_storage_tables = (
-                routed_gate_weights.scale_storage_table,
-                routed_up_weights.scale_storage_table,
-                routed_gate_weights.transposed_scale_storage_table,
-                routed_up_weights.transposed_scale_storage_table,
-                routed_down_weights.transposed_scale_storage_table,
-            )
-        elif len(routed_gate_weights) == 5:
-            # Single-grouped MXFP8 with TE-native columnwise payloads:
-            # gate/up=(row, row_scale, column, column_scale, True),
-            # down=(column, column_scale, True).
-            (
-                routed_gate_weights_fp8,
-                routed_gate_weights_sc,
-                routed_gate_weights_t_fp8,
-                routed_gate_weights_t_sc,
-                routed_weights_are_native_columnwise,
-            ) = routed_gate_weights
-            if len(routed_up_weights) != 5 or len(routed_down_weights) != 3:
-                raise ValueError(
-                    "native-columnwise MXFP8 gate/up/down tuples must have lengths 5/5/3"
-                )
-            (
-                routed_up_weights_fp8,
-                routed_up_weights_sc,
-                routed_up_weights_t_fp8,
-                routed_up_weights_t_sc,
-                routed_up_is_native_columnwise,
-            ) = routed_up_weights
-            (
-                routed_down_weights_t_fp8,
-                routed_down_weights_t_sc,
-                routed_down_is_native_columnwise,
-            ) = routed_down_weights
-            if (
-                routed_weights_are_native_columnwise is not True
-                or routed_up_is_native_columnwise is not True
-                or routed_down_is_native_columnwise is not True
-            ):
-                raise ValueError("all native-columnwise MXFP8 flags must be True")
-            weight_storage_tables = None
-            scale_storage_tables = None
-        elif len(routed_gate_weights) == 4:
-            # Legacy single-grouped MXFP8 with explicitly transposed payloads:
-            # gate/up=(row, row_scale, transposed, transposed_scale),
-            # down=(transposed, transposed_scale).
-            (
-                routed_gate_weights_fp8,
-                routed_gate_weights_sc,
-                routed_gate_weights_t_fp8,
-                routed_gate_weights_t_sc,
-            ) = routed_gate_weights
-            (
-                routed_up_weights_fp8,
-                routed_up_weights_sc,
-                routed_up_weights_t_fp8,
-                routed_up_weights_t_sc,
-            ) = routed_up_weights
-            routed_down_weights_t_fp8, routed_down_weights_t_sc = routed_down_weights
-            routed_weights_are_native_columnwise = False
-            weight_storage_tables = None
-            scale_storage_tables = None
-        else:
-            raise ValueError("MXFP8 gate weight tuple must contain four or five values")
+    if isinstance(normalized_weights, _MXFP8BackwardWeights):
         x_fp8_t_routed, x_sc_t_routed = forward_context.x_routed
         gate_fp8_routed, gate_sc_routed = forward_context.gate_routed
         up_fp8_routed, up_sc_routed = forward_context.up_routed
@@ -1059,14 +1182,14 @@ def backward(
             workspace.d_router_weight_buffer,
             workspace.d_router_weight_buffer_ptrs,
             shared_gate_weights,
-            routed_gate_weights_t_fp8,
-            routed_gate_weights_t_sc,
+            normalized_weights.gate_column_data,
+            normalized_weights.gate_column_scale,
             shared_up_weights,
-            routed_up_weights_t_fp8,
-            routed_up_weights_t_sc,
+            normalized_weights.up_column_data,
+            normalized_weights.up_column_scale,
             shared_down_weights,
-            routed_down_weights_t_fp8,
-            routed_down_weights_t_sc,
+            normalized_weights.down_column_data,
+            normalized_weights.down_column_scale,
             x_fp8_t_routed,
             x_sc_t_routed,
             forward_context.gate_shared,
@@ -1080,10 +1203,10 @@ def backward(
             hidden_sc_t_routed,
             workspace.x_buffer,
             workspace.x_buffer_ptrs,
-            routed_gate_weights_fp8,
-            routed_gate_weights_sc,
-            routed_up_weights_fp8,
-            routed_up_weights_sc,
+            normalized_weights.gate_row_data,
+            normalized_weights.gate_row_scale,
+            normalized_weights.up_row_data,
+            normalized_weights.up_row_scale,
             schedule.peer_rank,
             schedule.peer_token_idx,
             schedule.num_tokens,
@@ -1093,7 +1216,7 @@ def backward(
             config.bwd_num_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
-            routed_weights_are_native_columnwise,
+            normalized_weights.native_columnwise,
         )
         if main_grads is None:
             # Original MOK API: materialize and return six fresh weight gradients.
@@ -1136,8 +1259,8 @@ def backward(
             ) = dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
                 *mxfp8_bwd_args,
                 main_grads=main_grads,
-                weight_storage_tables=weight_storage_tables,
-                scale_storage_tables=scale_storage_tables,
+                weight_storage_tables=normalized_weights.storage_tables,
+                scale_storage_tables=normalized_weights.scale_storage_tables,
                 main_grad_storage_tables=main_grad_storage_tables,
             )
             (
@@ -1150,30 +1273,6 @@ def backward(
             ) = main_grads
     else:
         # BF16 has no scale or rowwise/columnwise representation pair.
-        if split_weights:
-            # Non-single BF16: select each expert payload through descriptors.
-            if any(
-                weight.scale is not None
-                for weight in (
-                    routed_gate_weights,
-                    routed_up_weights,
-                    routed_down_weights,
-                )
-            ):
-                raise ValueError("split BF16 routed weights must not provide scales")
-            routed_gate_data = routed_gate_weights.data
-            routed_up_data = routed_up_weights.data
-            routed_down_data = routed_down_weights.data
-            weight_storage_tables = (
-                routed_gate_weights.storage_table,
-                routed_up_weights.storage_table,
-                routed_down_weights.storage_table,
-            )
-        else:
-            routed_gate_data = routed_gate_weights
-            routed_up_data = routed_up_weights
-            routed_down_data = routed_down_weights
-            weight_storage_tables = None
         x_routed = forward_context.x_routed
         gate_routed = forward_context.gate_routed
         up_routed = forward_context.up_routed
@@ -1188,11 +1287,11 @@ def backward(
             workspace.d_router_weight_buffer,
             workspace.d_router_weight_buffer_ptrs,
             shared_gate_weights,
-            routed_gate_data,
+            normalized_weights.gate_data,
             shared_up_weights,
-            routed_up_data,
+            normalized_weights.up_data,
             shared_down_weights,
-            routed_down_data,
+            normalized_weights.down_data,
             x_routed,
             forward_context.gate_shared,
             gate_routed,
@@ -1247,7 +1346,7 @@ def backward(
             ) = dispatch_mlp_swiglu_combine_bwd_bf16_accum(
                 *bwd_args,
                 main_grads=main_grads,
-                weight_storage_tables=weight_storage_tables,
+                weight_storage_tables=normalized_weights.storage_tables,
                 main_grad_storage_tables=main_grad_storage_tables,
             )
             (
