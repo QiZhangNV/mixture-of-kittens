@@ -210,6 +210,8 @@ def _make_routed_storage_table(
     if not isinstance(expert_tensors, list) or not expert_tensors:
         raise TypeError("expert_tensors must be a nonempty list of tensors")
     first = expert_tensors[0]
+    if not isinstance(first, torch.Tensor):
+        raise TypeError("each expert tensor must be a torch.Tensor")
     if not first.is_cuda or not first.is_contiguous() or first.ndim != 2:
         raise ValueError("each expert tensor must be a contiguous CUDA matrix")
     for tensor in expert_tensors:
