@@ -340,7 +340,8 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / config::MLP_Nb);
     const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
-    const bool single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr();
+    const bool combined_fc1_payload = w_routed_gate.is_same(w_routed_up);
+    const bool combined_fc1_scale_payload = w_routed_gate_sc.is_same(w_routed_up_sc);
     const int num_local_experts = tokens_per_expert.size(0);
     const bool split_weight_storage = w_routed_gate_storage_table.has_value();
     const bool split_scale_storage = w_routed_gate_sc_storage_table.has_value();
@@ -354,6 +355,18 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
         "MoK: all three split MXFP8 scale descriptor tables must be provided together");
     TORCH_CHECK(split_weight_storage == split_scale_storage,
                 "MoK: split MXFP8 weight and scale descriptor tables must be provided together");
+    TORCH_CHECK(combined_fc1_payload == combined_fc1_scale_payload,
+                "MoK: combined FC1 weights and scales must alias consistently");
+    if (split_weight_storage) {
+        TORCH_CHECK(
+            combined_fc1_payload ==
+                w_routed_gate_storage_table->is_same(*w_routed_up_storage_table),
+            "MoK: combined FC1 weights and weight descriptor tables must alias consistently");
+        TORCH_CHECK(
+            combined_fc1_scale_payload ==
+                w_routed_gate_sc_storage_table->is_same(*w_routed_up_sc_storage_table),
+            "MoK: combined FC1 scales and scale descriptor tables must alias consistently");
+    }
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl y_routed_recv_buffer_data;
@@ -416,17 +429,19 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
             w_routed_gate_storage_table, num_local_experts),
         .w_routed_gate_sc = make_routed_scale_view(
             w_routed_gate_sc,
-            (single_grouped_fc1 ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
+            (combined_fc1_payload ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
             0, 0, w_routed_gate_sc_storage_table, num_local_experts),
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
         .w_routed_up = make_routed_weight_view(
             w_routed_up, intermediate_dim, hidden_dim,
-            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0, 0,
+            combined_fc1_payload
+                ? intermediate_dim / config::MLP_WEIGHT_ROWS_PER_CTA : 0,
+            0,
             w_routed_up_storage_table, num_local_experts),
         .w_routed_up_sc = make_routed_scale_view(
             w_routed_up_sc,
-            (single_grouped_fc1 ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
-            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0,
+            (combined_fc1_payload ? 2 : 1) * intermediate_dim / config::QUANT_Mb,
+            combined_fc1_payload ? intermediate_dim / config::QUANT_Mb : 0,
             0, w_routed_up_sc_storage_table, num_local_experts),
         .w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down),
         .w_routed_down = make_routed_weight_view(
@@ -500,8 +515,19 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
     const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
-    const bool single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr();
+    const bool combined_fc1_payload = w_routed_gate.is_same(w_routed_up);
     const int num_local_experts = tokens_per_expert.size(0);
+    const bool split_weight_storage = w_routed_gate_storage_table.has_value();
+    TORCH_CHECK(
+        split_weight_storage == w_routed_up_storage_table.has_value() &&
+        split_weight_storage == w_routed_down_storage_table.has_value(),
+        "MoK: all three split BF16 weight descriptor tables must be provided together");
+    if (split_weight_storage) {
+        TORCH_CHECK(
+            combined_fc1_payload ==
+                w_routed_gate_storage_table->is_same(*w_routed_up_storage_table),
+            "MoK: combined FC1 weights and weight descriptor tables must alias consistently");
+    }
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl y_routed_recv_buffer_data;
@@ -556,7 +582,9 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
         .w_routed_up = make_routed_weight_view(
             w_routed_up, intermediate_dim, hidden_dim,
-            single_grouped_fc1 ? intermediate_dim / config::QUANT_Mb : 0, 0,
+            combined_fc1_payload
+                ? intermediate_dim / config::MLP_WEIGHT_ROWS_PER_CTA : 0,
+            0,
             w_routed_up_storage_table, num_local_experts),
         .w_routed_up_sc = {},
         .w_shared_down = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_down),

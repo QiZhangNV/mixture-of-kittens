@@ -1,9 +1,13 @@
 struct config {
+    // One grouped-GEMM output tile is split across this many CTAs.
+    static constexpr int CLUSTER_SIZE = 2;
+
     // Grouped GEMM
     static constexpr int MLP_Mb = 256;
     static constexpr int MLP_Nb = 256;
     static constexpr int MLP_FP8_Kb = 128;
     static constexpr int MLP_BF16_Kb = 64;
+    static constexpr int MLP_WEIGHT_ROWS_PER_CTA = MLP_Nb / CLUSTER_SIZE;
     static constexpr int MLP_SUPERGROUP_SIZE = 8;
     static constexpr int MLP_LOAD_PIPE_DEPTH = 6;
     static constexpr int MLP_EPI_PIPE_DEPTH = 8;
@@ -33,7 +37,6 @@ struct config {
     // Kernel launch
     static constexpr int CLC_PIPE_DEPTH = 1;
     static constexpr int CLC_DRAIN_PIPE_DEPTH = 8; // roughly a good number, but variance is low
-    static constexpr int CLUSTER_SIZE = 2;
     static constexpr int NUM_CONSUMERS = 1;
     static constexpr int NUM_PRODUCERS = 1;
     static constexpr int NUM_WARPS = (NUM_CONSUMERS + NUM_PRODUCERS) * WARPGROUP_WARPS; // 8

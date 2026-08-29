@@ -94,7 +94,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 w_shared_down, w_routed_down, w_routed_down_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_down_sc_storage_table);
         case 4:
             return dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -194,7 +198,9 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table);
         case 4:
             return dispatch_mlp_swiglu_combiner<4, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -515,6 +521,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         return dispatch_for_main_grad.template operator()<false>();
     };
     switch (x_ptrs.size()) {
+        case 1: return dispatch_for_ep.template operator()<1>();
         case 4: return dispatch_for_ep.template operator()<4>();
         case 8: return dispatch_for_ep.template operator()<8>();
         case 16: return dispatch_for_ep.template operator()<16>();

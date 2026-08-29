@@ -213,6 +213,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
     }
 }
 
+// TODO(MCore integration): support combined FC1 payloads and descriptor-backed split routed
+// weights before enabling specialized forward-context recomputation from MCore.
 static __host__ __forceinline__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                            at::Tensor>

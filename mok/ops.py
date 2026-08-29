@@ -435,29 +435,42 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
             raise ValueError("w_routed_gate must have shape "
                              "(num_local_experts, intermediate_size, hidden_size)")
         num_local_experts = w_routed_gate.shape[0]
-    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
-    single_grouped_fc1_sc = w_routed_gate_sc.data_ptr() == w_routed_up_sc.data_ptr()
-    if single_grouped_fc1 != single_grouped_fc1_sc:
+    combined_fc1_payload = w_routed_gate is w_routed_up
+    combined_fc1_scale_payload = w_routed_gate_sc is w_routed_up_sc
+    if combined_fc1_payload != combined_fc1_scale_payload:
         raise ValueError(
-            "single-grouped FC1 data and scale tensors must alias consistently"
+            "combined FC1 data and scale tensors must alias consistently"
         )
+    if split_storage:
+        if combined_fc1_payload != (
+            w_routed_gate_storage_table is w_routed_up_storage_table
+        ):
+            raise ValueError(
+                "combined FC1 weights and weight descriptor tables must alias consistently"
+            )
+        if combined_fc1_scale_payload != (
+            w_routed_gate_sc_storage_table is w_routed_up_sc_storage_table
+        ):
+            raise ValueError(
+                "combined FC1 scales and scale descriptor tables must alias consistently"
+            )
     routed_fc1_shape = (
-        ((2 if single_grouped_fc1 else 1) * intermediate_size, hidden_size)
+        ((2 if combined_fc1_payload else 1) * intermediate_size, hidden_size)
         if split_storage
         else (
             num_local_experts,
-            (2 if single_grouped_fc1 else 1) * intermediate_size,
+            (2 if combined_fc1_payload else 1) * intermediate_size,
             hidden_size,
         )
     )
     routed_fc1_sc_shape = (
         (
-            (2 if single_grouped_fc1 else 1) * intermediate_size // 128,
+            (2 if combined_fc1_payload else 1) * intermediate_size // 128,
             hidden_size // 128, 32, 16,
         )
         if split_scale_storage
         else (
-            num_local_experts * (2 if single_grouped_fc1 else 1) * intermediate_size // 128,
+            num_local_experts * (2 if combined_fc1_payload else 1) * intermediate_size // 128,
             hidden_size // 128, 32, 16,
         )
     )
@@ -642,13 +655,19 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
                 "(num_local_experts, intermediate_size, hidden_size)"
             )
         num_local_experts = w_routed_gate.shape[0]
-    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
+    combined_fc1_payload = w_routed_gate is w_routed_up
+    if split_storage and combined_fc1_payload != (
+        w_routed_gate_storage_table is w_routed_up_storage_table
+    ):
+        raise ValueError(
+            "combined FC1 weights and weight descriptor tables must alias consistently"
+        )
     routed_fc1_shape = (
-        ((2 if single_grouped_fc1 else 1) * intermediate_size, hidden_size)
+        ((2 if combined_fc1_payload else 1) * intermediate_size, hidden_size)
         if split_storage
         else (
             num_local_experts,
-            (2 if single_grouped_fc1 else 1) * intermediate_size,
+            (2 if combined_fc1_payload else 1) * intermediate_size,
             hidden_size,
         )
     )
@@ -1197,45 +1216,45 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
-    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
-    single_grouped_fc1_sc = w_routed_gate_sc.data_ptr() == w_routed_up_sc.data_ptr()
-    single_grouped_fc1_t = w_routed_gate_T.data_ptr() == w_routed_up_T.data_ptr()
-    single_grouped_fc1_t_sc = (
-        w_routed_gate_T_sc.data_ptr() == w_routed_up_T_sc.data_ptr()
+    combined_fc1_payload = w_routed_gate is w_routed_up
+    combined_fc1_scale_payload = w_routed_gate_sc is w_routed_up_sc
+    combined_fc1_transposed_payload = w_routed_gate_T is w_routed_up_T
+    combined_fc1_transposed_scale_payload = (
+        w_routed_gate_T_sc is w_routed_up_T_sc
     )
-    if single_grouped_fc1 != single_grouped_fc1_sc:
+    if combined_fc1_payload != combined_fc1_scale_payload:
         raise ValueError(
-            "single-grouped rowwise FC1 data and scales must alias consistently"
+            "combined rowwise FC1 data and scales must alias consistently"
         )
-    if single_grouped_fc1_t != single_grouped_fc1_t_sc:
+    if combined_fc1_transposed_payload != combined_fc1_transposed_scale_payload:
         raise ValueError(
-            "single-grouped columnwise FC1 data and scales must alias consistently"
+            "combined columnwise FC1 data and scales must alias consistently"
         )
     if routed_weights_are_native_columnwise and not (
-        single_grouped_fc1 and single_grouped_fc1_sc
-        and single_grouped_fc1_t and single_grouped_fc1_t_sc
+        combined_fc1_payload and combined_fc1_scale_payload
+        and combined_fc1_transposed_payload and combined_fc1_transposed_scale_payload
     ):
-        raise ValueError("native columnwise weights require single-grouped FC1 aliases")
+        raise ValueError("native columnwise weights require combined FC1 aliases")
 
     mb_i_sc = (macrobatch_size // 128, intermediate_size // 128, 32, 16)
     i_mb_sc = (intermediate_size // 128, macrobatch_size // 128, 32, 16)
     h_mb_sc = (hidden_size // 128, macrobatch_size // 128, 32, 16)
     e_i_h_sc = (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)
     routed_fc1_shape = (
-        num_local_experts, (2 if single_grouped_fc1 else 1) * intermediate_size, hidden_size
+        num_local_experts, (2 if combined_fc1_payload else 1) * intermediate_size, hidden_size
     )
     routed_fc1_sc_shape = (
-        num_local_experts * (2 if single_grouped_fc1 else 1) * intermediate_size // 128,
+        num_local_experts * (2 if combined_fc1_payload else 1) * intermediate_size // 128,
         hidden_size // 128, 32, 16,
     )
     routed_fc1_t_shape = (
         routed_fc1_shape if routed_weights_are_native_columnwise else
         (num_local_experts, hidden_size,
-         (2 if single_grouped_fc1_t else 1) * intermediate_size)
+         (2 if combined_fc1_transposed_payload else 1) * intermediate_size)
     )
     routed_fc1_t_sc_shape = (
         num_local_experts * hidden_size // 128,
-        (2 if single_grouped_fc1_t else 1) * intermediate_size // 128, 32, 16,
+        (2 if combined_fc1_transposed_payload else 1) * intermediate_size // 128, 32, 16,
     )
     expected_shapes = (
         ("d_y_buffer", d_y_buffer, (num_local_tokens, hidden_size)),
@@ -1549,10 +1568,10 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
-    single_grouped_fc1 = w_routed_gate.data_ptr() == w_routed_up.data_ptr()
+    combined_fc1_payload = w_routed_gate is w_routed_up
     routed_fc1_shape = (
         num_local_experts,
-        (2 if single_grouped_fc1 else 1) * intermediate_size,
+        (2 if combined_fc1_payload else 1) * intermediate_size,
         hidden_size,
     )
     if type(topk) is not int or not 0 < topk <= 255:
