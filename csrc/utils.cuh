@@ -89,10 +89,10 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals &g) {
         compute_group::load(accumulator, stage_vecs[0]);
         for (int k = 0; k < topk; ++k) {
             if (top_experts[stage * topk + k] >= 0) {
-            compute_group::load(term, stage_vecs[1 + k]);
-            compute_group::mul(term, term, weights[stage * topk + k]);
-            compute_group::add(accumulator, accumulator, term);
-        }
+                compute_group::load(term, stage_vecs[1 + k]);
+                compute_group::mul(term, term, weights[stage * topk + k]);
+                compute_group::add(accumulator, accumulator, term);
+            }
         }
         compute_group::store(stage_vecs[0], accumulator);
         __syncthreads();
@@ -181,9 +181,9 @@ static __device__ __forceinline__ void bwd_epilogue_kernel(const globals &g) {
     compute_group::load(accumulator, token_vecs[0]);
     for (int k = 0; k < topk; ++k) {
         if (top_experts[k] >= 0) {
-        compute_group::load(term, token_vecs[1 + k]);
-        compute_group::add(accumulator, accumulator, term);
-    }
+            compute_group::load(term, token_vecs[1 + k]);
+            compute_group::add(accumulator, accumulator, term);
+        }
     }
     compute_group::store(token_vecs[0], accumulator);
     __syncthreads();
