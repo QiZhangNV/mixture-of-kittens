@@ -177,11 +177,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                     const int k_block = idx < first_gemm_iters ? idx : idx - first_gemm_iters;
                     wait(gemm_inputs_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
                     tma::cluster::load_async(a_smem[input_ring], a_gmem_curr, {tile_coord.x * 2 + cta_rank, k_block},               gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                    if constexpr (IS_SHARED || IS_WGRAD) {
-                    if constexpr (IS_AB)
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                    else
-                        tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                    if constexpr (IS_SHARED) {
+                        if constexpr (IS_AB)
+                            tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, k_block, tile_coord.y * 2 + cta_rank}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                        else
+                            tma::cluster::load_async(b_smem[input_ring], b_gmem_curr, {tile_coord.z, tile_coord.y * 2 + cta_rank, k_block}, gemm_inputs_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
                     } else if constexpr (IS_AB) {
                         const auto selected_b = b_gmem_curr.select_expert(tile_coord.z);
                         tma::cluster::load_async(b_smem[input_ring], selected_b,
@@ -223,19 +223,11 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                         const auto &b_gmem_curr = idx < first_gemm_iters ? b_gmem : *b2_gmem;
                         const int k_block = idx < first_gemm_iters ? idx : idx - first_gemm_iters;
                         tma::cluster::load_async(a_sc_smem[input_ring], a_sc_curr, {tile_coord.x * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
-                        if constexpr (IS_WGRAD) {
-                            tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], b_sc_curr,
-                                {tile_coord.z * (b_gmem_curr.rows() / config::QUANT_Mb)
-                                     + tile_coord.y * 2 + cta_rank,
-                                 k_block, 0, 0},
-                                gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
-                        } else {
-                            const auto selected_b_sc = b_sc_curr.select_expert(tile_coord.z);
-                            tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], selected_b_sc,
-                                {b_sc_curr.physical_row_block(tile_coord.z, tile_coord.y * 2 + cta_rank),
-                                 b_sc_curr.physical_col_block(k_block), 0, 0},
-                                gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
-                        }
+                        const auto selected_b_sc = b_sc_curr.select_expert(tile_coord.z);
+                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], selected_b_sc,
+                            {b_sc_curr.physical_row_block(tile_coord.z, tile_coord.y * 2 + cta_rank),
+                             b_sc_curr.physical_col_block(k_block), 0, 0},
+                            gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
                         update_phasebit<1>(gemm_bitfield, input_ring);
                         input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
                     }
@@ -273,14 +265,14 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                                 b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
                                 gemm_inputs_finished[input_ring]);
                     } else {
-                    if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring],
-                                           a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
-                                           b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
-                                           gemm_inputs_finished[input_ring]);
-                    else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring],
-                                           a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
-                                           b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
-                                           gemm_inputs_finished[input_ring]);
+                        if (idx == 0) mm2_ABt (d_tt, a_smem[input_ring], b_smem[input_ring],
+                                               a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                               b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                               gemm_inputs_finished[input_ring]);
+                        else          mma2_ABt(d_tt, a_smem[input_ring], b_smem[input_ring],
+                                               a_sc_tt.template subtile<full_tt_fp8e8m0<16>>(input_ring * 16),
+                                               b_sc_tt.template subtile<full_tt_fp8e8m0<32>>(input_ring * 32),
+                                               gemm_inputs_finished[input_ring]);
                     }
                 } else {
                     tma::expect_bytes(gemm_inputs_arrived[input_ring], config::CLUSTER_SIZE * (sizeof(a_tile) + sizeof(b_tile)));
@@ -483,9 +475,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 }
                 warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
                 warpgroup::tma::store_async_read_wait();
-        } else {
-            store_bf16();
-        }
+            } else {
+                store_bf16();
+            }
         }
         epilogue_group::sync(4);
         if (epilogue_group::warpid() == 0 && warp::elect_leader()) {
