@@ -5,6 +5,47 @@
 
 #include "megakernel.cuh"
 
+// Descriptor layouts are independent of NUM_DEVICES; EP4 is only a
+// convenient template instantiation for these host-side builders.
+static __host__ at::Tensor make_routed_weight_storage_table_mxfp8(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    return dispatch_mlp_swiglu_combiner<4>::make_routed_weight_storage_table(
+        expert_tensors);
+}
+
+static __host__ at::Tensor make_routed_weight_storage_table_bf16(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    return dispatch_mlp_swiglu_combiner<
+        4, RoutedPrecision::BF16
+    >::make_routed_weight_storage_table(expert_tensors);
+}
+
+static __host__ at::Tensor make_routed_scale_storage_table(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    return dispatch_mlp_swiglu_combiner<4>::make_routed_scale_storage_table(
+        expert_tensors);
+}
+
+static __host__ at::Tensor make_routed_d_weight_storage_table(
+    const std::vector<at::Tensor> &expert_tensors
+) {
+    TORCH_CHECK(!expert_tensors.empty(), "MoK expert gradient list must not be empty");
+    const auto dtype = expert_tensors.front().scalar_type();
+    if (dtype == at::kBFloat16) {
+        return dispatch_mlp_swiglu_combiner<
+            4, RoutedPrecision::MXFP8, true, true
+        >::make_routed_d_weight_storage_table(expert_tensors);
+    }
+    TORCH_CHECK(dtype == at::kFloat,
+                "MoK split main grads must have dtype bfloat16 or float32");
+    return dispatch_mlp_swiglu_combiner<
+        4, RoutedPrecision::MXFP8, true, false
+    >::make_routed_d_weight_storage_table(expert_tensors);
+}
+
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor>
@@ -37,7 +78,13 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_sc_storage_table = std::nullopt
 ) {
     const int num_devices = static_cast<int>(x_ptrs.size());
 
@@ -49,7 +96,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 w_shared_down, w_routed_down, w_routed_down_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_down_sc_storage_table);
         case 4:
             return dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -57,7 +108,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 w_shared_down, w_routed_down, w_routed_down_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_down_sc_storage_table);
         case 8:
             return dispatch_mlp_swiglu_combiner<8>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -65,7 +120,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 w_shared_down, w_routed_down, w_routed_down_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_down_sc_storage_table);
         case 16:
             return dispatch_mlp_swiglu_combiner<16>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -73,7 +132,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 w_shared_down, w_routed_down, w_routed_down_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_down_sc_storage_table);
         case 32:
             return dispatch_mlp_swiglu_combiner<32>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -81,7 +144,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 w_shared_down, w_routed_down, w_routed_down_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_down_sc_storage_table);
         case 64:
             return dispatch_mlp_swiglu_combiner<64>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -89,7 +156,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 w_shared_down, w_routed_down, w_routed_down_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_down_sc_storage_table);
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_fwd_mxfp8 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
@@ -117,7 +188,10 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt
 ) {
     const int num_devices = static_cast<int>(x_ptrs.size());
     switch (num_devices) {
@@ -126,37 +200,49 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table);
         case 4:
             return dispatch_mlp_swiglu_combiner<4, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table);
         case 8:
             return dispatch_mlp_swiglu_combiner<8, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table);
         case 16:
             return dispatch_mlp_swiglu_combiner<16, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table);
         case 32:
             return dispatch_mlp_swiglu_combiner<32, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table);
         case 64:
             return dispatch_mlp_swiglu_combiner<64, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_down_storage_table);
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_fwd_bf16 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
@@ -220,7 +306,8 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    bool routed_weights_are_native_columnwise
 ) {
     const int num_devices = static_cast<int>(x_ptrs.size());
 
@@ -240,7 +327,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 w_routed_gate, w_routed_gate_sc,
                 w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size, routed_weights_are_native_columnwise);
         case 4:
             return dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -256,7 +343,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 w_routed_gate, w_routed_gate_sc,
                 w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size, routed_weights_are_native_columnwise);
         case 8:
             return dispatch_mlp_swiglu_combiner<8>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -272,7 +359,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 w_routed_gate, w_routed_gate_sc,
                 w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size, routed_weights_are_native_columnwise);
         case 16:
             return dispatch_mlp_swiglu_combiner<16>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -288,7 +375,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 w_routed_gate, w_routed_gate_sc,
                 w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size, routed_weights_are_native_columnwise);
         case 32:
             return dispatch_mlp_swiglu_combiner<32>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -304,7 +391,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 w_routed_gate, w_routed_gate_sc,
                 w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size, routed_weights_are_native_columnwise);
         case 64:
             return dispatch_mlp_swiglu_combiner<64>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -320,10 +407,132 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 w_routed_gate, w_routed_gate_sc,
                 w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size, routed_weights_are_native_columnwise);
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_bwd_mxfp8 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
+    }
+}
+
+static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+    const at::Tensor &d_y_buffer,
+    const std::vector<int64_t> &d_y_buffer_ptrs,
+    const at::Tensor &d_x_routed_buffer,
+    const std::vector<int64_t> &d_x_routed_buffer_ptrs,
+    const at::Tensor &router_weight_buffer,
+    const std::vector<int64_t> &router_weight_buffer_ptrs,
+    const at::Tensor &d_router_weight_buffer,
+    const std::vector<int64_t> &d_router_weight_buffer_ptrs,
+    const at::Tensor &w_shared_gate,
+    const at::Tensor &w_routed_gate_T,
+    const at::Tensor &w_routed_gate_T_sc,
+    const at::Tensor &w_shared_up,
+    const at::Tensor &w_routed_up_T,
+    const at::Tensor &w_routed_up_T_sc,
+    const at::Tensor &w_shared_down,
+    const at::Tensor &w_routed_down_T,
+    const at::Tensor &w_routed_down_T_sc,
+    const at::Tensor &x_fp8_t_routed,
+    const at::Tensor &x_sc_t_routed,
+    const at::Tensor &gate_shared,
+    const at::Tensor &gate_fp8_routed,
+    const at::Tensor &gate_sc_routed,
+    const at::Tensor &up_shared,
+    const at::Tensor &up_fp8_routed,
+    const at::Tensor &up_sc_routed,
+    const at::Tensor &hidden_shared,
+    const at::Tensor &hidden_fp8_t_routed,
+    const at::Tensor &hidden_sc_t_routed,
+    const at::Tensor &x,
+    const std::vector<int64_t> &x_ptrs,
+    const at::Tensor &w_routed_gate,
+    const at::Tensor &w_routed_gate_sc,
+    const at::Tensor &w_routed_up,
+    const at::Tensor &w_routed_up_sc,
+    const at::Tensor &schedule_peer_rank,
+    const at::Tensor &schedule_peer_token_idx,
+    const at::Tensor &num_tokens,
+    const at::Tensor &tokens_per_expert,
+    int topk,
+    std::optional<float> swiglu_limit,
+    int num_comm_sms,
+    int macrobatch_size,
+    int minibatch_size,
+    bool routed_weights_are_native_columnwise,
+    const at::Tensor &main_grad_shared_gate,
+    const at::Tensor &main_grad_routed_gate,
+    const at::Tensor &main_grad_shared_up,
+    const at::Tensor &main_grad_routed_up,
+    const at::Tensor &main_grad_shared_down,
+    const at::Tensor &main_grad_routed_down,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_T_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_T_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_T_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_T_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_T_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_T_sc_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt
+) {
+    auto dispatch_for_ep = [&]<int EP_SIZE>() {
+        auto dispatch_for_main_grad = [&]<bool USE_BF16_MAIN_GRAD>() {
+            return dispatch_mlp_swiglu_combiner<
+                EP_SIZE, RoutedPrecision::MXFP8, true, USE_BF16_MAIN_GRAD
+            >::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+                router_weight_buffer, router_weight_buffer_ptrs,
+                d_router_weight_buffer, d_router_weight_buffer_ptrs,
+                w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
+                w_shared_up, w_routed_up_T, w_routed_up_T_sc,
+                w_shared_down, w_routed_down_T, w_routed_down_T_sc,
+                x_fp8_t_routed, x_sc_t_routed,
+                gate_shared, gate_fp8_routed, gate_sc_routed,
+                up_shared, up_fp8_routed, up_sc_routed,
+                hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
+                x, x_ptrs, w_routed_gate, w_routed_gate_sc,
+                w_routed_up, w_routed_up_sc,
+                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                routed_weights_are_native_columnwise,
+                &main_grad_shared_gate, &main_grad_routed_gate,
+                &main_grad_shared_up, &main_grad_routed_up,
+                &main_grad_shared_down, &main_grad_routed_down,
+                w_routed_gate_storage_table, w_routed_up_storage_table,
+                w_routed_gate_T_storage_table, w_routed_up_T_storage_table,
+                w_routed_down_T_storage_table,
+                w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+                w_routed_gate_T_sc_storage_table, w_routed_up_T_sc_storage_table,
+                w_routed_down_T_sc_storage_table,
+                main_grad_routed_gate_storage_table,
+                main_grad_routed_up_storage_table,
+                main_grad_routed_down_storage_table);
+        };
+        const at::ScalarType main_grad_dtype = main_grad_shared_gate.scalar_type();
+        TORCH_CHECK(main_grad_dtype == at::kFloat || main_grad_dtype == at::kBFloat16,
+                    "MoK: main_grad tensors must have dtype float32 or bfloat16");
+        if (main_grad_dtype == at::kBFloat16)
+            return dispatch_for_main_grad.template operator()<true>();
+        return dispatch_for_main_grad.template operator()<false>();
+    };
+    switch (x_ptrs.size()) {
+        case 1: return dispatch_for_ep.template operator()<1>();
+        case 4: return dispatch_for_ep.template operator()<4>();
+        case 8: return dispatch_for_ep.template operator()<8>();
+        case 16: return dispatch_for_ep.template operator()<16>();
+        case 32: return dispatch_for_ep.template operator()<32>();
+        case 64: return dispatch_for_ep.template operator()<64>();
+        default:
+            throw std::runtime_error(
+                "MoK: dispatch_mlp_swiglu_combine_bwd_mxfp8_accum unsupported EP size=" +
+                std::to_string(x_ptrs.size()));
     }
 }
 
@@ -362,64 +571,82 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    std::optional<at::Tensor> main_grad_shared_gate = std::nullopt,
+    std::optional<at::Tensor> main_grad_routed_gate = std::nullopt,
+    std::optional<at::Tensor> main_grad_shared_up = std::nullopt,
+    std::optional<at::Tensor> main_grad_routed_up = std::nullopt,
+    std::optional<at::Tensor> main_grad_shared_down = std::nullopt,
+    std::optional<at::Tensor> main_grad_routed_down = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_gate_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_up_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt
 ) {
-    const int num_devices = static_cast<int>(x_ptrs.size());
-    switch (num_devices) {
-        case 1:
-            return dispatch_mlp_swiglu_combiner<1, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
-                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
-                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
-        case 4:
-            return dispatch_mlp_swiglu_combiner<4, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
-                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
-                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
-        case 8:
-            return dispatch_mlp_swiglu_combiner<8, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
-                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
-                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
-        case 16:
-            return dispatch_mlp_swiglu_combiner<16, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
-                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
-                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
-        case 32:
-            return dispatch_mlp_swiglu_combiner<32, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
-                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
-                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
-        case 64:
-            return dispatch_mlp_swiglu_combiner<64, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_bwd_bf16(
-                d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
-                router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
-                w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
-                x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
-                schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
-                topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+    const bool accumulate_wgrad = main_grad_shared_gate.has_value();
+    TORCH_CHECK(main_grad_routed_gate.has_value() == accumulate_wgrad &&
+                main_grad_shared_up.has_value() == accumulate_wgrad &&
+                main_grad_routed_up.has_value() == accumulate_wgrad &&
+                main_grad_shared_down.has_value() == accumulate_wgrad &&
+                main_grad_routed_down.has_value() == accumulate_wgrad,
+                "MoK: main_grad tensors must be provided all together");
+    auto dispatch_for_ep = [&]<int EP_SIZE>() {
+        if (accumulate_wgrad) {
+            auto dispatch_for_main_grad = [&]<bool USE_BF16_MAIN_GRAD>() {
+                return dispatch_mlp_swiglu_combiner<
+                    EP_SIZE, RoutedPrecision::BF16, true, USE_BF16_MAIN_GRAD
+                >::dispatch_mlp_swiglu_combine_bwd_bf16(
+                    d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+                    router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
+                    w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
+                    x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
+                    schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+                    topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+                    &*main_grad_shared_gate, &*main_grad_routed_gate, &*main_grad_shared_up,
+                    &*main_grad_routed_up, &*main_grad_shared_down, &*main_grad_routed_down,
+                    w_routed_gate_storage_table, w_routed_up_storage_table,
+                    w_routed_down_storage_table,
+                    main_grad_routed_gate_storage_table,
+                    main_grad_routed_up_storage_table,
+                    main_grad_routed_down_storage_table);
+            };
+            const at::ScalarType main_grad_dtype = main_grad_shared_gate->scalar_type();
+            TORCH_CHECK(main_grad_dtype == at::kFloat || main_grad_dtype == at::kBFloat16,
+                        "MoK: main_grad tensors must have dtype float32 or bfloat16");
+            if (main_grad_dtype == at::kBFloat16)
+                return dispatch_for_main_grad.template operator()<true>();
+            return dispatch_for_main_grad.template operator()<false>();
+        }
+        return dispatch_mlp_swiglu_combiner<
+            EP_SIZE, RoutedPrecision::BF16
+        >::dispatch_mlp_swiglu_combine_bwd_bf16(
+            d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+            router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
+            w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
+            x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
+            schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
+            topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            w_routed_gate_storage_table, w_routed_up_storage_table,
+            w_routed_down_storage_table,
+            main_grad_routed_gate_storage_table,
+            main_grad_routed_up_storage_table,
+            main_grad_routed_down_storage_table);
+    };
+    switch (x_ptrs.size()) {
+        case 1: return dispatch_for_ep.template operator()<1>();
+        case 4: return dispatch_for_ep.template operator()<4>();
+        case 8: return dispatch_for_ep.template operator()<8>();
+        case 16: return dispatch_for_ep.template operator()<16>();
+        case 32: return dispatch_for_ep.template operator()<32>();
+        case 64: return dispatch_for_ep.template operator()<64>();
         default:
-            throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_bwd_bf16 unsupported num_devices=" +
-                                     std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
+            throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_bwd_bf16 unsupported EP size=" +
+                                     std::to_string(x_ptrs.size()));
     }
 }
-
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 recompute_forward_context_mxfp8_entrypoint(
