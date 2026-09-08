@@ -12,6 +12,8 @@ from .ops import (
     bwd_epilogue,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
+    dispatch_mlp_swiglu_combine_bwd_mxfp8_accum,
+    dispatch_mlp_swiglu_combine_bwd_bf16_accum,
     recompute_forward_context_mxfp8,
     recompute_forward_context_bf16,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
@@ -37,6 +39,7 @@ class MoKSchedule:
     peer_token_idx: torch.Tensor     # (schedule_capacity,) int32
     num_tokens: torch.Tensor         # (1,) int32
     tokens_per_expert: torch.Tensor  # (num_local_experts,) int32
+    top_experts: torch.Tensor  # (num_local_tokens, topk) int32; -1 marks no route
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,83 @@ class MoKForwardContext:
     up_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     hidden_shared: torch.Tensor
     hidden_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+@dataclass(frozen=True, slots=True)
+class SplitRoutedWeight:
+    """One logical routed matrix stored in independent per-expert allocations.
+
+    ``data`` and ``scale`` are representative expert tensors required by the
+    Tensor-based custom-op interface; the descriptor tables select the actual
+    expert allocation at runtime. The tables own neither payload nor scale
+    storage. MCore parameters already own every data payload, so no parallel
+    ``data_tensors`` collection is needed. In contrast, the tcgen05-layout
+    scales are generated specifically for MOK and have no other owner, so
+    ``scale_tensors`` retains every expert scale for the descriptor lifetime.
+
+    MXFP8 backward also provides a columnwise payload through the transposed
+    fields. ``native_columnwise=False`` means the legacy payload is physically
+    transposed and uses the ABt dgrad path. ``native_columnwise=True`` means it
+    is TE's native columnwise-quantized payload in the original logical matrix
+    shape and uses the AB dgrad path without materializing a transpose.
+
+    Gate and up may intentionally share the same full ``[2I, H]`` data,
+    descriptor table, and scale tensor. MoK then applies its existing logical
+    gate/up row offsets without repacking that FC1 parameter.
+    """
+
+    data: torch.Tensor
+    storage_table: torch.Tensor
+    scale: torch.Tensor | None = None
+    scale_storage_table: torch.Tensor | None = None
+    scale_tensors: tuple[torch.Tensor, ...] | None = None
+    transposed_data: torch.Tensor | None = None
+    transposed_scale: torch.Tensor | None = None
+    transposed_storage_table: torch.Tensor | None = None
+    transposed_scale_storage_table: torch.Tensor | None = None
+    transposed_scale_tensors: tuple[torch.Tensor, ...] | None = None
+    native_columnwise: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _BF16BackwardWeightArgs:
+    """Parsed BF16 routed-weight arguments for ``backward``."""
+
+    gate_data: torch.Tensor
+    up_data: torch.Tensor
+    down_data: torch.Tensor
+    storage_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _MXFP8BackwardWeightArgs:
+    """Parsed MXFP8 routed-weight arguments for ``backward``."""
+
+    gate_row_data: torch.Tensor
+    gate_row_scale: torch.Tensor
+    gate_column_data: torch.Tensor
+    gate_column_scale: torch.Tensor
+    up_row_data: torch.Tensor
+    up_row_scale: torch.Tensor
+    up_column_data: torch.Tensor
+    up_column_scale: torch.Tensor
+    down_column_data: torch.Tensor
+    down_column_scale: torch.Tensor
+    native_columnwise: bool
+    storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None
+    scale_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None
 
 
 @dataclass(slots=True)
@@ -144,7 +224,7 @@ def validate_workspace_args(
         raise ValueError("hidden_size must be divisible by 256")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
-    fwd_epilogue_smem_bytes = 2 * ((topk + 1) * 2048 + topk * 4) + 1024
+    fwd_epilogue_smem_bytes = 2 * ((topk + 1) * 2048 + 2 * topk * 4) + 1024
     if fwd_epilogue_smem_bytes > device_properties.shared_memory_per_block_optin:
         raise ValueError("topk requires more dynamic shared memory than the device supports")
 
@@ -358,7 +438,7 @@ def build_schedule(
     Inputs:
         workspace:         MoKWorkspace
         config:            MoKConfig
-        top_experts:       int64 [num_local_tokens, topk]
+        top_experts:       int32 or int64 [num_local_tokens, topk]
         num_local_experts: int
 
     Outputs:
@@ -398,8 +478,8 @@ def build_schedule(
         raise ValueError("all_gather_top_experts_chunk_bytes must divide one rank's route-buffer bytes")
     if not top_experts.is_cuda or top_experts.device != workspace.device:
         raise ValueError("top_experts must be on the workspace CUDA device")
-    if top_experts.dtype != torch.int64:
-        raise TypeError("top_experts must have dtype torch.int64")
+    if top_experts.dtype not in (torch.int32, torch.int64):
+        raise TypeError("top_experts must have dtype torch.int32 or torch.int64")
     if not top_experts.is_contiguous():
         raise ValueError("top_experts must be contiguous")
     if tuple(top_experts.shape) != (workspace.num_local_tokens, workspace.topk):
@@ -407,7 +487,9 @@ def build_schedule(
     if type(num_local_experts) is not int or num_local_experts <= 0:
         raise ValueError("num_local_experts must be a positive integer")
 
-    top_experts_int32 = top_experts.to(torch.int32)
+    top_experts_int32 = (
+        top_experts if top_experts.dtype == torch.int32 else top_experts.to(torch.int32)
+    )
     all_gather_top_experts(
         top_experts_int32, workspace.all_gather_top_experts_buffer,
         workspace.all_gather_top_experts_buffer_multicast_ptr, workspace.ep_rank,
@@ -422,6 +504,7 @@ def build_schedule(
     return MoKSchedule(
         peer_rank=schedule_peer_rank, peer_token_idx=schedule_peer_token_idx,
         num_tokens=num_tokens, tokens_per_expert=tokens_per_expert,
+        top_experts=top_experts_int32,
     )
 
 
@@ -458,6 +541,8 @@ def validate_inputs(
         tensors.append(("grad_output", grad_output, torch.bfloat16, expected_activation_shape))
     if router_weights is not None:
         tensors.append(("router_weights", router_weights, torch.float32, (workspace.num_local_tokens, workspace.topk)))
+    tensors.append(("schedule.top_experts", schedule.top_experts, torch.int32,
+                    (workspace.num_local_tokens, workspace.topk)))
     for tensor_name, tensor, expected_dtype, expected_shape in tensors:
         if not tensor.is_cuda or tensor.device != workspace.device or tensor.dtype != expected_dtype or not tensor.is_contiguous():
             raise ValueError(f"{tensor_name} must be contiguous {expected_dtype} on the workspace CUDA device")
@@ -476,15 +561,27 @@ def forward(
     shared_gate_weights: torch.Tensor,
     shared_up_weights: torch.Tensor,
     shared_down_weights: torch.Tensor,
-    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-    routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-    routed_down_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    routed_gate_weights: torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | SplitRoutedWeight,
+    routed_up_weights: torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | SplitRoutedWeight,
+    routed_down_weights: torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | SplitRoutedWeight,
     swiglu_limit: float | None = None,
 ) -> tuple[
     torch.Tensor,
     MoKForwardContext,
 ]:
     """Runs the MoE forward pass.
+
+    Routed weights use one of three representations:
+      * ``torch.Tensor``: contiguous single-grouped BF16 payload.
+      * ``(data, scale)``: contiguous single-grouped MXFP8 forward payload.
+      * ``SplitRoutedWeight``: descriptor-backed non-single BF16 or MXFP8
+        payloads stored in independent per-expert allocations.
 
     Inputs:
         config:              MoKConfig
@@ -495,9 +592,9 @@ def forward(
         shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
         shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
         shared_down_weights: bfloat16 [hidden_size, intermediate_size]
-        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
-        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
-        routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 data/scale tuple
+        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 representation
+        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 representation
+        routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 representation
         swiglu_limit:        float | None
 
     Outputs:
@@ -511,24 +608,93 @@ def forward(
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
 
-    if isinstance(routed_gate_weights, tuple):
-        routed_gate_weights_fp8, routed_gate_weights_sc = routed_gate_weights
-        routed_up_weights_fp8, routed_up_weights_sc = routed_up_weights
-        routed_down_weights_fp8, routed_down_weights_sc = routed_down_weights
-        (x_fp8_t_routed, x_sc_t_routed,
-         gate_shared, gate_fp8_routed, gate_sc_routed,
-         up_shared, up_fp8_routed, up_sc_routed,
-         hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
-         y_shared, y_routed) = dispatch_mlp_swiglu_combine_fwd_mxfp8(
-            workspace.x_buffer, workspace.x_buffer_ptrs,
-            workspace.combine_buffer, workspace.combine_buffer_ptrs,
-            shared_gate_weights, routed_gate_weights_fp8, routed_gate_weights_sc,
-            shared_up_weights, routed_up_weights_fp8, routed_up_weights_sc,
-            shared_down_weights, routed_down_weights_fp8, routed_down_weights_sc,
-            schedule.peer_rank, schedule.peer_token_idx,
-            schedule.num_tokens, schedule.tokens_per_expert,
-            workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
-            config.macrobatch_size, config.minibatch_size,
+    split_weights = isinstance(routed_gate_weights, SplitRoutedWeight)
+    if split_weights != isinstance(
+        routed_up_weights, SplitRoutedWeight
+    ) or split_weights != isinstance(routed_down_weights, SplitRoutedWeight):
+        raise TypeError(
+            "routed gate/up/down weights must use the same storage representation"
+        )
+    routed_precision_is_mxfp8 = (
+        routed_gate_weights.scale is not None
+        if split_weights
+        else isinstance(routed_gate_weights, tuple)
+    )
+    if split_weights:
+        split_triplet = (routed_gate_weights, routed_up_weights, routed_down_weights)
+        if any(
+            (weight.scale is not None) != routed_precision_is_mxfp8
+            for weight in split_triplet
+        ):
+            raise ValueError("split routed gate/up/down weights must use one precision")
+
+    if routed_precision_is_mxfp8:
+        if split_weights:
+            if any(weight.scale_storage_table is None for weight in split_triplet):
+                raise ValueError(
+                    "all split MXFP8 routed weights must provide scale descriptor tables"
+                )
+            routed_gate_weights_fp8 = routed_gate_weights.data
+            routed_gate_weights_sc = routed_gate_weights.scale
+            routed_up_weights_fp8 = routed_up_weights.data
+            routed_up_weights_sc = routed_up_weights.scale
+            routed_down_weights_fp8 = routed_down_weights.data
+            routed_down_weights_sc = routed_down_weights.scale
+            routed_storage_tables = (
+                routed_gate_weights.storage_table,
+                routed_up_weights.storage_table,
+                routed_down_weights.storage_table,
+            )
+            routed_scale_storage_tables = (
+                routed_gate_weights.scale_storage_table,
+                routed_up_weights.scale_storage_table,
+                routed_down_weights.scale_storage_table,
+            )
+        else:
+            routed_gate_weights_fp8, routed_gate_weights_sc = routed_gate_weights
+            routed_up_weights_fp8, routed_up_weights_sc = routed_up_weights
+            routed_down_weights_fp8, routed_down_weights_sc = routed_down_weights
+            routed_storage_tables = (None, None, None)
+            routed_scale_storage_tables = (None, None, None)
+        (
+            x_fp8_t_routed,
+            x_sc_t_routed,
+            gate_shared,
+            gate_fp8_routed,
+            gate_sc_routed,
+            up_shared,
+            up_fp8_routed,
+            up_sc_routed,
+            hidden_shared,
+            hidden_fp8_t_routed,
+            hidden_sc_t_routed,
+            y_shared,
+            y_routed,
+        ) = dispatch_mlp_swiglu_combine_fwd_mxfp8(
+            workspace.x_buffer,
+            workspace.x_buffer_ptrs,
+            workspace.combine_buffer,
+            workspace.combine_buffer_ptrs,
+            shared_gate_weights,
+            routed_gate_weights_fp8,
+            routed_gate_weights_sc,
+            shared_up_weights,
+            routed_up_weights_fp8,
+            routed_up_weights_sc,
+            shared_down_weights,
+            routed_down_weights_fp8,
+            routed_down_weights_sc,
+            schedule.peer_rank,
+            schedule.peer_token_idx,
+            schedule.num_tokens,
+            schedule.tokens_per_expert,
+            workspace.topk,
+            swiglu_limit,
+            config.fwd_num_comm_sms,
+            config.macrobatch_size,
+            config.minibatch_size,
+            *routed_storage_tables,
+            *routed_scale_storage_tables,
         )
         forward_context = MoKForwardContext(
             x_routed=(x_fp8_t_routed, x_sc_t_routed),
@@ -540,17 +706,51 @@ def forward(
             hidden_routed=(hidden_fp8_t_routed, hidden_sc_t_routed),
         )
     else:
-        (x_routed, gate_shared, gate_routed, up_shared, up_routed,
-         hidden_shared, hidden_routed, y_shared, y_routed) = dispatch_mlp_swiglu_combine_fwd_bf16(
-            workspace.x_buffer, workspace.x_buffer_ptrs,
-            workspace.combine_buffer, workspace.combine_buffer_ptrs,
-            shared_gate_weights, routed_gate_weights,
-            shared_up_weights, routed_up_weights,
-            shared_down_weights, routed_down_weights,
-            schedule.peer_rank, schedule.peer_token_idx,
-            schedule.num_tokens, schedule.tokens_per_expert,
-            workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
-            config.macrobatch_size, config.minibatch_size,
+        if split_weights:
+            routed_gate_data = routed_gate_weights.data
+            routed_up_data = routed_up_weights.data
+            routed_down_data = routed_down_weights.data
+            routed_storage_tables = (
+                routed_gate_weights.storage_table,
+                routed_up_weights.storage_table,
+                routed_down_weights.storage_table,
+            )
+        else:
+            routed_gate_data = routed_gate_weights
+            routed_up_data = routed_up_weights
+            routed_down_data = routed_down_weights
+            routed_storage_tables = (None, None, None)
+        (
+            x_routed,
+            gate_shared,
+            gate_routed,
+            up_shared,
+            up_routed,
+            hidden_shared,
+            hidden_routed,
+            y_shared,
+            y_routed,
+        ) = dispatch_mlp_swiglu_combine_fwd_bf16(
+            workspace.x_buffer,
+            workspace.x_buffer_ptrs,
+            workspace.combine_buffer,
+            workspace.combine_buffer_ptrs,
+            shared_gate_weights,
+            routed_gate_data,
+            shared_up_weights,
+            routed_up_data,
+            shared_down_weights,
+            routed_down_data,
+            schedule.peer_rank,
+            schedule.peer_token_idx,
+            schedule.num_tokens,
+            schedule.tokens_per_expert,
+            workspace.topk,
+            swiglu_limit,
+            config.fwd_num_comm_sms,
+            config.macrobatch_size,
+            config.minibatch_size,
+            *routed_storage_tables,
         )
         forward_context = MoKForwardContext(
             x_routed=x_routed,
@@ -564,7 +764,8 @@ def forward(
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    output = fwd_epilogue(y_shared, workspace.combine_buffer, workspace.router_weight_buffer)
+    output = fwd_epilogue(y_shared, workspace.combine_buffer,
+                          workspace.router_weight_buffer, schedule.top_experts)
     return output, forward_context
 
 
@@ -581,6 +782,9 @@ def recompute_forward_context(
 ) -> MoKForwardContext:
     """Recomputes the intermediates needed by the MoK backward pass.
 
+    ``SplitRoutedWeight`` is intentionally unsupported here because the
+    recompute custom ops do not yet accept per-expert descriptor tables.
+
     Inputs:
         config:              MoKConfig
         workspace:           MoKWorkspace
@@ -588,14 +792,20 @@ def recompute_forward_context(
         x:                   bfloat16 [num_local_tokens, hidden_size]
         shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
         shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
-        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
-        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
+        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 representation
+        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 representation
         swiglu_limit:        float | None
 
     Outputs:
         forward_context: MoKForwardContext
     """
     validate_inputs(config, workspace, schedule, x)
+    # Fail explicitly instead of passing a descriptor-backed object to the
+    # contiguous BF16 custom op.
+    if isinstance(routed_gate_weights, SplitRoutedWeight) or isinstance(
+        routed_up_weights, SplitRoutedWeight
+    ):
+        raise TypeError("recompute_forward_context does not support SplitRoutedWeight")
     if isinstance(routed_gate_weights, tuple) != isinstance(routed_up_weights, tuple):
         raise TypeError("routed gate and up weights must use the same precision representation")
     if isinstance(routed_gate_weights, tuple) and (len(routed_gate_weights) != 2 or len(routed_up_weights) != 2):
@@ -649,6 +859,210 @@ def recompute_forward_context(
     )
 
 
+def _parse_backward_weight_arguments(
+    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    routed_down_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    main_grads: tuple[torch.Tensor, ...] | None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None,
+) -> _BF16BackwardWeightArgs | _MXFP8BackwardWeightArgs:
+    """Parse all public routed-weight encodings used by ``backward``.
+
+    Tuple-length compatibility is intentionally confined to this boundary.
+    The backward implementation below consumes only named fields.
+    """
+    split_weights = isinstance(routed_gate_weights, SplitRoutedWeight)
+    if split_weights != isinstance(
+        routed_up_weights, SplitRoutedWeight
+    ) or split_weights != isinstance(routed_down_weights, SplitRoutedWeight):
+        raise TypeError(
+            "routed gate/up/down weights must use the same storage representation"
+        )
+    if split_weights and main_grads is None:
+        raise ValueError("split routed weights require fused main-grad accumulation")
+    if (main_grad_storage_tables is not None) != split_weights:
+        raise ValueError(
+            "split routed weights require three split main-grad storage tables"
+        )
+
+    if split_weights:
+        split_gate = routed_gate_weights
+        split_up = routed_up_weights
+        split_down = routed_down_weights
+        split_triplet = (split_gate, split_up, split_down)
+        split_is_mxfp8 = split_gate.scale is not None
+        if not split_is_mxfp8:
+            if any(weight.scale is not None for weight in split_triplet):
+                raise ValueError("split BF16 routed weights must not provide scales")
+            return _BF16BackwardWeightArgs(
+                gate_data=split_gate.data,
+                up_data=split_up.data,
+                down_data=split_down.data,
+                storage_tables=(
+                    split_gate.storage_table,
+                    split_up.storage_table,
+                    split_down.storage_table,
+                ),
+            )
+
+        if any(weight.scale is None for weight in split_triplet):
+            raise ValueError("all split MXFP8 routed weights must provide scales")
+        if any(
+            weight.transposed_data is None
+            or weight.transposed_scale is None
+            or weight.transposed_storage_table is None
+            or weight.scale_storage_table is None
+            or weight.transposed_scale_storage_table is None
+            for weight in split_triplet
+        ):
+            raise ValueError(
+                "split MXFP8 routed weights require rowwise/columnwise data, "
+                "scales, and descriptors"
+            )
+        native_columnwise_values = {
+            weight.native_columnwise for weight in split_triplet
+        }
+        if len(native_columnwise_values) != 1:
+            raise ValueError(
+                "split MXFP8 routed weights must agree on columnwise layout"
+            )
+        return _MXFP8BackwardWeightArgs(
+            gate_row_data=split_gate.data,
+            gate_row_scale=split_gate.scale,
+            gate_column_data=split_gate.transposed_data,
+            gate_column_scale=split_gate.transposed_scale,
+            up_row_data=split_up.data,
+            up_row_scale=split_up.scale,
+            up_column_data=split_up.transposed_data,
+            up_column_scale=split_up.transposed_scale,
+            down_column_data=split_down.transposed_data,
+            down_column_scale=split_down.transposed_scale,
+            native_columnwise=split_gate.native_columnwise,
+            storage_tables=(
+                split_gate.storage_table,
+                split_up.storage_table,
+                split_gate.transposed_storage_table,
+                split_up.transposed_storage_table,
+                split_down.transposed_storage_table,
+            ),
+            scale_storage_tables=(
+                split_gate.scale_storage_table,
+                split_up.scale_storage_table,
+                split_gate.transposed_scale_storage_table,
+                split_up.transposed_scale_storage_table,
+                split_down.transposed_scale_storage_table,
+            ),
+        )
+
+    tuple_weights = isinstance(routed_gate_weights, tuple)
+    if tuple_weights != isinstance(
+        routed_up_weights, tuple
+    ) or tuple_weights != isinstance(routed_down_weights, tuple):
+        raise TypeError(
+            "routed gate/up/down weights must use the same storage representation"
+        )
+    if not tuple_weights:
+        if not all(
+            isinstance(weight, torch.Tensor)
+            for weight in (routed_gate_weights, routed_up_weights, routed_down_weights)
+        ):
+            raise TypeError("contiguous BF16 routed weights must be torch.Tensor objects")
+        return _BF16BackwardWeightArgs(
+            gate_data=routed_gate_weights,
+            up_data=routed_up_weights,
+            down_data=routed_down_weights,
+            storage_tables=None,
+        )
+
+    if len(routed_gate_weights) == 5:
+        # Single-grouped MXFP8 with TE-native columnwise payloads:
+        # gate/up=(row, row_scale, column, column_scale, True),
+        # down=(column, column_scale, True).
+        if len(routed_up_weights) != 5 or len(routed_down_weights) != 3:
+            raise ValueError(
+                "native-columnwise MXFP8 gate/up/down tuples must have lengths 5/5/3"
+            )
+        (
+            gate_row_data,
+            gate_row_scale,
+            gate_column_data,
+            gate_column_scale,
+            gate_native_columnwise,
+        ) = routed_gate_weights
+        (
+            up_row_data,
+            up_row_scale,
+            up_column_data,
+            up_column_scale,
+            up_native_columnwise,
+        ) = routed_up_weights
+        (
+            down_column_data,
+            down_column_scale,
+            down_native_columnwise,
+        ) = routed_down_weights
+        if (
+            gate_native_columnwise is not True
+            or up_native_columnwise is not True
+            or down_native_columnwise is not True
+        ):
+            raise ValueError("all native-columnwise MXFP8 flags must be True")
+        return _MXFP8BackwardWeightArgs(
+            gate_row_data=gate_row_data,
+            gate_row_scale=gate_row_scale,
+            gate_column_data=gate_column_data,
+            gate_column_scale=gate_column_scale,
+            up_row_data=up_row_data,
+            up_row_scale=up_row_scale,
+            up_column_data=up_column_data,
+            up_column_scale=up_column_scale,
+            down_column_data=down_column_data,
+            down_column_scale=down_column_scale,
+            native_columnwise=True,
+            storage_tables=None,
+            scale_storage_tables=None,
+        )
+
+    if len(routed_gate_weights) == 4:
+        # Legacy single-grouped MXFP8 with explicitly transposed payloads:
+        # gate/up=(row, row_scale, transposed, transposed_scale),
+        # down=(transposed, transposed_scale).
+        if len(routed_up_weights) != 4 or len(routed_down_weights) != 2:
+            raise ValueError(
+                "legacy MXFP8 gate/up/down tuples must have lengths 4/4/2"
+            )
+        (
+            gate_row_data,
+            gate_row_scale,
+            gate_column_data,
+            gate_column_scale,
+        ) = routed_gate_weights
+        (
+            up_row_data,
+            up_row_scale,
+            up_column_data,
+            up_column_scale,
+        ) = routed_up_weights
+        down_column_data, down_column_scale = routed_down_weights
+        return _MXFP8BackwardWeightArgs(
+            gate_row_data=gate_row_data,
+            gate_row_scale=gate_row_scale,
+            gate_column_data=gate_column_data,
+            gate_column_scale=gate_column_scale,
+            up_row_data=up_row_data,
+            up_row_scale=up_row_scale,
+            up_column_data=up_column_data,
+            up_column_scale=up_column_scale,
+            down_column_data=down_column_data,
+            down_column_scale=down_column_scale,
+            native_columnwise=False,
+            storage_tables=None,
+            scale_storage_tables=None,
+        )
+
+    raise ValueError("MXFP8 gate weight tuple must contain four or five values")
+
+
 def backward(
     config: MoKConfig,
     workspace: MoKWorkspace,
@@ -660,10 +1074,25 @@ def backward(
     shared_gate_weights: torch.Tensor,
     shared_up_weights: torch.Tensor,
     shared_down_weights: torch.Tensor,
-    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    routed_down_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
+    routed_down_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     swiglu_limit: float | None = None,
+    main_grads: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
+    main_grad_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -675,6 +1104,12 @@ def backward(
     torch.Tensor,
 ]:
     """Runs the MoE backward pass.
+
+    Contiguous BF16 weights use ``torch.Tensor``. Contiguous MXFP8 gate/up
+    weights use either the legacy four-tensor tuple or the native-columnwise
+    five-item tuple; down uses the corresponding two- or three-item tuple.
+    Descriptor-backed non-single BF16/MXFP8 weights use
+    ``SplitRoutedWeight``.
 
     Inputs:
         config:              MoKConfig
@@ -691,8 +1126,22 @@ def backward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 tensor tuple
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 tensor tuple
         swiglu_limit:        float | None
+        main_grads:          optional BF16/FP32 buffers in MOK ABI order:
+                             shared gate, routed gate, shared up, routed up,
+                             shared down, routed down. If provided, wgrad is
+                             accumulated in-place instead of returned freshly.
+        main_grad_storage_tables:
+                             None for contiguous single-grouped main grads;
+                             for non-single weights, descriptor tables ordered
+                             as routed gate, routed up, routed down. Gate/up may
+                             share the same combined-FC1 table.
 
     Outputs:
+        The six returned weight-gradient entries are fresh gradients when
+        ``main_grads is None``; otherwise they alias the supplied accumulation
+        buffers. For split weights, routed entries are representative tensors
+        while the storage tables address every expert buffer.
+
         d_x:                   bfloat16 [num_local_tokens, hidden_size]
         d_router_weights:      float32 [num_local_tokens, topk]
         d_routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size]
@@ -711,70 +1160,217 @@ def backward(
     workspace.router_weight_buffer.copy_(router_weights)   # TODO: we can remove this
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    if isinstance(routed_gate_weights, tuple):
-        (routed_gate_weights_fp8, routed_gate_weights_sc,
-         routed_gate_weights_t_fp8, routed_gate_weights_t_sc) = routed_gate_weights
-        (routed_up_weights_fp8, routed_up_weights_sc,
-         routed_up_weights_t_fp8, routed_up_weights_t_sc) = routed_up_weights
-        routed_down_weights_t_fp8, routed_down_weights_t_sc = routed_down_weights
+    weight_args = _parse_backward_weight_arguments(
+        routed_gate_weights,
+        routed_up_weights,
+        routed_down_weights,
+        main_grads,
+        main_grad_storage_tables,
+    )
+    if isinstance(weight_args, _MXFP8BackwardWeightArgs):
         x_fp8_t_routed, x_sc_t_routed = forward_context.x_routed
         gate_fp8_routed, gate_sc_routed = forward_context.gate_routed
         up_fp8_routed, up_sc_routed = forward_context.up_routed
         hidden_fp8_t_routed, hidden_sc_t_routed = forward_context.hidden_routed
-        (d_x_shared, d_x_routed,
-         d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed,
-         d_up_shared, d_up_fp8_routed, d_up_sc_routed,
-         d_hidden_shared, d_hidden_routed, d_y_fp8_routed, d_y_sc_routed,
-         d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up,
-         d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd_mxfp8(
-            workspace.d_y_buffer, workspace.d_y_buffer_ptrs,
-            workspace.d_x_routed_buffer, workspace.d_x_routed_buffer_ptrs,
-            workspace.router_weight_buffer, workspace.router_weight_buffer_ptrs,
-            workspace.d_router_weight_buffer, workspace.d_router_weight_buffer_ptrs,
-            shared_gate_weights, routed_gate_weights_t_fp8, routed_gate_weights_t_sc,
-            shared_up_weights, routed_up_weights_t_fp8, routed_up_weights_t_sc,
-            shared_down_weights, routed_down_weights_t_fp8, routed_down_weights_t_sc,
-            x_fp8_t_routed, x_sc_t_routed,
-            forward_context.gate_shared, gate_fp8_routed, gate_sc_routed,
-            forward_context.up_shared, up_fp8_routed, up_sc_routed,
-            forward_context.hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
-            workspace.x_buffer, workspace.x_buffer_ptrs,
-            routed_gate_weights_fp8, routed_gate_weights_sc,
-            routed_up_weights_fp8, routed_up_weights_sc,
-            schedule.peer_rank, schedule.peer_token_idx,
-            schedule.num_tokens, schedule.tokens_per_expert,
-            workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
-            config.macrobatch_size, config.minibatch_size,
+        mxfp8_bwd_args = (
+            workspace.d_y_buffer,
+            workspace.d_y_buffer_ptrs,
+            workspace.d_x_routed_buffer,
+            workspace.d_x_routed_buffer_ptrs,
+            workspace.router_weight_buffer,
+            workspace.router_weight_buffer_ptrs,
+            workspace.d_router_weight_buffer,
+            workspace.d_router_weight_buffer_ptrs,
+            shared_gate_weights,
+            weight_args.gate_column_data,
+            weight_args.gate_column_scale,
+            shared_up_weights,
+            weight_args.up_column_data,
+            weight_args.up_column_scale,
+            shared_down_weights,
+            weight_args.down_column_data,
+            weight_args.down_column_scale,
+            x_fp8_t_routed,
+            x_sc_t_routed,
+            forward_context.gate_shared,
+            gate_fp8_routed,
+            gate_sc_routed,
+            forward_context.up_shared,
+            up_fp8_routed,
+            up_sc_routed,
+            forward_context.hidden_shared,
+            hidden_fp8_t_routed,
+            hidden_sc_t_routed,
+            workspace.x_buffer,
+            workspace.x_buffer_ptrs,
+            weight_args.gate_row_data,
+            weight_args.gate_row_scale,
+            weight_args.up_row_data,
+            weight_args.up_row_scale,
+            schedule.peer_rank,
+            schedule.peer_token_idx,
+            schedule.num_tokens,
+            schedule.tokens_per_expert,
+            workspace.topk,
+            swiglu_limit,
+            config.bwd_num_comm_sms,
+            config.macrobatch_size,
+            config.minibatch_size,
+            weight_args.native_columnwise,
         )
+        if main_grads is None:
+            # Original MOK API: materialize and return six fresh weight gradients.
+            (
+                d_x_shared,
+                d_x_routed,
+                d_gate_shared,
+                d_gate_fp8_routed,
+                d_gate_sc_routed,
+                d_up_shared,
+                d_up_fp8_routed,
+                d_up_sc_routed,
+                d_hidden_shared,
+                d_hidden_routed,
+                d_y_fp8_routed,
+                d_y_sc_routed,
+                d_w_shared_gate,
+                d_w_routed_gate,
+                d_w_shared_up,
+                d_w_routed_up,
+                d_w_shared_down,
+                d_w_routed_down,
+            ) = dispatch_mlp_swiglu_combine_bwd_mxfp8(*mxfp8_bwd_args)
+        else:
+            # Fused accumulation: mutate the six supplied main-grad buffers.
+            # Descriptor tables are present only for non-single expert storage.
+            (
+                d_x_shared,
+                d_x_routed,
+                d_gate_shared,
+                d_gate_fp8_routed,
+                d_gate_sc_routed,
+                d_up_shared,
+                d_up_fp8_routed,
+                d_up_sc_routed,
+                d_hidden_shared,
+                d_hidden_routed,
+                d_y_fp8_routed,
+                d_y_sc_routed,
+            ) = dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+                *mxfp8_bwd_args,
+                main_grads=main_grads,
+                weight_storage_tables=weight_args.storage_tables,
+                scale_storage_tables=weight_args.scale_storage_tables,
+                main_grad_storage_tables=main_grad_storage_tables,
+            )
+            (
+                d_w_shared_gate,
+                d_w_routed_gate,
+                d_w_shared_up,
+                d_w_routed_up,
+                d_w_shared_down,
+                d_w_routed_down,
+            ) = main_grads
     else:
+        # BF16 has no scale or rowwise/columnwise representation pair.
         x_routed = forward_context.x_routed
         gate_routed = forward_context.gate_routed
         up_routed = forward_context.up_routed
         hidden_routed = forward_context.hidden_routed
-        (d_x_shared, d_x_routed, d_gate_shared, d_gate_routed,
-         d_up_shared, d_up_routed, d_hidden_shared, d_hidden_routed, d_y_routed,
-         d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up,
-         d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd_bf16(
-            workspace.d_y_buffer, workspace.d_y_buffer_ptrs,
-            workspace.d_x_routed_buffer, workspace.d_x_routed_buffer_ptrs,
-            workspace.router_weight_buffer, workspace.router_weight_buffer_ptrs,
-            workspace.d_router_weight_buffer, workspace.d_router_weight_buffer_ptrs,
-            shared_gate_weights, routed_gate_weights,
-            shared_up_weights, routed_up_weights,
-            shared_down_weights, routed_down_weights,
-            x_routed, forward_context.gate_shared, gate_routed,
-            forward_context.up_shared, up_routed,
-            forward_context.hidden_shared, hidden_routed,
-            workspace.x_buffer, workspace.x_buffer_ptrs,
-            schedule.peer_rank, schedule.peer_token_idx,
-            schedule.num_tokens, schedule.tokens_per_expert,
-            workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
-            config.macrobatch_size, config.minibatch_size,
+        bwd_args = (
+            workspace.d_y_buffer,
+            workspace.d_y_buffer_ptrs,
+            workspace.d_x_routed_buffer,
+            workspace.d_x_routed_buffer_ptrs,
+            workspace.router_weight_buffer,
+            workspace.router_weight_buffer_ptrs,
+            workspace.d_router_weight_buffer,
+            workspace.d_router_weight_buffer_ptrs,
+            shared_gate_weights,
+            weight_args.gate_data,
+            shared_up_weights,
+            weight_args.up_data,
+            shared_down_weights,
+            weight_args.down_data,
+            x_routed,
+            forward_context.gate_shared,
+            gate_routed,
+            forward_context.up_shared,
+            up_routed,
+            forward_context.hidden_shared,
+            hidden_routed,
+            workspace.x_buffer,
+            workspace.x_buffer_ptrs,
+            schedule.peer_rank,
+            schedule.peer_token_idx,
+            schedule.num_tokens,
+            schedule.tokens_per_expert,
+            workspace.topk,
+            swiglu_limit,
+            config.bwd_num_comm_sms,
+            config.macrobatch_size,
+            config.minibatch_size,
         )
+        if main_grads is None:
+            # Original MOK API: materialize and return six fresh weight gradients.
+            (
+                d_x_shared,
+                d_x_routed,
+                d_gate_shared,
+                d_gate_routed,
+                d_up_shared,
+                d_up_routed,
+                d_hidden_shared,
+                d_hidden_routed,
+                d_y_routed,
+                d_w_shared_gate,
+                d_w_routed_gate,
+                d_w_shared_up,
+                d_w_routed_up,
+                d_w_shared_down,
+                d_w_routed_down,
+            ) = dispatch_mlp_swiglu_combine_bwd_bf16(*bwd_args)
+        else:
+            # Fused accumulation: mutate the six supplied main-grad buffers.
+            # Descriptor tables are present only for non-single expert storage.
+            (
+                d_x_shared,
+                d_x_routed,
+                d_gate_shared,
+                d_gate_routed,
+                d_up_shared,
+                d_up_routed,
+                d_hidden_shared,
+                d_hidden_routed,
+                d_y_routed,
+            ) = dispatch_mlp_swiglu_combine_bwd_bf16_accum(
+                *bwd_args,
+                main_grads=main_grads,
+                weight_storage_tables=weight_args.storage_tables,
+                main_grad_storage_tables=main_grad_storage_tables,
+            )
+            (
+                d_w_shared_gate,
+                d_w_routed_gate,
+                d_w_shared_up,
+                d_w_routed_up,
+                d_w_shared_down,
+                d_w_routed_down,
+            ) = main_grads
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    d_x = bwd_epilogue(d_x_shared, workspace.d_x_routed_buffer)
+    d_x = bwd_epilogue(d_x_shared, workspace.d_x_routed_buffer,
+                       schedule.top_experts)
     d_router_weights = workspace.d_router_weight_buffer.clone()  # TODO: we can remove this
-    return (d_x, d_router_weights, d_w_routed_gate, d_w_routed_up, d_w_routed_down,
-            d_w_shared_gate, d_w_shared_up, d_w_shared_down)
+    d_router_weights.masked_fill_(schedule.top_experts < 0, 0.0)
+    return (
+        d_x,
+        d_router_weights,
+        d_w_routed_gate,
+        d_w_routed_up,
+        d_w_routed_down,
+        d_w_shared_gate,
+        d_w_shared_up,
+        d_w_shared_down,
+    )

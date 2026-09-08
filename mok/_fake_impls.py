@@ -88,6 +88,12 @@ def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
+    w_routed_gate_sc_storage_table: torch.Tensor | None = None,
+    w_routed_up_sc_storage_table: torch.Tensor | None = None,
+    w_routed_down_sc_storage_table: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
     torch.Tensor, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
@@ -135,6 +141,9 @@ def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor, torch.Tensor,
@@ -280,6 +289,7 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    routed_weights_are_native_columnwise: bool = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor,  # d_x_shared, d_x_routed
     torch.Tensor, torch.Tensor, torch.Tensor,  # d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed
@@ -386,6 +396,7 @@ def _fwd_epilogue_fake(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:  # output
     return y_shared.new_empty(y_shared.shape)
 
@@ -394,5 +405,6 @@ def _fwd_epilogue_fake(
 def _bwd_epilogue_fake(
     d_x_shared: torch.Tensor,
     d_x_routed_buffer: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:  # d_x
     return d_x_shared.new_empty(d_x_shared.shape)
