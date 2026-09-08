@@ -1,10 +1,42 @@
+import ctypes
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
 
 from mok import functional, ops
 from .utils import BF16_TOLERANCE, MXFP8_TOLERANCE, check_correctness, generate_inputs
+
+
+def _current_cuda_context() -> int | None:
+    driver = ctypes.CDLL("libcuda.so.1")
+    driver.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    driver.cuCtxGetCurrent.restype = ctypes.c_int
+    context = ctypes.c_void_p()
+    assert driver.cuCtxGetCurrent(ctypes.byref(context)) == 0
+    return context.value
+
+
+def test_storage_table_builds_on_fresh_host_thread(
+    context: tuple[int, int, torch.device],
+) -> None:
+    _, _, device = context
+    expert_grads = [
+        torch.empty((256, 256), dtype=torch.float32, device=device)
+        for _ in range(2)
+    ]
+
+    def build_table() -> tuple[torch.Tensor, int | None, int | None]:
+        before = _current_cuda_context()
+        table = ops.make_routed_d_weight_storage_table(expert_grads)
+        return table, before, _current_cuda_context()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        table, before, after = executor.submit(build_table).result(timeout=30)
+
+    assert table.device == device
+    assert (before, after) == (None, None)
 
 
 def _quantize_experts(

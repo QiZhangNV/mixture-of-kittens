@@ -245,12 +245,46 @@ static __host__ inline routed_d_weight_gl make_routed_d_weight_view(
     };
 }
 
+class ScopedCudaPrimaryContext final {
+public:
+    explicit ScopedCudaPrimaryContext(int device_index) {
+        TORCH_CHECK(cuDeviceGet(&device_, device_index) == CUDA_SUCCESS,
+                    "MoK cuDeviceGet failed");
+        CUcontext context = nullptr;
+        TORCH_CHECK(cuDevicePrimaryCtxRetain(&context, device_) == CUDA_SUCCESS,
+                    "MoK cuDevicePrimaryCtxRetain failed");
+        const CUresult result = cuCtxPushCurrent(context);
+        if (result != CUDA_SUCCESS) {
+            (void)cuDevicePrimaryCtxRelease(device_);
+        }
+        TORCH_CHECK(result == CUDA_SUCCESS, "MoK cuCtxPushCurrent failed");
+    }
+
+    ~ScopedCudaPrimaryContext() noexcept {
+        CUcontext context = nullptr;
+        (void)cuCtxPopCurrent(&context);
+        (void)cuDevicePrimaryCtxRelease(device_);
+    }
+
+    ScopedCudaPrimaryContext(const ScopedCudaPrimaryContext &) = delete;
+    ScopedCudaPrimaryContext &operator=(const ScopedCudaPrimaryContext &) = delete;
+
+private:
+    CUdevice device_ = 0;
+};
+
 template <typename GL>
 static __host__ inline at::Tensor make_expert_storage_table(
     const std::vector<at::Tensor> &expert_tensors
 ) {
     TORCH_CHECK(!expert_tensors.empty(), "MoK expert tensor list must not be empty");
     const auto device = expert_tensors.front().device();
+    // cuTensorMapEncodeTiled is a CUDA Driver API and requires a current
+    // context on the calling host thread. PyTorch autograd workers can have a
+    // current device ordinal without a current Driver context, so push the
+    // tensor device's primary context for the complete table build and restore
+    // the caller's prior context on every exit path.
+    ScopedCudaPrimaryContext context_guard(device.index());
     std::vector<GL> layouts;
     layouts.reserve(expert_tensors.size());
     for (const auto &tensor : expert_tensors) {
