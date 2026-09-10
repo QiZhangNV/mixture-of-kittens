@@ -545,6 +545,146 @@ def run_reference_bf16(
     return (*results, d_w_output_gate)
 
 
+@torch.enable_grad()
+def run_reference_native_bf16(
+    x: torch.Tensor,
+    topk_experts: torch.Tensor,
+    router_weights: torch.Tensor,
+    w_shared_gate: torch.Tensor,
+    w_shared_up: torch.Tensor,
+    w_shared_down: torch.Tensor,
+    w_routed_gate: torch.Tensor,
+    w_routed_up: torch.Tensor,
+    w_routed_down: torch.Tensor,
+    d_output: torch.Tensor,
+    swiglu_limit: float | None = None,
+    *,
+    group: dist.ProcessGroup | None = None,
+    shared_output_gate_weight: torch.Tensor | None = None,
+    bias_activation_fusion: bool = True,
+) -> tuple[torch.Tensor, ...]:
+    """Independent dense, fresh-gradient Native-MCore semantic oracle.
+
+    Unlike MOK, TEGroupedMLP applies FP32 routing probabilities to the
+    activation BEFORE the BF16 down GEMM. Native shared gating also stores
+    ``Q = S * G`` in BF16 before adding the BF16 combined routed output.
+    The return order matches run_reference_bf16: Y plus eight gradients,
+    with a BF16 output-gate wgrad appended only when a gate is present.
+
+    ``bias_activation_fusion=True`` models the compiled bias/weighted-SwiGLU
+    path: FP32 pointwise intermediates, BF16 output at the GEMM boundary.
+    False models separate eager BF16 pointwise operations. This is not an
+    implementation of the dispatcher or a performance baseline; collective
+    reduction order and GEMM implementations may still differ from Native.
+    """
+    if x.dtype != torch.bfloat16 or router_weights.dtype != torch.float32:
+        raise ValueError("Native BF16 reference requires BF16 X and FP32 routing weights")
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    num_local_experts = w_routed_gate.shape[0]
+    num_local_tokens, hidden = x.shape
+    topk = topk_experts.shape[1]
+    num_routes = num_local_tokens * topk
+
+    def activation(fc1, probs=None):
+        gate, up = fc1.chunk(2, dim=-1)
+        if bias_activation_fusion:
+            gate, up = gate.float(), up.float()
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        result = torch.nn.functional.silu(gate) * up
+        if probs is not None:
+            result = result * probs
+        return result.to(fc1.dtype)
+
+    # Use independent leaves and explicit all-to-all gradient transport.
+    experts_flat = topk_experts.flatten()
+    valid_routes = (experts_flat >= 0).nonzero().flatten()
+    destination_ranks = experts_flat[valid_routes] // num_local_experts
+    dispatch_order = valid_routes[torch.argsort(destination_ranks, stable=True)]
+    send_counts = torch.bincount(destination_ranks, minlength=world_size)
+    all_send_counts = torch.empty(world_size, world_size, dtype=torch.int64, device=x.device)
+    dist.all_gather_into_tensor(all_send_counts, send_counts, group=group)
+    send_splits = send_counts.tolist()
+    recv_splits = all_send_counts[:, rank].tolist()
+    num_recv = sum(recv_splits)
+    recv_x = all_to_all(
+        x.detach()[dispatch_order // topk], num_recv, recv_splits, send_splits, group=group
+    ).requires_grad_()
+    recv_probs = all_to_all(
+        router_weights.detach().flatten()[dispatch_order],
+        num_recv, recv_splits, send_splits, group=group,
+    ).requires_grad_()
+    recv_experts = all_to_all(
+        (experts_flat[dispatch_order] % num_local_experts).contiguous(),
+        num_recv, recv_splits, send_splits, group=group,
+    )
+    routed_weights = tuple(
+        weight.detach().requires_grad_()
+        for weight in (w_routed_gate, w_routed_up, w_routed_down)
+    )
+    routed_fc1 = torch.cat(routed_weights[:2], dim=1)
+    recv_output = torch.zeros_like(recv_x)
+    for expert in range(num_local_experts):
+        rows = (recv_experts == expert).nonzero().flatten()
+        fc1 = recv_x[rows] @ routed_fc1[expert].T
+        weighted_hidden = activation(fc1, recv_probs[rows, None])
+        expert_output = weighted_hidden @ routed_weights[2][expert].T
+        recv_output = recv_output.index_copy(0, rows, expert_output)
+
+    num_valid = valid_routes.numel()
+    returned_output = all_to_all(
+        recv_output.detach(), num_valid, send_splits, recv_splits, group=group
+    )
+    flat_output = torch.zeros(num_routes, hidden, dtype=x.dtype, device=x.device)
+    flat_output[dispatch_order] = returned_output
+    routed_output = flat_output.view(num_local_tokens, topk, hidden).float().sum(1).to(x.dtype)
+
+    x_shared = x.detach().requires_grad_()
+    shared_weights = tuple(
+        weight.detach().requires_grad_()
+        for weight in (w_shared_gate, w_shared_up, w_shared_down)
+    )
+    shared_fc1 = x_shared @ torch.cat(shared_weights[:2], dim=0).T
+    shared_output = activation(shared_fc1) @ shared_weights[2].T
+    shared_targets = (x_shared, *shared_weights)
+    if shared_output_gate_weight is not None:
+        gate_weight = shared_output_gate_weight.detach().requires_grad_()
+        gate = torch.sigmoid(torch.nn.functional.linear(x_shared, gate_weight))
+        shared_output = shared_output * gate  # Native Q is BF16, not MOK's FP32 Q.
+        shared_targets = (*shared_targets, gate_weight)
+    output = routed_output + shared_output
+
+    # P was consumed before FC2, so combine backward broadcasts unscaled dY.
+    d_recv_output = all_to_all(
+        d_output[dispatch_order // topk], num_recv, recv_splits, send_splits, group=group
+    )
+    routed_gradients = torch.autograd.grad(
+        recv_output, (recv_x, recv_probs, *routed_weights), d_recv_output
+    )
+    returned_d_x = all_to_all(
+        routed_gradients[0], num_valid, send_splits, recv_splits, group=group
+    )
+    returned_d_probs = all_to_all(
+        routed_gradients[1], num_valid, send_splits, recv_splits, group=group
+    )
+    flat_d_x = torch.zeros_like(flat_output)
+    flat_d_x[dispatch_order] = returned_d_x
+    d_x_routed = flat_d_x.view(num_local_tokens, topk, hidden).float().sum(1).to(x.dtype)
+    flat_d_probs = torch.zeros(num_routes, dtype=router_weights.dtype, device=x.device)
+    flat_d_probs[dispatch_order] = returned_d_probs
+    shared_gradients = torch.autograd.grad(shared_output, shared_targets, d_output)
+    d_x = d_x_routed + shared_gradients[0]
+    result = (
+        output, d_x, flat_d_probs.view_as(router_weights),
+        *routed_gradients[2:], *shared_gradients[1:4],
+    )
+    if shared_output_gate_weight is not None:
+        return (*result, shared_gradients[4])  # Native BF16 Linear wgrad, not FP32 MOK wgrad.
+    return result
+
+
 def get_error_stats(
     reference: torch.Tensor,
     actual: torch.Tensor,
