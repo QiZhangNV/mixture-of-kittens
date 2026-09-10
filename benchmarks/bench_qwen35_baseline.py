@@ -1,4 +1,4 @@
-"""Ungated BF16 Qwen shape baseline; does not require the output-gate feature.
+"""BF16 Qwen shape baseline for the nine-gradient MOK API.
 
 Run from the MOK checkout, on four GPUs in the existing OCI allocation::
 
@@ -6,6 +6,7 @@ Run from the MOK checkout, on four GPUs in the existing OCI allocation::
 
 The default is the existing dense/fresh-gradient path. Use a separate invocation
 with ``--grad-mode fp32-main-grad`` for accumulation; do not mix those results.
+Use ``--gate on`` for MOK-new-G; the default ``--gate off`` is MOK-new-U.
 CLI parsing and ``--help`` only use the standard library (no CUDA imports).
 """
 
@@ -21,7 +22,8 @@ import subprocess
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--label", default="MOK-old-U")
+    parser.add_argument("--label", default=None)
+    parser.add_argument("--gate", choices=("off", "on"), default="off")
     parser.add_argument("--num-local-tokens", type=int, default=4096)
     parser.add_argument("--hidden-dim", type=int, default=4096)
     parser.add_argument("--intermediate-dim", type=int, default=1024)
@@ -55,6 +57,8 @@ def parse_args(argv=None):
         parser.error("--macrobatch-size must be divisible by --minibatch-size")
     if not math.isfinite(args.schedule_capacity_multiplier) or args.schedule_capacity_multiplier <= 0:
         parser.error("--schedule-capacity-multiplier must be positive and finite")
+    if args.label is None:
+        args.label = "MOK-new-G" if args.gate == "on" else "MOK-new-U"
     return args
 
 
@@ -77,8 +81,8 @@ def git_metadata(repo):
     }
 
 
-class UngatedBF16Benchmark:
-    def __init__(self, inputs, config, group, functional, grad_mode):
+class BF16Benchmark:
+    def __init__(self, inputs, config, group, functional, grad_mode, gate_weight=None):
         import torch
 
         self.functional = functional
@@ -86,6 +90,8 @@ class UngatedBF16Benchmark:
         self.x, self.topk_experts, self.router_weights = inputs[:3]
         self.weights = inputs[3:9]  # shared gate/up/down, routed gate/up/down
         self.d_output = inputs[9]
+        self.gate_weight = gate_weight
+        self.gate_main_grad = None
         self.num_local_experts = self.weights[3].shape[0]
         self.workspace = functional.get_workspace(
             config, group, device=self.x.device,
@@ -100,11 +106,15 @@ class UngatedBF16Benchmark:
                 torch.zeros_like(self.weights[i], dtype=torch.float32)
                 for i in (0, 3, 1, 4, 2, 5)
             )
+            if gate_weight is not None:
+                self.gate_main_grad = torch.zeros_like(gate_weight, dtype=torch.float32)
 
     def zero_main_grads(self):
         if self.main_grads is not None:
             for gradient in self.main_grads:
                 gradient.zero_()
+        if self.gate_main_grad is not None:
+            self.gate_main_grad.zero_()
 
     def run_fwd(self):
         schedule = self.functional.build_schedule(
@@ -114,16 +124,23 @@ class UngatedBF16Benchmark:
         output, context = self.functional.forward(
             self.config, self.workspace, schedule,
             self.x, self.router_weights, *self.weights,
+            shared_output_gate_weight=self.gate_weight,
         )
         return output, (schedule, context)
 
     def run_bwd(self, saved):
         schedule, context = saved
-        return self.functional.backward(
+        gradients = self.functional.backward(
             self.config, self.workspace, schedule, context,
             self.d_output, self.x, self.router_weights, *self.weights,
             main_grads=self.main_grads,
+            shared_output_gate_weight=self.gate_weight,
+            shared_output_gate_main_grad=self.gate_main_grad,
         )
+        assert len(gradients) == 9
+        if self.gate_weight is None:
+            assert gradients[-1] is None
+        return gradients
 
 
 def measure_phase(phase, benchmark, benchmark_utils, torch, dist, device):
@@ -197,8 +214,11 @@ def main(argv=None):
         if rank == 0:
             print(json.dumps({
                 "event": "qwen35_baseline_config", "config": vars(args),
-                "dtype": "bfloat16", "routed_layout": "dense", "output_gate": False,
+                "dtype": "bfloat16", "routed_layout": "dense", "output_gate": args.gate == "on",
                 "local_experts": local_experts, "seed": "1234 + EP rank (generate_inputs)",
+                "output_gate_weight_seed": "1919 + EP rank (same as Native-G)" if args.gate == "on" else None,
+                "output_gate_wgrad_dtype": "float32" if args.gate == "on" else None,
+                "tflops_scope": "existing shared+routed MLP FLOP count; excludes tiny output-gate work",
                 "git": git_metadata(repo), "functional_source": functional.__file__,
                 "extension_source": getattr(_C, "__file__", None),
                 "torch_version": torch.__version__, "torch_cuda_version": torch.version.cuda,
@@ -224,9 +244,15 @@ def main(argv=None):
             rank, device, args.num_experts, local_experts, args.topk,
             args.num_local_tokens, args.hidden_dim, args.intermediate_dim,
         )
-        benchmark = UngatedBF16Benchmark(inputs, config, dist.group.WORLD, functional, args.grad_mode)
+        gate_weight = None
+        if args.gate == "on":
+            generator = torch.Generator(device=device).manual_seed(1919 + rank)
+            gate_weight = torch.randn(
+                1, args.hidden_dim, generator=generator, device=device, dtype=torch.bfloat16,
+            ) * args.hidden_dim ** -0.5
+        benchmark = BF16Benchmark(inputs, config, dist.group.WORLD, functional, args.grad_mode, gate_weight)
         if not args.skip_correctness:
-            reference = run_reference_bf16(*inputs)
+            reference = run_reference_bf16(*inputs, shared_output_gate_weight=gate_weight)
             benchmark.zero_main_grads()
             benchmark_utils.check_benchmark_correctness(
                 f"{args.label}/{args.grad_mode}", benchmark.run_fwd, benchmark.run_bwd,

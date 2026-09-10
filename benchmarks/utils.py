@@ -26,6 +26,15 @@ def get_tflops(latency_ms, num_local_tokens, topk, hidden_dim, intermediate_dim,
 def check_benchmark_correctness(name, run_fwd, run_bwd, reference, tolerance, rank):
     output, context = run_fwd()
     backward = run_bwd(context)
+    if len(reference) == 10:
+        assert len(backward) == 9
+        assert backward[-1].dtype == torch.float32
+    else:
+        assert len(reference) == 9
+        # Existing Native benchmark adapters still return the eight MLP grads.
+        assert len(backward) in (8, 9)
+        if len(backward) == 9:
+            assert backward[-1] is None
     comparisons = (
         ("output", reference[0], output),
         ("d_x", reference[1], backward[0]),
@@ -37,6 +46,8 @@ def check_benchmark_correctness(name, run_fwd, run_bwd, reference, tolerance, ra
         ("d_w_shared_up", reference[7], backward[6]),
         ("d_w_shared_down", reference[8], backward[7]),
     )
+    if len(reference) == 10:
+        comparisons += (("d_w_shared_output_gate", reference[9], backward[8]),)
     for result_name, expected, result in comparisons:
         check_correctness(f"{name}/{result_name}", expected, result, tolerance, print_stats=rank == 0)
 

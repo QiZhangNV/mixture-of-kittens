@@ -16,6 +16,8 @@ class BaselineCLI(unittest.TestCase):
             (4096, 4096, 1024, 64, 10, 4),
         )
         self.assertEqual(args.grad_mode, "fresh")
+        self.assertEqual(args.gate, "off")
+        self.assertEqual(args.label, "MOK-new-U")
         self.assertEqual(
             (args.fwd_comm_sms, args.bwd_comm_sms, args.minibatch_size,
              args.macrobatch_size, args.schedule_capacity_multiplier),
@@ -31,6 +33,12 @@ class BaselineCLI(unittest.TestCase):
         self.assertEqual((args.warmup_iters, args.timed_iters), (3, 5))
         self.assertEqual(args.grad_mode, "fp32-main-grad")
         self.assertEqual(args.label, "MOK-old-U-accum")
+
+    def test_gated_label_and_explicit_override(self):
+        args = parse_args(["--gate", "on"])
+        self.assertEqual(args.label, "MOK-new-G")
+        args = parse_args(["--gate", "on", "--label", "custom-G"])
+        self.assertEqual(args.label, "custom-G")
 
     def test_invalid_counts_and_modes_are_rejected(self):
         invalid = (
