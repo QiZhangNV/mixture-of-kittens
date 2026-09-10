@@ -2,9 +2,10 @@
 
 from contextlib import redirect_stderr
 import io
+from types import SimpleNamespace
 import unittest
 
-from benchmarks.bench_qwen35_native import parse_args, select_grouped_tensor
+from benchmarks.bench_qwen35_native import count_grouped_gemm_calls, parse_args, select_grouped_tensor
 
 
 class NativeCLI(unittest.TestCase):
@@ -31,6 +32,27 @@ class NativeCLI(unittest.TestCase):
     def test_required_device_init_does_not_silently_fallback(self):
         with self.assertRaisesRegex(RuntimeError, "Device-init requested"):
             select_grouped_tensor("device-init", False)
+
+    def test_te_internal_grouped_does_not_enable_mcore_grouped_tensor(self):
+        args = parse_args(["--gemm-backend", "te-cublas-grouped"])
+        self.assertEqual(select_grouped_tensor(args.gemm_backend, False), (False, None))
+        self.assertEqual(select_grouped_tensor(args.gemm_backend, True), (False, None))
+
+    def test_call_probe_counts_and_restores_on_exception(self):
+        grouped = lambda value: value + 1
+        legacy = lambda value: value - 1
+        module = SimpleNamespace(
+            general_grouped_gemm_for_grouped_tensor=grouped,
+            general_grouped_gemm=legacy,
+        )
+        with self.assertRaisesRegex(RuntimeError, "probe failure"):
+            with count_grouped_gemm_calls(module) as counts:
+                self.assertEqual(module.general_grouped_gemm_for_grouped_tensor(4), 5)
+                self.assertEqual(module.general_grouped_gemm(4), 3)
+                self.assertEqual(counts, {"grouped_tensor": 1, "legacy": 1})
+                raise RuntimeError("probe failure")
+        self.assertIs(module.general_grouped_gemm_for_grouped_tensor, grouped)
+        self.assertIs(module.general_grouped_gemm, legacy)
 
     def test_invalid_arguments(self):
         for argv in (["--timed-iters", "0"], ["--warmup-iters", "-1"], ["--num-experts", "63"], ["--rank-capacity-factor", "nan"], ["--gemm-backend", "op-fuser"]):

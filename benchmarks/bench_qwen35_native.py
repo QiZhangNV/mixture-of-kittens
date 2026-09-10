@@ -11,6 +11,7 @@ their probability application and BF16 rounding boundaries differ.
 """
 
 import argparse
+from contextlib import contextmanager
 import gc
 import inspect
 import json
@@ -35,7 +36,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mcore-repo", type=Path, default=Path(__file__).resolve().parents[3] / "vendor" / "Megatron-LM")
     parser.add_argument("--gate", choices=("both", "off", "on"), default="both")
-    parser.add_argument("--gemm-backend", choices=("auto", "device-init", "multistream"), default="auto")
+    parser.add_argument(
+        "--gemm-backend", choices=("auto", "device-init", "te-cublas-grouped", "multistream"), default="auto",
+        help="device-init: MCore public GroupedTensor API (requires TE use_grouped_tensor); "
+             "te-cublas-grouped: ordinary GroupedLinear with TE internal cuBLAS grouped switch; "
+             "multistream: explicit legacy path; auto: public API when available, otherwise multistream",
+    )
     parser.add_argument("--num-local-tokens", type=int, default=4096)
     parser.add_argument("--hidden-dim", type=int, default=4096)
     parser.add_argument("--intermediate-dim", type=int, default=1024)
@@ -71,14 +77,41 @@ def parse_args(argv=None):
 def select_grouped_tensor(requested, supports_grouped_tensor):
     if requested == "device-init" and not supports_grouped_tensor:
         raise RuntimeError(
-            "Device-init requested, but installed TE GroupedLinear has no use_grouped_tensor. "
-            "Use a newer image or explicitly choose --gemm-backend multistream."
+            "Device-init requested for the MCore public GroupedTensor API, but installed TE "
+            "GroupedLinear has no use_grouped_tensor constructor argument. This does not rule "
+            "out TE's internal cuBLAS grouped path: try --gemm-backend te-cublas-grouped, "
+            "or explicitly choose --gemm-backend multistream."
         )
-    enabled = requested != "multistream" and supports_grouped_tensor
+    enabled = requested not in ("multistream", "te-cublas-grouped") and supports_grouped_tensor
     fallback = None
     if requested == "auto" and not enabled:
         fallback = "TE GroupedLinear lacks use_grouped_tensor; explicitly recorded multistream API fallback"
     return enabled, fallback
+
+
+@contextmanager
+def count_grouped_gemm_calls(grouped_linear):
+    """Temporary Python-entrypoint probe, restored before any timed calls."""
+    counts = {"grouped_tensor": 0, "legacy": 0}
+    originals = {}
+    try:
+        for name, key in (
+            ("general_grouped_gemm_for_grouped_tensor", "grouped_tensor"),
+            ("general_grouped_gemm", "legacy"),
+        ):
+            function = getattr(grouped_linear, name, None)
+            if callable(function):
+                originals[name] = function
+
+                def wrapper(*args, _key=key, _function=function, **kwargs):
+                    counts[_key] += 1
+                    return _function(*args, **kwargs)
+
+                setattr(grouped_linear, name, wrapper)
+        yield counts
+    finally:
+        for name, function in originals.items():
+            setattr(grouped_linear, name, function)
 
 
 def build_layer(args, world_size, gated, use_grouped_tensor):
@@ -233,7 +266,8 @@ def module_evidence(layer, te, selected):
             },
         }
     return {
-        "selected_api_path": "TE GroupedLinear(use_grouped_tensor=True)" if selected else "TE GroupedLinear(use_grouped_tensor=False), multistream API path",
+        "selected_api_path": "MCore explicit grouped-tensor API" if selected else "ordinary TE GroupedLinear; MCore grouped-tensor flag off",
+        "te_internal_grouped_switch": os.environ.get("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM"),
         "op_fuser": False,
         "kernel_backend": "unverified: API selection alone does not establish cuBLAS vs another kernel backend",
         "te_version": te.__version__, "te_source": te.__file__,
@@ -284,6 +318,10 @@ def profile_backend(benchmark, torch):
 
 def main(argv=None):
     args = parse_args(argv)
+    te_internal_grouped = args.gemm_backend == "te-cublas-grouped"
+    # This internal TE path is distinct from MCore's grouped-tensor API flag.
+    # Set explicitly before TE import; multistream must not inherit env=1.
+    os.environ["NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM"] = "1" if te_internal_grouped else "0"
     mcore_repo = args.mcore_repo.resolve()
     if not (mcore_repo / "megatron" / "core").is_dir():
         raise FileNotFoundError(f"Not a MCore checkout: {mcore_repo}")
@@ -294,6 +332,7 @@ def main(argv=None):
     import torch.distributed as dist
     import transformer_engine as te
     import transformer_engine.pytorch
+    import transformer_engine.pytorch.module.grouped_linear as grouped_linear
     from megatron.core import parallel_state
     from megatron.core.config import set_experimental_flag
     from megatron.core.transformer.moe import moe_layer, fused_a2a
@@ -308,6 +347,7 @@ def main(argv=None):
         raise RuntimeError(f"Loaded the wrong reference helpers: {reference_utils.__file__}")
     supports_grouped_tensor = "use_grouped_tensor" in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
     selected, fallback = select_grouped_tensor(args.gemm_backend, supports_grouped_tensor)
+    effective_backend = "te-cublas-grouped" if te_internal_grouped else ("device-init" if selected else "multistream")
     benchmark_utils.WARMUP_ITERS = args.warmup_iters
     benchmark_utils.TIMED_ITERS = args.timed_iters
     rank, world_size, device = benchmark_utils.init_distributed()
@@ -335,11 +375,14 @@ def main(argv=None):
                 "mcore_layer_source": moe_layer.__file__, "torch_version": torch.__version__,
                 "torch_cuda_version": torch.version.cuda, "te_version": te.__version__, "hardware": hardware,
                 "fallback_reason": fallback, "grad_mode": "fresh", "routed_weights": "non-single per-expert Parameters",
+                "effective_backend_candidate": effective_backend,
+                "mcore_grouped_tensor_api": selected, "te_internal_grouped_candidate": te_internal_grouped,
                 "shared_expert_overlap": False, "op_fuser": False,
                 "effective_rank_capacity_factor": args.rank_capacity_factor if selected else None,
                 "environment": {key: os.environ.get(key) for key in (
                     "CUDA_DEVICE_MAX_CONNECTIONS", "NCCL_NVLS_ENABLE", "OMP_NUM_THREADS",
                     "PYTORCH_CUDA_ALLOC_CONF", "MOK_BENCHMARK_NUMA_BINDING", "NVTE_CUTEDSL_FUSED_GROUPED_MLP",
+                    "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM",
                 )},
                 "timing": {
                     "method": "CUDA events, median of per-iteration maximum across EP ranks; no CUDA graph",
@@ -360,8 +403,25 @@ def main(argv=None):
             if rank == 0:
                 print(json.dumps({"event": "qwen35_native_backend", "label": label, **module_evidence(benchmark.layer, te, selected)}, sort_keys=True), flush=True)
             native_reference = run_reference_native_bf16(*inputs, shared_output_gate_weight=weight, bias_activation_fusion=args.bias_activation_fusion)
-            output, context = benchmark.run_fwd()
-            gradients = benchmark.format_gradients(benchmark.run_bwd(context))
+            with count_grouped_gemm_calls(grouped_linear) as call_counts:
+                output, context = benchmark.run_fwd()
+                raw_gradients = benchmark.run_bwd(context)
+            gradients = benchmark.format_gradients(raw_gradients)
+            del raw_gradients
+            rank_counts = [None] * world_size
+            dist.all_gather_object(rank_counts, call_counts)
+            expected_calls = {"grouped_tensor": 6, "legacy": 0} if (selected or te_internal_grouped) else {"grouped_tensor": 0, "legacy": 6}
+            backend_verified = all(counts == expected_calls for counts in rank_counts)
+            if rank == 0:
+                print(json.dumps({
+                    "event": "qwen35_native_backend_calls", "label": label,
+                    "backend_candidate": effective_backend, "grouped_linear_source": grouped_linear.__file__,
+                    "expected_calls": expected_calls, "calls_by_rank": rank_counts,
+                    "backend_entrypoint_verified": backend_verified,
+                    "probe_scope": "one correctness fwd+bwd; two routed FCs times fwd/dgrad/wgrad; wrappers removed before timing",
+                }, sort_keys=True), flush=True)
+            if not backend_verified:
+                raise RuntimeError(f"Requested {effective_backend}, but actual TE entrypoints disagree: {rank_counts}")
             actual = (output, *gradients)
             benchmark.check_overflow()
             native_ok = compare_results(actual, native_reference, f"{label} vs Native oracle", rank)
@@ -387,7 +447,8 @@ def main(argv=None):
                 print(json.dumps({
                     "event": "qwen35_native_result", "label": label, "grad_mode": "fresh",
                     "native_reference_passed": native_ok, "mok_semantic_reference_passed": mok_ok,
-                    "selected_grouped_tensor": selected, "kernel_backend_verified": False,
+                    "selected_grouped_tensor": selected, "effective_backend": effective_backend,
+                    "backend_entrypoint_verified": backend_verified, "backend_calls_by_rank": rank_counts,
                     "results": results,
                 }, sort_keys=True), flush=True)
             del benchmark
