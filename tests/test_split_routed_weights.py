@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from mok import functional, ops
-from .utils import BF16_TOLERANCE, MXFP8_TOLERANCE, check_correctness, generate_inputs
+from .utils import BF16_TOLERANCE, MXFP8_TOLERANCE, check_correctness, generate_inputs, ungated_backward_gradients
 
 
 def _current_cuda_context() -> int | None:
@@ -279,6 +279,8 @@ def test_split_routed_weights_match_dense(
         ),
     )
 
+    ungated_backward_gradients(dense_backward)
+    ungated_backward_gradients(split_backward)
     check_correctness("split/output", dense_output, split_output, tolerance, rank == 0)
     check_correctness("split/d_x", dense_backward[0], split_backward[0], tolerance, rank == 0)
     check_correctness(

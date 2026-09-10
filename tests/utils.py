@@ -8,6 +8,13 @@ BF16_TOLERANCE = (0.5, 0.01)
 MXFP8_TOLERANCE = (1.0, 0.1)
 
 
+def ungated_backward_gradients(gradients):
+    """Validate the unified API, then expose the unchanged eight gradients."""
+    assert len(gradients) == 9
+    assert gradients[-1] is None
+    return gradients[:8]
+
+
 def shapes(world_size: int) -> tuple[tuple[str, int, int, int, int, int], ...]:
     return (  # (name, routed experts, hidden dim, intermediate dim, top-k, num local tokens)
         ("Kimi K2.7 Code", 384, 7168, 2048, 8, 7168),

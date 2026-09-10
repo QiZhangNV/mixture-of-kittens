@@ -1,7 +1,7 @@
-"""Preparation tests; MOK-gated checks skip until the feature API exists.
+"""Independent gate references and real BF16 MOK output-gate API tests.
 
-Run through the repository's torchrun/pytest CUDA fixture. Reference tests
-do not claim that gated MOK has been implemented or validated.
+Run through the repository's torchrun/pytest CUDA fixture. Full Qwen shape
+checks are opt-in; missing production APIs fail rather than silently skip.
 """
 
 import inspect
@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from mok import functional
+from mok import functional, ops
 
 from .utils import (
     BF16_TOLERANCE,
@@ -259,8 +259,74 @@ def _require_mok_gate_api():
         functional.backward: ("shared_output_gate_weight", "shared_output_gate_main_grad"),
     }
     for function, arguments in expected.items():
-        if not all(name in inspect.signature(function).parameters for name in arguments):
-            pytest.skip("MOK shared output-gate API is not implemented; reference-only preparation")
+        assert all(name in inspect.signature(function).parameters for name in arguments), (
+            f"Required MOK shared output-gate API missing: {function.__name__} {arguments}"
+        )
+    assert callable(getattr(functional, "_shared_output_gate_wgrad", None))
+
+
+def _check_saved_gate(saved, x, weight):
+    assert saved.shared_output.shape == x.shape
+    assert saved.shared_output.dtype == torch.bfloat16
+    assert saved.shared_output_gate.shape == (x.shape[0], 1)
+    assert saved.shared_output_gate.dtype == torch.bfloat16
+    assert not saved.shared_output_gate.requires_grad
+    assert saved.shared_output_gate.grad_fn is None
+    expected_gate = torch.sigmoid(torch.nn.functional.linear(x, weight))
+    torch.testing.assert_close(saved.shared_output_gate, expected_gate, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [
+    (32, 64),
+    pytest.param(
+        (4096, 4096),
+        marks=pytest.mark.skipif(
+            os.getenv("MOK_TEST_QWEN_GATE_SHAPE") != "1",
+            reason="opt in to Qwen wgrad shape with MOK_TEST_QWEN_GATE_SHAPE=1",
+        ),
+        id="qwen-target",
+    ),
+])
+def test_production_gate_wgrad_fp32_without_bf16_intermediate(context, shape):
+    _require_mok_gate_api()
+    rank, _, device = context
+    rows, hidden = shape
+    generator = torch.Generator(device=device).manual_seed(2819 + rank)
+    x = torch.randn(rows, hidden, generator=generator, device=device, dtype=torch.bfloat16)
+    shared = torch.randn(rows, hidden, generator=generator, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(1, hidden, generator=generator, device=device, dtype=torch.bfloat16) * hidden ** -0.5
+    dy = torch.randn(rows, hidden, generator=generator, device=device, dtype=torch.bfloat16) * hidden ** -0.5
+    _, _, _, dz_ref, _, dw_fp64 = run_shared_output_gate_reference(x, shared, weight, dy)
+
+    # Exercise the ACTUAL production helper, using an independently derived dZ.
+    actual = functional._shared_output_gate_wgrad(dz_ref, x)
+    assert actual.dtype == torch.float32 and actual.shape == weight.shape
+    assert torch.isfinite(actual).all()
+    unit_roundoff = torch.finfo(torch.float32).eps / 2
+    gamma_k = rows * unit_roundoff / (1 - rows * unit_roundoff)
+    bound = gamma_k * (dz_ref.double().abs().T @ x.double().abs())
+    assert torch.isfinite(bound).all()
+    assert torch.all((actual.double() - dw_fp64).abs() <= bound)
+
+    # Same dispatch shape; exact FP32 dot distinguishes genuine FP32 output
+    # from a BF16 matmul result that was subsequently converted to FP32.
+    exact_dz = torch.ones_like(dz_ref)
+    exact_x = torch.ones_like(x)
+    exact_x[-1].fill_(1 / 64)
+    expected = torch.full_like(weight, rows - 1 + 1 / 64, dtype=torch.float32)
+    assert not torch.equal(expected, expected.to(torch.bfloat16).float())
+    fresh = functional._shared_output_gate_wgrad(exact_dz, exact_x)
+    assert fresh.dtype == torch.float32
+    torch.testing.assert_close(fresh, expected, rtol=0, atol=0)
+    fresh_snapshot = fresh.clone()
+    main_grad = torch.full_like(expected, 0.25)
+    accumulated = main_grad.clone()
+    for _ in range(2):
+        returned = functional._shared_output_gate_wgrad(exact_dz, exact_x, main_grad)
+        accumulated.add_(expected)
+        assert returned is main_grad
+        torch.testing.assert_close(returned, accumulated, rtol=0, atol=0)
+    torch.testing.assert_close(fresh, fresh_snapshot, rtol=0, atol=0)
 
 
 def _mok_schedule(context, inputs):
@@ -279,7 +345,7 @@ def _mok_schedule(context, inputs):
     return config, workspace, schedule
 
 
-def test_mok_explicit_ungated_nine_item_contract_when_implemented(context):
+def test_mok_explicit_ungated_nine_item_contract(context):
     _require_mok_gate_api()
     inputs, _ = _dense_inputs(context)
     x, _, probs, *rest = inputs
@@ -289,6 +355,7 @@ def test_mok_explicit_ungated_nine_item_contract_when_implemented(context):
         config, workspace, schedule, x, probs, *weights,
         shared_output_gate_weight=None,
     )
+    assert saved.shared_output is None and saved.shared_output_gate is None
     gradients = functional.backward(
         config, workspace, schedule, saved, dy, x, probs, *weights,
         shared_output_gate_weight=None,
@@ -303,11 +370,15 @@ def test_mok_explicit_ungated_nine_item_contract_when_implemented(context):
 
 
 @pytest.mark.parametrize("accumulate", [False, True])
-def test_mok_gated_dense_matches_reference_when_implemented(context, accumulate):
+def test_mok_gated_dense_matches_reference(context, accumulate):
     _require_mok_gate_api()
     inputs, weight = _dense_inputs(context)
     x, _, probs, *rest = inputs
     weights, dy = rest[:-1], rest[-1]
+    if not accumulate:
+        # Even trainable inputs/weights must not retain an inner gate/Z graph.
+        x.requires_grad_(True)
+        weight.requires_grad_(True)
     config, workspace, schedule = _mok_schedule(context, inputs)
     main_grads = None
     gate_main_grad = None
@@ -325,6 +396,7 @@ def test_mok_gated_dense_matches_reference_when_implemented(context, accumulate)
             config, workspace, schedule, x, probs, *weights,
             shared_output_gate_weight=weight,
         )
+        _check_saved_gate(saved, x, weight)
         gradients = functional.backward(
             config, workspace, schedule, saved, dy, x, probs, *weights,
             main_grads=main_grads,
@@ -344,7 +416,7 @@ def test_mok_gated_dense_matches_reference_when_implemented(context, accumulate)
             check_correctness(name, golden, actual, BF16_TOLERANCE, print_stats=context[0] == 0)
 
 
-def test_mok_gated_multiple_live_contexts_when_implemented(context):
+def test_mok_gated_multiple_live_contexts(context):
     _require_mok_gate_api()
     inputs, weight = _dense_inputs(context)
     second = list(inputs)
@@ -360,10 +432,14 @@ def test_mok_gated_multiple_live_contexts_when_implemented(context):
             config, workspace, schedule, x, probs, *weights,
             shared_output_gate_weight=weight,
         )
-        pending.append((batch, config, workspace, schedule, output, saved))
+        _check_saved_gate(saved, x, weight)
+        snapshots = (saved.shared_output.clone(), saved.shared_output_gate.clone())
+        pending.append((batch, config, workspace, schedule, output, saved, snapshots))
 
     # Both contexts must survive a subsequent forward using the same workspace.
-    for batch, config, workspace, schedule, output, saved in reversed(pending):
+    for batch, config, workspace, schedule, output, saved, snapshots in reversed(pending):
+        torch.testing.assert_close(saved.shared_output, snapshots[0], rtol=0, atol=0)
+        torch.testing.assert_close(saved.shared_output_gate, snapshots[1], rtol=0, atol=0)
         x, _, probs, *rest = batch
         weights, dy = rest[:-1], rest[-1]
         gradients = functional.backward(
@@ -374,3 +450,43 @@ def test_mok_gated_multiple_live_contexts_when_implemented(context):
         assert len(gradients) == 9
         for name, actual, golden in zip(GATED_RESULT_NAMES, (output, *gradients), reference, strict=True):
             check_correctness(name, golden, actual, BF16_TOLERANCE, print_stats=context[0] == 0)
+
+
+@pytest.mark.parametrize("invalid", ["weight_dtype", "weight_shape", "mxfp8"])
+def test_mok_gated_forward_rejects_unsupported_inputs(context, invalid):
+    _require_mok_gate_api()
+    inputs, weight = _dense_inputs(context)
+    x, _, probs, *rest = inputs
+    weights = list(rest[:-1])
+    config, workspace, schedule = _mok_schedule(context, inputs)
+    if invalid == "weight_dtype":
+        weight = weight.float()
+    elif invalid == "weight_shape":
+        weight = weight.flatten()
+    else:
+        weights[3:] = [ops.mxfp8_quantize(w, True, False)[:2] for w in weights[3:]]
+    error = NotImplementedError if invalid == "mxfp8" else ValueError
+    with pytest.raises(error, match="BF16"):
+        functional.forward(
+            config, workspace, schedule, x, probs, *weights,
+            shared_output_gate_weight=weight,
+        )
+
+
+@pytest.mark.parametrize("invalid", ["missing_saved_state", "missing_weight", "bf16_main_grad"])
+def test_mok_gated_backward_rejects_inconsistent_state(context, invalid):
+    _require_mok_gate_api()
+    inputs, weight = _dense_inputs(context)
+    x, _, probs, *rest = inputs
+    weights, dy = rest[:-1], rest[-1]
+    config, workspace, schedule = _mok_schedule(context, inputs)
+    _, saved = functional.forward(
+        config, workspace, schedule, x, probs, *weights,
+        shared_output_gate_weight=None if invalid == "missing_saved_state" else weight,
+    )
+    with pytest.raises(ValueError):
+        functional.backward(
+            config, workspace, schedule, saved, dy, x, probs, *weights,
+            shared_output_gate_weight=None if invalid == "missing_weight" else weight,
+            shared_output_gate_main_grad=torch.zeros_like(weight) if invalid == "bf16_main_grad" else None,
+        )
