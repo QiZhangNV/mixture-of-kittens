@@ -329,12 +329,12 @@ def test_production_gate_wgrad_fp32_without_bf16_intermediate(context, shape):
     torch.testing.assert_close(fresh, fresh_snapshot, rtol=0, atol=0)
 
 
-def _mok_schedule(context, inputs):
+def _mok_schedule(context, inputs, macrobatch_size=4096):
     _, _, device = context
     x, experts, probs, *_ = inputs
     config = functional.MoKConfig(
         fwd_num_comm_sms=2, bwd_num_comm_sms=2,
-        minibatch_size=256, macrobatch_size=4096,
+        minibatch_size=256, macrobatch_size=macrobatch_size,
         schedule_capacity_multiplier=1.5,
     )
     workspace = functional.get_workspace(
@@ -370,7 +370,8 @@ def test_mok_explicit_ungated_nine_item_contract(context):
 
 
 @pytest.mark.parametrize("accumulate", [False, True])
-def test_mok_gated_dense_matches_reference(context, accumulate):
+@pytest.mark.parametrize("macrobatch_size", [4096, 512])
+def test_mok_gated_dense_matches_reference(context, accumulate, macrobatch_size):
     _require_mok_gate_api()
     inputs, weight = _dense_inputs(context)
     x, _, probs, *rest = inputs
@@ -379,7 +380,7 @@ def test_mok_gated_dense_matches_reference(context, accumulate):
         # Even trainable inputs/weights must not retain an inner gate/Z graph.
         x.requires_grad_(True)
         weight.requires_grad_(True)
-    config, workspace, schedule = _mok_schedule(context, inputs)
+    config, workspace, schedule = _mok_schedule(context, inputs, macrobatch_size)
     main_grads = None
     gate_main_grad = None
     if accumulate:
