@@ -336,6 +336,42 @@ def run_bwd_epilogue_reference(
     return (d_x_shared.float() + d_x_routed.float().sum(dim=1)).to(torch.bfloat16)
 
 
+@torch.enable_grad()
+def run_shared_output_gate_reference(
+    x: torch.Tensor,
+    shared_output: torch.Tensor,
+    output_gate_weight: torch.Tensor,
+    d_output: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Independent reference for the BF16 gate and FP32 shared product.
+
+    Returns ``G, dS, dG, dZ, dX_gate, dW_gate_fp64``. Autograd supplies the
+    BF16 cast boundaries, including dG before sigmoid backward. The FP64
+    wgrad oracle uses *this reference's* dZ, never a MOK intermediate or the
+    already-rounded BF16 gradient of a BF16 weight. It is not a benchmark.
+    """
+    if any(t.dtype != torch.bfloat16 for t in (x, shared_output, output_gate_weight, d_output)):
+        raise ValueError("the shared output-gate reference requires BF16 inputs")
+    if output_gate_weight.shape != (1, x.shape[-1]):
+        raise ValueError("output gate weight must have shape [1, H]")
+
+    x_ref = x.detach().requires_grad_()
+    shared_ref = shared_output.detach().requires_grad_()
+    gate_weight_ref = output_gate_weight.detach()
+    logits = torch.nn.functional.linear(x_ref, gate_weight_ref)
+    gate = torch.sigmoid(logits)
+    gated_shared_fp32 = shared_ref.float() * gate.float()
+    d_shared, d_gate, d_logits, d_x_gate = torch.autograd.grad(
+        gated_shared_fp32,
+        (shared_ref, gate, logits, x_ref),
+        d_output.float(),
+    )
+    d_weight_fp64 = d_logits.double().T @ x_ref.detach().double()
+    return (
+        gate.detach(), d_shared, d_gate, d_logits, d_x_gate, d_weight_fp64,
+    )
+
+
 def run_reference_bf16(
     x: torch.Tensor,               # [T, H]
     topk_experts: torch.Tensor,    # [T, TOPK]
@@ -350,17 +386,27 @@ def run_reference_bf16(
     swiglu_limit: float | None = None,
     *,
     group: dist.ProcessGroup | None = None,
-) -> tuple[
-    torch.Tensor,  # output
-    torch.Tensor,  # d_x
-    torch.Tensor,  # d_router_weights
-    torch.Tensor,  # d_w_routed_gate
-    torch.Tensor,  # d_w_routed_up
-    torch.Tensor,  # d_w_routed_down
-    torch.Tensor,  # d_w_shared_gate
-    torch.Tensor,  # d_w_shared_up
-    torch.Tensor,  # d_w_shared_down
-]:
+    shared_output_gate_weight: torch.Tensor | None = None,
+    shared_output_gate_main_grad: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Reference MoE forward/backward, preserving the legacy ungated result.
+
+    Without an output gate, return the existing nine entries (Y and eight
+    gradients) with their original numerical path. With a gate, append the
+    FP32 gate wgrad as entry ten. An optional FP32 gate main-grad receives
+    additive contributions and is returned by reference. The six MLP wgrads
+    keep their original BF16 reference semantics.
+    """
+    if shared_output_gate_main_grad is not None:
+        if shared_output_gate_weight is None:
+            raise ValueError("gate main-grad requires an output gate weight")
+        if (
+            shared_output_gate_main_grad.dtype != torch.float32
+            or shared_output_gate_main_grad.shape != shared_output_gate_weight.shape
+            or shared_output_gate_main_grad.device != x.device
+        ):
+            raise ValueError("gate main-grad must be FP32 [1, H] on the input device")
+
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
 
@@ -421,8 +467,25 @@ def run_reference_bf16(
     up_shared = x_shared @ w_shared_up.T
     shared_output = run_swiglu_reference(gate_shared, up_shared, swiglu_limit) @ w_shared_down.T
 
-    # Final sum
-    output = (routed_output + shared_output.float()).to(torch.bfloat16)
+    # Keep the old ungated reference unchanged. Gated mode follows the B
+    # epilogue's shared-first, route-by-route FP32 accumulation order.
+    if shared_output_gate_weight is None:
+        output = (routed_output + shared_output.float()).to(torch.bfloat16)
+        d_shared_output = d_output
+    else:
+        gate, d_shared_output, _, _, d_x_gate, d_w_gate_fp64 = (
+            run_shared_output_gate_reference(
+                x, shared_output, shared_output_gate_weight, d_output
+            )
+        )
+        accumulator = shared_output.float() * gate.float()
+        routed = flat_output.view(num_local_tokens, topk, hidden)
+        for k in range(topk):
+            term = routed[:, k].float() * router_weights[:, k, None]
+            accumulator = accumulator + torch.where(
+                topk_experts[:, k, None] >= 0, term, 0.0
+            )
+        output = accumulator.to(torch.bfloat16)
 
     # Combine all-to-all
     d_flat_output = (d_output.unsqueeze(1).float() * router_weights.unsqueeze(2)).to(torch.bfloat16)
@@ -446,13 +509,21 @@ def run_reference_bf16(
     d_x_shared, d_w_shared_gate, d_w_shared_up, d_w_shared_down = torch.autograd.grad(
         shared_output,
         (x_shared, w_shared_gate, w_shared_up, w_shared_down),
-        d_output,
+        d_shared_output,
     )
-    d_x = (d_x_routed + d_x_shared.float()).to(torch.bfloat16)
+    if shared_output_gate_weight is None:
+        d_x = (d_x_routed + d_x_shared.float()).to(torch.bfloat16)
+    else:
+        accumulator = d_x_shared.float()
+        routed_d_x = flat_d_x.view(num_local_tokens, topk, hidden)
+        for k in range(topk):
+            accumulator = accumulator + routed_d_x[:, k].float()
+        d_x_mlp = accumulator.to(torch.bfloat16)
+        d_x = d_x_mlp + d_x_gate
     d_router_weights = (d_output.unsqueeze(1).float() * flat_output.view(num_local_tokens, topk, hidden).float()).sum(2)
     d_router_weights.masked_fill_(topk_experts < 0, 0.0)
 
-    return (
+    results = (
         output,             # [T, H]
         d_x,                # [T, H]
         d_router_weights,   # [T, TOPK]
@@ -463,6 +534,15 @@ def run_reference_bf16(
         d_w_shared_up,      # [I, H]
         d_w_shared_down,    # [H, I]
     )
+    if shared_output_gate_weight is None:
+        return results
+
+    d_w_output_gate = d_w_gate_fp64.float()
+    if shared_output_gate_main_grad is not None:
+        with torch.no_grad():
+            shared_output_gate_main_grad.add_(d_w_output_gate)
+        d_w_output_gate = shared_output_gate_main_grad
+    return (*results, d_w_output_gate)
 
 
 def get_error_stats(
