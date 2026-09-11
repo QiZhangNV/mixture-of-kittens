@@ -1069,6 +1069,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     macrobatch_size: int,
     minibatch_size: int,
     routed_weights_are_native_columnwise: bool = False,
+    shared_grad_output: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1090,6 +1091,10 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     torch.Tensor,
 ]:
     """Runs the fused MXFP8 MoE backward pass.
+
+    ``shared_grad_output`` optionally supplies BF16 [T, H] gradients for
+    the shared MLP only. Routed dispatch/quantization and router backward
+    retain the original ``d_y_buffer``. None preserves the ungated path.
 
     Inputs:
         d_y_buffer:                    bfloat16 [num_local_tokens, hidden_size]
@@ -1340,6 +1345,9 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     if tuple(tokens_per_expert.shape) != (num_local_experts,):
         raise ValueError("tokens_per_expert must have shape (num_local_experts,)")
 
+    if shared_grad_output is not None:
+        _validate_shared_grad_output(shared_grad_output, d_y_buffer)
+
     return _C.dispatch_mlp_swiglu_combine_bwd_mxfp8(
         d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
         router_weight_buffer, router_weight_buffer_ptrs,
@@ -1355,6 +1363,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
         routed_weights_are_native_columnwise,
+        shared_grad_output=shared_grad_output,
     )
 
 
@@ -1387,6 +1396,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         torch.Tensor,
         torch.Tensor,
     ] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Runs MXFP8 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
@@ -1397,6 +1407,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
 
     This eager wrapper is separate from the original custom op because custom
     op outputs may not alias mutated inputs.
+    ``shared_grad_output`` follows the fresh op's BF16 shared-only contract.
     """
     if len(main_grads) != 6:
         raise ValueError("main_grads must contain six tensors")
@@ -1425,9 +1436,11 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         raise ValueError(
             "split weight, scale, and main-grad storage tables must be provided together"
         )
+    if shared_grad_output is not None:
+        _validate_shared_grad_output(shared_grad_output, args[0])
     if weight_storage_tables is None:
         outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads
+            *args, *main_grads, shared_grad_output=shared_grad_output
         )
     else:
         if (
@@ -1441,7 +1454,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
             )
         outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
             *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
-            *main_grad_storage_tables
+            *main_grad_storage_tables, shared_grad_output=shared_grad_output
         )
     return outputs[:12]
 
