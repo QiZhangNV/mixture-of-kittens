@@ -1,4 +1,4 @@
-"""Native-U/Native-G: actual MCore MoELayer with fixed routes, BF16 and no op fuser.
+"""Native-U/Native-G: actual MCore MoELayer with fixed routes and no op fuser.
 
 Run in the OCI allocation, from this MOK checkout::
 
@@ -8,6 +8,8 @@ Run in the OCI allocation, from this MOK checkout::
 This is a fixed-route, fresh-gradient layer baseline, not a router-inclusive
 training benchmark. Native and MOK references are checked separately because
 their probability application and BF16 rounding boundaries differ.
+Use --precision mxfp8 for MXFP8 routed GEMMs with BF16 shared/gate. Its BF16
+reference is an accuracy anchor, not a quantization-exact MXFP8 oracle.
 """
 
 import argparse
@@ -36,6 +38,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mcore-repo", type=Path, default=Path(__file__).resolve().parents[3] / "vendor" / "Megatron-LM")
     parser.add_argument("--gate", choices=("both", "off", "on"), default="both")
+    parser.add_argument("--precision", choices=("bf16", "mxfp8"), default="bf16")
     parser.add_argument(
         "--gemm-backend", choices=("auto", "device-init", "te-cublas-grouped", "multistream"), default="auto",
         help="device-init: MCore public GroupedTensor API (requires TE use_grouped_tensor); "
@@ -72,6 +75,37 @@ def parse_args(argv=None):
     if not math.isfinite(args.rank_capacity_factor) or args.rank_capacity_factor <= 0:
         parser.error("--rank-capacity-factor must be positive and finite")
     return args
+
+
+def shared_bf16_quant_recipe():
+    """MCore's public per-module override; no monkey-patched shared forward."""
+    return {
+        "configs": {
+            "shared_bf16": {
+                "transformer_engine_config_type": "TEQuantizationParams",
+                "training_recipe": {
+                    "fp8_quantization_recipe": None,
+                    "fp4_quantization_recipe": None,
+                    "override_quantized_autocast": True,
+                },
+            },
+        },
+        "matchers": {
+            "shared": {
+                "config": "shared_bf16", "type": "glob",
+                "pattern": "*.shared_experts.*", "enabled": True,
+            },
+        },
+    }
+
+
+def comparison_tolerance(tensor_name, precision, bf16_tolerance, mxfp8_tolerance):
+    # Shared/gate were never quantized. Do not relax their checks to 10%.
+    return (
+        mxfp8_tolerance
+        if precision == "mxfp8" and not tensor_name.startswith("d_w_shared_")
+        else bf16_tolerance
+    )
 
 
 def select_grouped_tensor(requested, supports_grouped_tensor):
@@ -119,10 +153,13 @@ def build_layer(args, world_size, gated, use_grouped_tensor):
     import torch.nn.functional as F
     from megatron.core.fp8_utils import get_fp8_context
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_submodules
+    from megatron.core.quantization.quant_config import RecipeConfig
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.spec_utils import get_submodules
     from megatron.core.transformer.transformer_config import TransformerConfig
 
+    # Existing real-DDP harnesses reuse this builder with a BF16-only namespace.
+    precision = getattr(args, "precision", "bf16")
     config = TransformerConfig(
         num_layers=1, hidden_size=args.hidden_dim, num_attention_heads=8,
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1,
@@ -139,7 +176,16 @@ def build_layer(args, world_size, gated, use_grouped_tensor):
         use_grouped_gemm_for_shared_expert=False,
         gated_linear_unit=True, activation_func=F.silu, add_bias_linear=False,
         bias_activation_fusion=args.bias_activation_fusion, use_te_activation_func=False,
-        params_dtype=torch.bfloat16, bf16=True, fp8=None, fp8_param=False,
+        params_dtype=torch.bfloat16, bf16=True,
+        fp8="e4m3" if precision == "mxfp8" else None,
+        fp8_recipe="mxfp8", fp8_param=False, fp8_wgrad=True,
+        quant_recipe=(
+            RecipeConfig.from_config_dict(shared_bf16_quant_recipe())
+            if precision == "mxfp8" else None
+        ),
+        # Native initializes/caches quantized routed weights on its first untimed
+        # correctness forward. No weight update happens during this benchmark.
+        disable_parameter_transpose_cache=False,
         gradient_accumulation_fusion=False, use_cpu_initialization=False,
         use_transformer_engine_op_fuser=False,
         moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend="hybridep",
@@ -277,8 +323,45 @@ def module_evidence(layer, te, selected):
     }
 
 
-def compare_results(actual, reference, name, rank):
-    from tests.utils import BF16_TOLERANCE, get_error_stats
+def precision_evidence(layer, precision):
+    """Inspect after real forward/backward, before publishing any timing."""
+    result = {}
+    for name, module in (
+        ("routed_fc1", layer.experts.linear_fc1),
+        ("routed_fc2", layer.experts.linear_fc2),
+        ("shared_fc1", layer.shared_experts.linear_fc1),
+        ("shared_fc2", layer.shared_experts.linear_fc2),
+    ):
+        routed = name.startswith("routed_")
+        fp8 = getattr(module, "fp8", None)
+        recipe = getattr(module, "fp8_meta", {}).get("recipe")
+        is_mxfp8 = callable(getattr(recipe, "mxfp8", None)) and recipe.mxfp8()
+        expected_fp8 = precision == "mxfp8" and routed
+        if fp8 is None or bool(fp8) != expected_fp8:
+            raise RuntimeError(f"{name}: expected fp8={expected_fp8}, got {fp8}")
+        if expected_fp8 and not is_mxfp8:
+            raise RuntimeError(f"{name}: expected actual MXFP8 recipe, got {recipe}")
+        if getattr(module, "disable_parameter_transpose_cache", True):
+            raise RuntimeError(f"{name}: weight-cache policy unexpectedly disabled")
+        if getattr(module, "is_first_microbatch", True):
+            raise RuntimeError(f"{name}: first untimed forward did not initialize weight cache")
+        result[name] = {
+            "fp8": bool(fp8), "recipe": str(recipe), "recipe_is_mxfp8": bool(is_mxfp8),
+            "parameter_dtypes": sorted({str(p.dtype) for p in module.parameters()}),
+            "is_first_microbatch": module.is_first_microbatch,
+            "disable_parameter_transpose_cache": module.disable_parameter_transpose_cache,
+            "module_quant_override": repr(getattr(module, "te_quant_params", None)),
+        }
+    gate = layer.shared_experts.gate_weight
+    result["shared_output_gate"] = {
+        "implementation": "MCore Native Torch linear/sigmoid/multiply; no TE quantization",
+        "parameter_dtype": str(gate.dtype) if gate is not None else None,
+    }
+    return result
+
+
+def compare_results(actual, reference, name, rank, precision="bf16"):
+    from tests.utils import BF16_TOLERANCE, MXFP8_TOLERANCE, get_error_stats
 
     stats = {}
     passed = True
@@ -286,13 +369,14 @@ def compare_results(actual, reference, name, rank):
         if value.shape != golden.shape:
             raise AssertionError(f"{tensor_name}: shape mismatch {value.shape} vs {golden.shape}")
         mean, maximum, relative = get_error_stats(golden, value)
-        ok = all(math.isfinite(x) for x in (mean, maximum, relative)) and maximum <= BF16_TOLERANCE[0] and relative <= BF16_TOLERANCE[1]
-        stats[tensor_name] = {"absolute_mean": mean, "absolute_max": maximum, "relative_l1": relative, "passed": ok, "actual_dtype": str(value.dtype), "reference_dtype": str(golden.dtype)}
+        tolerance = comparison_tolerance(tensor_name, precision, BF16_TOLERANCE, MXFP8_TOLERANCE)
+        ok = all(math.isfinite(x) for x in (mean, maximum, relative)) and maximum <= tolerance[0] and relative <= tolerance[1]
+        stats[tensor_name] = {"absolute_mean": mean, "absolute_max": maximum, "relative_l1": relative, "passed": ok, "actual_dtype": str(value.dtype), "reference_dtype": str(golden.dtype), "tolerance": tolerance}
         passed &= ok
     if len(actual) != len(reference):
         raise AssertionError("Native/reference output lengths differ")
     if rank == 0:
-        print(json.dumps({"event": "qwen35_native_correctness", "comparison": name, "tolerance": BF16_TOLERANCE, "passed": passed, "tensors": stats}, sort_keys=True), flush=True)
+        print(json.dumps({"event": "qwen35_native_correctness", "comparison": name, "precision": precision, "reference_scope": "BF16 semantic anchor; not quantization-exact MXFP8 oracle", "passed": passed, "tensors": stats}, sort_keys=True), flush=True)
     return passed
 
 
@@ -375,6 +459,8 @@ def main(argv=None):
                 "mcore_layer_source": moe_layer.__file__, "torch_version": torch.__version__,
                 "torch_cuda_version": torch.version.cuda, "te_version": te.__version__, "hardware": hardware,
                 "fallback_reason": fallback, "grad_mode": "fresh", "routed_weights": "non-single per-expert Parameters",
+                "precision": args.precision, "shared_precision": "bfloat16",
+                "shared_quant_override": shared_bf16_quant_recipe() if args.precision == "mxfp8" else None,
                 "effective_backend_candidate": effective_backend,
                 "mcore_grouped_tensor_api": selected, "te_internal_grouped_candidate": te_internal_grouped,
                 "shared_expert_overlap": False, "op_fuser": False,
@@ -389,6 +475,9 @@ def main(argv=None):
                     "fwd_scope": "actual MoELayer.forward with fixed route; includes differentiable FP32 probability scatter; bool route-map prebuilt; excludes router GEMM/top-k",
                     "bwd_scope": "autograd.grad on actual MoELayer graph; setup forward and result gradient stacking excluded",
                     "mok_comparison_scope": "MOK baseline includes build_schedule + functional.forward; both exclude router and use same compact FP32 P/ids",
+                    "weight_quantization": "Native caches routed quantization after untimed correctness forward; MOK prequantizes routed weights outside timing; no parameter updates",
+                    "activation_quantization": "included in fwd/bwd when precision=mxfp8",
+                    "grad_comparison": "fresh-to-fresh only; Native leaf weight gradients are BF16, MOK output-gate wgrad is FP32; neither includes DDP/main-grad accumulation",
                 },
                 "memory_scope": "PyTorch allocator peaks for each whole phase incl warmup/setup forward; excludes external CUDA allocations",
             }, sort_keys=True), flush=True)
@@ -408,6 +497,10 @@ def main(argv=None):
                 raw_gradients = benchmark.run_bwd(context)
             gradients = benchmark.format_gradients(raw_gradients)
             del raw_gradients
+            precision_by_rank = [None] * world_size
+            dist.all_gather_object(precision_by_rank, precision_evidence(benchmark.layer, args.precision))
+            if rank == 0:
+                print(json.dumps({"event": "qwen35_native_precision", "label": label, "precision": args.precision, "ranks": precision_by_rank}, sort_keys=True), flush=True)
             rank_counts = [None] * world_size
             dist.all_gather_object(rank_counts, call_counts)
             expected_calls = {"grouped_tensor": 6, "legacy": 0} if (selected or te_internal_grouped) else {"grouped_tensor": 0, "legacy": 6}
@@ -424,10 +517,10 @@ def main(argv=None):
                 raise RuntimeError(f"Requested {effective_backend}, but actual TE entrypoints disagree: {rank_counts}")
             actual = (output, *gradients)
             benchmark.check_overflow()
-            native_ok = compare_results(actual, native_reference, f"{label} vs Native oracle", rank)
+            native_ok = compare_results(actual, native_reference, f"{label} vs Native BF16 semantic anchor", rank, args.precision)
             del native_reference
             mok_reference = run_reference_bf16(*inputs, shared_output_gate_weight=weight)
-            mok_ok = compare_results(actual, mok_reference, f"{label} vs MOK-semantic oracle (cross-semantics)", rank)
+            mok_ok = compare_results(actual, mok_reference, f"{label} vs MOK BF16 semantic anchor (cross-semantics)", rank, args.precision)
             del mok_reference, actual, output, context, gradients
             if not native_ok:
                 raise AssertionError(f"{label} failed Native-semantic oracle; not publishing performance as valid")
@@ -445,7 +538,7 @@ def main(argv=None):
             benchmark.check_overflow()
             if rank == 0:
                 print(json.dumps({
-                    "event": "qwen35_native_result", "label": label, "grad_mode": "fresh",
+                    "event": "qwen35_native_result", "label": label, "grad_mode": "fresh", "precision": args.precision,
                     "native_reference_passed": native_ok, "mok_semantic_reference_passed": mok_ok,
                     "selected_grouped_tensor": selected, "effective_backend": effective_backend,
                     "backend_entrypoint_verified": backend_verified, "backend_calls_by_rank": rank_counts,
