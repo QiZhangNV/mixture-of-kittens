@@ -622,7 +622,7 @@ def forward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 representation
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 representation
         swiglu_limit:        float | None
-        shared_output_gate_weight: optional BF16 [1, H] output gate, BF16 routed mode only
+        shared_output_gate_weight: optional BF16 [1, H] output gate for BF16 or MXFP8 routed experts
 
     Outputs:
         output:          bfloat16 [num_local_tokens, hidden_size]
@@ -659,8 +659,6 @@ def forward(
 
     shared_output_gate = None
     if shared_output_gate_weight is not None:
-        if routed_precision_is_mxfp8:
-            raise NotImplementedError("shared output gating currently supports BF16 routed experts only")
         # This functional API has a manual backward; do not retain an inner
         # autograd graph (and Z) when called with trainable X or weights.
         with torch.no_grad():
@@ -744,6 +742,8 @@ def forward(
             up_routed=(up_fp8_routed, up_sc_routed),
             hidden_shared=hidden_shared,
             hidden_routed=(hidden_fp8_t_routed, hidden_sc_t_routed),
+            shared_output=y_shared if shared_output_gate is not None else None,
+            shared_output_gate=shared_output_gate,
         )
     else:
         if split_weights:
@@ -1221,10 +1221,6 @@ def backward(
             raise ValueError("shared output gate main-grad requires shared_output_gate_weight")
     else:
         _validate_shared_output_gate_weight(shared_output_gate_weight, x)
-        if isinstance(routed_gate_weights, tuple) or (
-            isinstance(routed_gate_weights, SplitRoutedWeight) and routed_gate_weights.scale is not None
-        ):
-            raise NotImplementedError("shared output gating currently supports BF16 routed experts only")
         if gate is None or shared_output is None:
             raise ValueError("gated backward requires saved S/G from the original gated forward context")
         if shared_output_gate_main_grad is not None and (
@@ -1328,7 +1324,7 @@ def backward(
                 d_w_routed_up,
                 d_w_shared_down,
                 d_w_routed_down,
-            ) = dispatch_mlp_swiglu_combine_bwd_mxfp8(*mxfp8_bwd_args)
+            ) = dispatch_mlp_swiglu_combine_bwd_mxfp8(*mxfp8_bwd_args, **shared_grad_kwargs)
         else:
             # Fused accumulation: mutate the six supplied main-grad buffers.
             # Descriptor tables are present only for non-single expert storage.
@@ -1351,6 +1347,7 @@ def backward(
                 weight_storage_tables=weight_args.storage_tables,
                 scale_storage_tables=weight_args.scale_storage_tables,
                 main_grad_storage_tables=main_grad_storage_tables,
+                **shared_grad_kwargs,
             )
             (
                 d_w_shared_gate,

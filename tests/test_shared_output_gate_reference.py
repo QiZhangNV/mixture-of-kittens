@@ -521,7 +521,7 @@ def test_mok_gated_multiple_live_contexts(context):
             check_correctness(name, golden, actual, BF16_TOLERANCE, print_stats=context[0] == 0)
 
 
-@pytest.mark.parametrize("invalid", ["weight_dtype", "weight_shape", "mxfp8"])
+@pytest.mark.parametrize("invalid", ["weight_dtype", "weight_shape"])
 def test_mok_gated_forward_rejects_unsupported_inputs(context, invalid):
     _require_mok_gate_api()
     inputs, weight = _dense_inputs(context)
@@ -532,10 +532,7 @@ def test_mok_gated_forward_rejects_unsupported_inputs(context, invalid):
         weight = weight.float()
     elif invalid == "weight_shape":
         weight = weight.flatten()
-    else:
-        weights[3:] = [ops.mxfp8_quantize(w, True, False)[:2] for w in weights[3:]]
-    error = NotImplementedError if invalid == "mxfp8" else ValueError
-    with pytest.raises(error, match="BF16"):
+    with pytest.raises(ValueError, match="BF16"):
         functional.forward(
             config, workspace, schedule, x, probs, *weights,
             shared_output_gate_weight=weight,
