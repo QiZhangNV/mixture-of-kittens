@@ -56,8 +56,8 @@ def test_gate_reference_autograd_matches_manual_bf16_boundaries(context):
         x, shared, weight, dy
     )
     expected_gate = torch.sigmoid(torch.nn.functional.linear(x, weight))
-    expected_ds = (dy.float() * expected_gate.float()).to(torch.bfloat16)
-    expected_dg = (dy.float() * shared.float()).sum(-1, keepdim=True).to(torch.bfloat16)
+    expected_ds = dy * expected_gate
+    expected_dg = (dy * shared).sum(-1, keepdim=True)
     expected_dz = torch.ops.aten.sigmoid_backward.default(expected_dg, expected_gate)
     for actual, expected in (
         (gate, expected_gate), (ds, expected_ds), (dg, expected_dg),
@@ -70,6 +70,36 @@ def test_gate_reference_autograd_matches_manual_bf16_boundaries(context):
     torch.testing.assert_close(
         dw_fp64, expected_dz.double().T @ x.double(), rtol=0, atol=0
     )
+
+
+def _bf16_product_rounding_witness(device, rows, hidden):
+    # Both products are near +/-1. BF16 rounds the positive product down,
+    # yielding exact cancellation. FP32 retains its 1/16384 residual.
+    x = torch.zeros(rows, hidden, device=device, dtype=torch.bfloat16)
+    x[:, :2] = 1
+    shared = torch.zeros_like(x)
+    shared[:, 0] = 1 + 1 / 128
+    shared[:, 1] = 1
+    dy = torch.zeros_like(x)
+    dy[:, 0] = 1 + 1 / 128
+    dy[:, 1] = -(1 + 1 / 64)
+    weight = torch.zeros(1, hidden, device=device, dtype=torch.bfloat16)
+    weight[0, 0], weight[0, 1] = 1, -1  # Z=0 and G=0.5, but Wg is nonzero.
+    return x, shared, weight, dy
+
+
+def test_gate_reference_rounds_bf16_product_before_hidden_reduction(context):
+    x, shared, weight, dy = _bf16_product_rounding_witness(context[2], 32, 64)
+    gate, ds, dg, dz, dx_gate, dw_fp64 = run_shared_output_gate_reference(
+        x, shared, weight, dy
+    )
+    torch.testing.assert_close(gate, torch.full_like(gate, 0.5), rtol=0, atol=0)
+    torch.testing.assert_close(ds, dy * 0.5, rtol=0, atol=0)
+    for gradient in (dg, dz, dx_gate, dw_fp64):
+        torch.testing.assert_close(gradient, torch.zeros_like(gradient), rtol=0, atol=0)
+    old_dg = (dy.float() * shared.float()).sum(-1, keepdim=True).to(torch.bfloat16)
+    torch.testing.assert_close(old_dg, torch.full_like(dg, 1 / 16384), rtol=0, atol=0)
+    assert not torch.equal(dg, old_dg)
 
 
 def test_gate_fp32_mm_against_independent_reference_dz(context):
@@ -367,6 +397,44 @@ def test_mok_explicit_ungated_nine_item_contract(context):
         GATED_RESULT_NAMES[:-1], (output, *gradients[:8]), reference, strict=True
     ):
         check_correctness(name, golden, actual, BF16_TOLERANCE, print_stats=context[0] == 0)
+
+
+def test_mok_gate_backward_uses_bf16_product_rounding(context):
+    """A real MOK context whose gate wgrad detects the old formula exactly."""
+    _require_mok_gate_api()
+    inputs, _ = _dense_inputs(context)
+    x, experts, probs, *rest = inputs
+    weights = rest[:-1]
+    x, shared, weight, dy = _bf16_product_rounding_witness(
+        context[2], x.shape[0], x.shape[1]
+    )
+    for matrix in weights:
+        matrix.zero_()
+    # Only one shared intermediate channel is active. BF16(silu(16))=16,
+    # so the down GEMM produces our exact S; routed experts remain zero.
+    weights[0][0, 0] = 16
+    weights[1][0, 0] = 1
+    weights[2][0, 0] = (1 + 1 / 128) / 16
+    weights[2][1, 0] = 1 / 16
+    inputs = (x, experts, probs, *weights, dy)
+    config, workspace, schedule = _mok_schedule(context, inputs)
+    output, saved = functional.forward(
+        config, workspace, schedule, x, probs, *weights,
+        shared_output_gate_weight=weight,
+    )
+    torch.testing.assert_close(saved.shared_output, shared, rtol=0, atol=0)
+    torch.testing.assert_close(output, shared * 0.5, rtol=0, atol=0)
+    _, _, _, _, _, golden_dw = run_shared_output_gate_reference(x, shared, weight, dy)
+    gradients = functional.backward(
+        config, workspace, schedule, saved, dy, x, probs, *weights,
+        shared_output_gate_weight=weight,
+    )
+    assert len(gradients) == 9 and gradients[-1].dtype == torch.float32
+    torch.testing.assert_close(golden_dw, torch.zeros_like(golden_dw), rtol=0, atol=0)
+    torch.testing.assert_close(gradients[-1].double(), golden_dw, rtol=0, atol=0)
+    # With the old FP32-product dG, dZ would be 1/65536 per token and the
+    # first two gate-weight gradients would be 512/65536, not zero.
+    assert x.shape[0] == 512
 
 
 @pytest.mark.parametrize("accumulate", [False, True])

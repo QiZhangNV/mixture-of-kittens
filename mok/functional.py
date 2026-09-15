@@ -1238,8 +1238,10 @@ def backward(
     shared_grad_kwargs = {}
     if gate is not None:
         with torch.no_grad():
-            d_shared = (grad_output.float() * gate.float()).to(torch.bfloat16)
-            d_gate = (grad_output.float() * shared_output.float()).sum(-1, keepdim=True).to(torch.bfloat16)
+            # Native-style BF16 tensor boundaries: multiply uses FP32 opmath,
+            # then dG sums BF16 products with an FP32 accumulator.
+            d_shared = grad_output * gate
+            d_gate = (grad_output * shared_output).sum(-1, keepdim=True)
         shared_grad_kwargs["shared_grad_output"] = d_shared
 
     workspace.d_y_buffer.copy_(grad_output)                # TODO: we can remove this

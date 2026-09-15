@@ -350,12 +350,14 @@ def run_shared_output_gate_reference(
     output_gate_weight: torch.Tensor,
     d_output: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
-    """Independent reference for the BF16 gate and FP32 shared product.
+    """Independent Native-style gate backward; NOT the MoE forward oracle.
 
-    Returns ``G, dS, dG, dZ, dX_gate, dW_gate_fp64``. Autograd supplies the
-    BF16 cast boundaries, including dG before sigmoid backward. The FP64
-    wgrad oracle uses *this reference's* dZ, never a MOK intermediate or the
-    already-rounded BF16 gradient of a BF16 weight. It is not a benchmark.
+    Returns ``G, dS, dG, dZ, dX_gate, dW_gate_fp64``. A local BF16 S*G graph
+    lets autograd independently produce dS and sum(BF16(dY*S)), then BF16
+    sigmoid backward. The full forward oracle below still combines FP32
+    S*G with routed outputs (B semantics); this local graph defines only
+    the chosen backward rounding. The FP64 wgrad oracle uses *this
+    reference's* dZ, never a MOK intermediate or BF16 weight.grad.
     """
     if any(t.dtype != torch.bfloat16 for t in (x, shared_output, output_gate_weight, d_output)):
         raise ValueError("the shared output-gate reference requires BF16 inputs")
@@ -367,11 +369,11 @@ def run_shared_output_gate_reference(
     gate_weight_ref = output_gate_weight.detach()
     logits = torch.nn.functional.linear(x_ref, gate_weight_ref)
     gate = torch.sigmoid(logits)
-    gated_shared_fp32 = shared_ref.float() * gate.float()
+    gated_shared_bf16 = shared_ref * gate
     d_shared, d_gate, d_logits, d_x_gate = torch.autograd.grad(
-        gated_shared_fp32,
+        gated_shared_bf16,
         (shared_ref, gate, logits, x_ref),
-        d_output.float(),
+        d_output,
     )
     d_weight_fp64 = d_logits.double().T @ x_ref.detach().double()
     return (
@@ -402,7 +404,9 @@ def run_reference_bf16(
     gradients) with their original numerical path. With a gate, append the
     FP32 gate wgrad as entry ten. An optional FP32 gate main-grad receives
     additive contributions and is returned by reference. The six MLP wgrads
-    keep their original BF16 reference semantics.
+    keep their original BF16 reference semantics. Gated forward retains
+    FP32 S*G (B semantics), independently of the Native-style BF16-product
+    rounding used by the local output-gate backward oracle.
     """
     if shared_output_gate_main_grad is not None:
         if shared_output_gate_weight is None:
