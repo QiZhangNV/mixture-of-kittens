@@ -143,9 +143,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("w_routed_down_storage_table") = pybind11::none(),
           pybind11::arg("main_grad_routed_gate_storage_table") = pybind11::none(),
           pybind11::arg("main_grad_routed_up_storage_table") = pybind11::none(),
-          pybind11::arg("main_grad_routed_down_storage_table") = pybind11::none());
+          pybind11::arg("main_grad_routed_down_storage_table") = pybind11::none(),
+          pybind11::arg("shared_grad_output") = pybind11::none());
     m.def("fwd_epilogue", &utils::fwd_epilogue::fwd_epilogue_entrypoint, "",
-          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"), pybind11::arg("top_experts"));
+          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"), pybind11::arg("top_experts"),
+          pybind11::arg("shared_output_gate") = pybind11::none());
     m.def("bwd_epilogue", &utils::bwd_epilogue::bwd_epilogue_entrypoint, "",
           pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"), pybind11::arg("top_experts"));
     m.def("recompute_forward_context_mxfp8", &recompute_forward_context_mxfp8_entrypoint, "",
