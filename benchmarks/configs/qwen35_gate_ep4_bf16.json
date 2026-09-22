@@ -1,0 +1,10 @@
+[
+  {
+    "name": "qwen35_ep4_balanced",
+    "fwd_num_comm_sms": 36,
+    "bwd_num_comm_sms": 48,
+    "minibatch_size": 4096,
+    "macrobatch_size": 65536,
+    "schedule_capacity_multiplier": 0.0625
+  }
+]
