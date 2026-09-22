@@ -150,10 +150,13 @@ followed by the output-gate gradient (`None` when ungated). An optional
 gradients and is returned by reference; it is independent of the six MLP
 `main_grads` buffers. Migrate existing eight-item unpacking accordingly.
 
-Gated forward retains its original BF16 shared output and BF16 sigmoid output
-in the returned context. Preserve that context until backward. Gated MXFP8 and
-gated `recompute_forward_context` are not supported in this first version;
-ungated BF16/MXFP8 retain their original numerical paths.
+Gated forward supports both BF16 and MXFP8 routed experts. Shared weights,
+activations, and the output-gate tensors remain BF16 in either mode. Forward
+retains its original BF16 shared output and BF16 sigmoid output in the returned
+context; preserve that context until backward. The shared branch consumes the
+BF16 gated gradient while routed experts keep the original upstream gradient
+and their existing quantization path. Gated `recompute_forward_context` is not
+supported; ungated BF16/MXFP8 retain their original numerical paths.
 
 ### Example (MXFP8 forward and backward using the functional layer)
 
