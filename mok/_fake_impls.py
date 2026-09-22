@@ -359,6 +359,7 @@ def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    shared_grad_output: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor,
@@ -397,6 +398,7 @@ def _fwd_epilogue_fake(
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
     top_experts: torch.Tensor,
+    shared_output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:  # output
     return y_shared.new_empty(y_shared.shape)
 

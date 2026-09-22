@@ -583,7 +583,8 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
     const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt,
     const std::optional<at::Tensor> &main_grad_routed_gate_storage_table = std::nullopt,
     const std::optional<at::Tensor> &main_grad_routed_up_storage_table = std::nullopt,
-    const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt
+    const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt,
+    const std::optional<at::Tensor> &shared_grad_output = std::nullopt
 ) {
     const bool accumulate_wgrad = main_grad_shared_gate.has_value();
     TORCH_CHECK(main_grad_routed_gate.has_value() == accumulate_wgrad &&
@@ -610,7 +611,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
                     w_routed_down_storage_table,
                     main_grad_routed_gate_storage_table,
                     main_grad_routed_up_storage_table,
-                    main_grad_routed_down_storage_table);
+                    main_grad_routed_down_storage_table, shared_grad_output);
             };
             const at::ScalarType main_grad_dtype = main_grad_shared_gate->scalar_type();
             TORCH_CHECK(main_grad_dtype == at::kFloat || main_grad_dtype == at::kBFloat16,
@@ -633,7 +634,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
             w_routed_down_storage_table,
             main_grad_routed_gate_storage_table,
             main_grad_routed_up_storage_table,
-            main_grad_routed_down_storage_table);
+            main_grad_routed_down_storage_table, shared_grad_output);
     };
     switch (x_ptrs.size()) {
         case 1: return dispatch_for_ep.template operator()<1>();

@@ -51,6 +51,9 @@ class MoKForwardContext:
     up_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     hidden_shared: torch.Tensor
     hidden_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    # Per-forward tensors, never workspace/ring-buffer views. Ungated keeps neither.
+    shared_output: torch.Tensor | None = None
+    shared_output_gate: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +555,27 @@ def validate_inputs(
         raise ValueError("schedule capacity does not match the workspace")
 
 
+def _validate_shared_output_gate_weight(weight: torch.Tensor, x: torch.Tensor) -> None:
+    if (weight.dtype != torch.bfloat16 or weight.device != x.device
+            or tuple(weight.shape) != (1, x.shape[1]) or not weight.is_contiguous()):
+        raise ValueError("shared_output_gate_weight must be contiguous BF16 [1, H] on the input device")
+
+
+def _shared_output_gate_wgrad(
+    d_z: torch.Tensor, x: torch.Tensor, main_grad: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """BF16 inputs -> FP32 contribution, with no BF16 result intermediate.
+
+    Used by the manual backward and its local precision tests. The caller
+    validates an optional FP32 accumulation buffer before launching backward.
+    """
+    contribution = torch.mm(d_z.T, x, out_dtype=torch.float32)
+    if main_grad is None:
+        return contribution
+    main_grad.add_(contribution)
+    return main_grad
+
+
 def forward(
     config: MoKConfig,
     workspace: MoKWorkspace,
@@ -571,6 +595,8 @@ def forward(
     | tuple[torch.Tensor, torch.Tensor]
     | SplitRoutedWeight,
     swiglu_limit: float | None = None,
+    *,
+    shared_output_gate_weight: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     MoKForwardContext,
@@ -596,12 +622,15 @@ def forward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 representation
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 representation
         swiglu_limit:        float | None
+        shared_output_gate_weight: optional BF16 [1, H] output gate, BF16 routed mode only
 
     Outputs:
         output:          bfloat16 [num_local_tokens, hidden_size]
         forward_context: MoKForwardContext
     """
     validate_inputs(config, workspace, schedule, x, router_weights)
+    if shared_output_gate_weight is not None:
+        _validate_shared_output_gate_weight(shared_output_gate_weight, x)
 
     workspace.x_buffer.copy_(x)  # TODO: we can remove this
     workspace.router_weight_buffer.copy_(router_weights)
@@ -627,6 +656,17 @@ def forward(
             for weight in split_triplet
         ):
             raise ValueError("split routed gate/up/down weights must use one precision")
+
+    shared_output_gate = None
+    if shared_output_gate_weight is not None:
+        if routed_precision_is_mxfp8:
+            raise NotImplementedError("shared output gating currently supports BF16 routed experts only")
+        # This functional API has a manual backward; do not retain an inner
+        # autograd graph (and Z) when called with trainable X or weights.
+        with torch.no_grad():
+            shared_output_gate = torch.sigmoid(
+                torch.nn.functional.linear(x, shared_output_gate_weight)
+            )
 
     if routed_precision_is_mxfp8:
         if split_weights:
@@ -760,12 +800,20 @@ def forward(
             up_routed=up_routed,
             hidden_shared=hidden_shared,
             hidden_routed=hidden_routed,
+            shared_output=y_shared if shared_output_gate is not None else None,
+            shared_output_gate=shared_output_gate,
         )
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    output = fwd_epilogue(y_shared, workspace.combine_buffer,
-                          workspace.router_weight_buffer, schedule.top_experts)
+    if shared_output_gate is None:
+        output = fwd_epilogue(y_shared, workspace.combine_buffer,
+                              workspace.router_weight_buffer, schedule.top_experts)
+    else:
+        output = fwd_epilogue(
+            y_shared, workspace.combine_buffer, workspace.router_weight_buffer,
+            schedule.top_experts, shared_output_gate=shared_output_gate,
+        )
     return output, forward_context
 
 
@@ -784,6 +832,8 @@ def recompute_forward_context(
 
     ``SplitRoutedWeight`` is intentionally unsupported here because the
     recompute custom ops do not yet accept per-expert descriptor tables.
+    This API also remains ungated: gated backward needs S/G from the original
+    forward context. Recomputing that state requires the shared down weight.
 
     Inputs:
         config:              MoKConfig
@@ -1093,6 +1143,9 @@ def backward(
         torch.Tensor,
     ]
     | None = None,
+    *,
+    shared_output_gate_weight: torch.Tensor | None = None,
+    shared_output_gate_main_grad: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1102,6 +1155,7 @@ def backward(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
 ]:
     """Runs the MoE backward pass.
 
@@ -1135,6 +1189,8 @@ def backward(
                              for non-single weights, descriptor tables ordered
                              as routed gate, routed up, routed down. Gate/up may
                              share the same combined-FC1 table.
+        shared_output_gate_weight: the optional BF16 [1, H] weight used by forward
+        shared_output_gate_main_grad: optional FP32 [1, H] additive accumulation buffer
 
     Outputs:
         The six returned weight-gradient entries are fresh gradients when
@@ -1150,10 +1206,43 @@ def backward(
         d_shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
         d_shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
         d_shared_down_weights: bfloat16 [hidden_size, intermediate_size]
+        d_shared_output_gate_weight: float32 [1, H], or None for ungated
     """
     validate_inputs(config, workspace, schedule, x, router_weights, grad_output)
     if not isinstance(forward_context, MoKForwardContext):
         raise TypeError("forward_context must be a MoKForwardContext")
+
+    gate = forward_context.shared_output_gate
+    shared_output = forward_context.shared_output
+    if shared_output_gate_weight is None:
+        if gate is not None or shared_output is not None:
+            raise ValueError("a gated forward context requires shared_output_gate_weight in backward")
+        if shared_output_gate_main_grad is not None:
+            raise ValueError("shared output gate main-grad requires shared_output_gate_weight")
+    else:
+        _validate_shared_output_gate_weight(shared_output_gate_weight, x)
+        if isinstance(routed_gate_weights, tuple) or (
+            isinstance(routed_gate_weights, SplitRoutedWeight) and routed_gate_weights.scale is not None
+        ):
+            raise NotImplementedError("shared output gating currently supports BF16 routed experts only")
+        if gate is None or shared_output is None:
+            raise ValueError("gated backward requires saved S/G from the original gated forward context")
+        if shared_output_gate_main_grad is not None and (
+            shared_output_gate_main_grad.dtype != torch.float32
+            or shared_output_gate_main_grad.device != x.device
+            or tuple(shared_output_gate_main_grad.shape) != (1, x.shape[1])
+            or not shared_output_gate_main_grad.is_contiguous()
+        ):
+            raise ValueError("shared output gate main-grad must be contiguous FP32 [1, H] on the input device")
+
+    shared_grad_kwargs = {}
+    if gate is not None:
+        with torch.no_grad():
+            # Native-style BF16 tensor boundaries: multiply uses FP32 opmath,
+            # then dG sums BF16 products with an FP32 accumulator.
+            d_shared = grad_output * gate
+            d_gate = (grad_output * shared_output).sum(-1, keepdim=True)
+        shared_grad_kwargs["shared_grad_output"] = d_shared
 
     workspace.d_y_buffer.copy_(grad_output)                # TODO: we can remove this
     workspace.x_buffer.copy_(x)                            # TODO: we can remove this
@@ -1329,7 +1418,7 @@ def backward(
                 d_w_routed_up,
                 d_w_shared_down,
                 d_w_routed_down,
-            ) = dispatch_mlp_swiglu_combine_bwd_bf16(*bwd_args)
+            ) = dispatch_mlp_swiglu_combine_bwd_bf16(*bwd_args, **shared_grad_kwargs)
         else:
             # Fused accumulation: mutate the six supplied main-grad buffers.
             # Descriptor tables are present only for non-single expert storage.
@@ -1348,6 +1437,7 @@ def backward(
                 main_grads=main_grads,
                 weight_storage_tables=weight_args.storage_tables,
                 main_grad_storage_tables=main_grad_storage_tables,
+                **shared_grad_kwargs,
             )
             (
                 d_w_shared_gate,
@@ -1362,6 +1452,13 @@ def backward(
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     d_x = bwd_epilogue(d_x_shared, workspace.d_x_routed_buffer,
                        schedule.top_experts)
+    d_w_output_gate = None
+    if gate is not None:
+        with torch.no_grad():
+            d_z = torch.ops.aten.sigmoid_backward.default(d_gate, gate)
+            d_x_gate = d_z @ shared_output_gate_weight
+            d_w_output_gate = _shared_output_gate_wgrad(d_z, x, shared_output_gate_main_grad)
+            d_x = d_x + d_x_gate  # Deliberate BF16 merge after the original MLP epilogue.
     d_router_weights = workspace.d_router_weight_buffer.clone()  # TODO: we can remove this
     d_router_weights.masked_fill_(schedule.top_experts < 0, 0.0)
     return (
@@ -1373,4 +1470,5 @@ def backward(
         d_w_shared_gate,
         d_w_shared_up,
         d_w_shared_down,
+        d_w_output_gate,
     )
