@@ -402,8 +402,9 @@ def run_reference_bf16(
 
     Without an output gate, return the existing nine entries (Y and eight
     gradients) with their original numerical path. With a gate, append the
-    FP32 gate wgrad as entry ten. An optional FP32 gate main-grad receives
-    additive contributions and is returned by reference. The six MLP wgrads
+    FP32 gate wgrad as entry ten. An optional BF16/FP32 gate main-grad receives
+    FP32 contributions directly and is returned by reference; a BF16 buffer
+    rounds only after each addition. The six MLP wgrads
     keep their original BF16 reference semantics. Gated forward retains
     FP32 S*G (B semantics), independently of the Native-style BF16-product
     rounding used by the local output-gate backward oracle.
@@ -412,11 +413,12 @@ def run_reference_bf16(
         if shared_output_gate_weight is None:
             raise ValueError("gate main-grad requires an output gate weight")
         if (
-            shared_output_gate_main_grad.dtype != torch.float32
+            shared_output_gate_main_grad.dtype not in (torch.bfloat16, torch.float32)
             or shared_output_gate_main_grad.shape != shared_output_gate_weight.shape
             or shared_output_gate_main_grad.device != x.device
+            or not shared_output_gate_main_grad.is_contiguous()
         ):
-            raise ValueError("gate main-grad must be FP32 [1, H] on the input device")
+            raise ValueError("gate main-grad must be contiguous BF16/FP32 [1, H] on the input device")
 
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)

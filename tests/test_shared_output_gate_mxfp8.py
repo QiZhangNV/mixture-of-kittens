@@ -98,24 +98,24 @@ def _routed(inputs, layout):
             "owners": (fc1_owners, down_owners)}
 
 
-def _main_grads(inputs, gate, layout):
+def _main_grads(inputs, gate, layout, dtype=torch.float32):
     seed = 0.25
-    shared = [torch.full_like(weight, seed, dtype=torch.float32) for weight in inputs[3:6]]
-    gate_grad = torch.full_like(gate, seed, dtype=torch.float32)
+    shared = [torch.full_like(weight, seed, dtype=dtype) for weight in inputs[3:6]]
+    gate_grad = torch.full_like(gate, seed, dtype=dtype)
     tables = None
     if layout == "legacy":
-        routed = [torch.full_like(weight, seed, dtype=torch.float32) for weight in inputs[6:9]]
+        routed = [torch.full_like(weight, seed, dtype=dtype) for weight in inputs[6:9]]
         main = (shared[0], routed[0], shared[1], routed[1], shared[2], routed[2])
         return {"main": main, "tables": tables, "gate": gate_grad, "routed": routed,
                 "layout": layout, "seed": seed}
     fc1 = torch.cat((inputs[6], inputs[7]), dim=1)
     if layout == "native":
-        routed_fc1 = torch.full_like(fc1, seed, dtype=torch.float32)
-        routed_down = torch.full_like(inputs[8], seed, dtype=torch.float32)
+        routed_fc1 = torch.full_like(fc1, seed, dtype=dtype)
+        routed_down = torch.full_like(inputs[8], seed, dtype=dtype)
         main_fc1, main_down = routed_fc1, routed_down
     else:
-        routed_fc1 = [torch.full_like(weight, seed, dtype=torch.float32) for weight in fc1]
-        routed_down = [torch.full_like(weight, seed, dtype=torch.float32) for weight in inputs[8]]
+        routed_fc1 = [torch.full_like(weight, seed, dtype=dtype) for weight in fc1]
+        routed_down = [torch.full_like(weight, seed, dtype=dtype) for weight in inputs[8]]
         fc1_table = ops.make_routed_d_weight_storage_table(routed_fc1)
         down_table = ops.make_routed_d_weight_storage_table(routed_down)
         tables = (fc1_table, fc1_table, down_table)
@@ -156,7 +156,7 @@ def _logical_results(output, gradients, main, intermediate, calls):
         gate, up = fc1.split(intermediate, dim=1)
     weights = (gate, up, down, main["main"][0], main["main"][2], main["main"][4], main["gate"])
     # Compare per-call contributions, not a large seed that could hide errors.
-    normalized = tuple((value - main["seed"]) / calls for value in weights)
+    normalized = tuple((value.float() - main["seed"]) / calls for value in weights)
     return (output, gradients[0], gradients[1], *normalized)
 
 
@@ -192,7 +192,11 @@ def _check_local_gate(actual, before, golden):
         expected = before.double() + expected
         u = torch.finfo(torch.float32).eps / 2
         bound = bound + u * (before.double().abs() + golden[0].abs() + bound)
-    assert actual.dtype == torch.float32 and torch.isfinite(actual).all()
+    if actual.dtype == torch.bfloat16:
+        # One BF16 writeback after an FP32 add; the GEMM contribution itself
+        # remains FP32. Exact witnesses separately reject pre-rounded inputs.
+        bound = bound + torch.finfo(torch.bfloat16).eps / 2 * (expected.abs() + bound)
+    assert actual.dtype in (torch.bfloat16, torch.float32) and torch.isfinite(actual).all()
     assert torch.isfinite(expected).all() and torch.isfinite(bound).all()
     assert torch.all((actual.double() - expected).abs() <= bound), "actual-S local gate FP64 producer check failed"
 
@@ -205,14 +209,14 @@ def _compare_independent(context, actual, reference, label):
         check_correctness(f"{label}/independent-S/{name}", golden, value, tolerance, print_stats=context[0] == 0)
 
 
-def _run_case(context, layout, accumulate, macro, qwen=False):
+def _run_case(context, layout, accumulate, macro, qwen=False, main_grad_dtype=torch.float32):
     inputs, gate = _inputs(context, qwen)
     if not accumulate:
         inputs[0].requires_grad_(True)
         gate.requires_grad_(True)
     routed = _routed(inputs, layout)
     state = _schedule(context, inputs, macro, qwen)
-    main = _main_grads(inputs, gate, layout) if accumulate else None
+    main = _main_grads(inputs, gate, layout, main_grad_dtype) if accumulate else None
     reference = run_reference_bf16(*inputs, shared_output_gate_weight=gate)
     for iteration in range(2 if accumulate else 1):
         output, saved = _forward(inputs, gate, routed, state)
@@ -234,6 +238,12 @@ def _run_case(context, layout, accumulate, macro, qwen=False):
 ])
 def test_mxfp8_gated_independent_reference_and_fp32_gate_consumer(context, layout, accumulate, macro):
     _run_case(context, layout, accumulate, macro)
+
+
+@pytest.mark.parametrize("layout", ["legacy", "native", "split_native"])
+@pytest.mark.parametrize("macro", [4096, 512])
+def test_mxfp8_gated_bf16_main_grad_matches_reference(context, layout, macro):
+    _run_case(context, layout, True, macro, main_grad_dtype=torch.bfloat16)
 
 
 @pytest.mark.parametrize("accumulate", [False, True])

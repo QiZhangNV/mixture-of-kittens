@@ -146,9 +146,12 @@ d_w_g = gradients[8]  # Fresh FP32 gradient, without a BF16 result intermediate.
 
 `backward` now always returns **nine** entries: the original eight gradients
 followed by the output-gate gradient (`None` when ungated). An optional
-`shared_output_gate_main_grad` FP32 `[1, H]` buffer receives additive gate
-gradients and is returned by reference; it is independent of the six MLP
-`main_grads` buffers. Migrate existing eight-item unpacking accordingly.
+`shared_output_gate_main_grad` BF16 or FP32 `[1, H]` buffer receives additive
+FP32 gate-gradient contributions and is returned by reference. A BF16 buffer
+rounds when each addition is written back; the contribution is not first cast
+to BF16. Without this buffer, the fresh gate gradient remains FP32. The gate
+buffer is independent of the six MLP `main_grads` buffers. Migrate existing
+eight-item unpacking accordingly.
 
 Gated forward supports both BF16 and MXFP8 routed experts. Shared weights,
 activations, and the output-gate tensors remain BF16 in either mode. Forward

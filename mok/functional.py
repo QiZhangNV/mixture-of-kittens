@@ -567,7 +567,9 @@ def _shared_output_gate_wgrad(
     """BF16 inputs -> FP32 contribution, with no BF16 result intermediate.
 
     Used by the manual backward and its local precision tests. The caller
-    validates an optional FP32 accumulation buffer before launching backward.
+    validates an optional BF16/FP32 accumulation buffer before launching
+    backward. BF16 buffers round only when the FP32 contribution is added
+    and written back, not before the addition.
     """
     contribution = torch.mm(d_z.T, x, out_dtype=torch.float32)
     if main_grad is None:
@@ -1190,7 +1192,7 @@ def backward(
                              as routed gate, routed up, routed down. Gate/up may
                              share the same combined-FC1 table.
         shared_output_gate_weight: the optional BF16 [1, H] weight used by forward
-        shared_output_gate_main_grad: optional FP32 [1, H] additive accumulation buffer
+        shared_output_gate_main_grad: optional BF16/FP32 [1, H] additive accumulation buffer
 
     Outputs:
         The six returned weight-gradient entries are fresh gradients when
@@ -1206,7 +1208,8 @@ def backward(
         d_shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
         d_shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
         d_shared_down_weights: bfloat16 [hidden_size, intermediate_size]
-        d_shared_output_gate_weight: float32 [1, H], or None for ungated
+        d_shared_output_gate_weight: fresh float32 [1, H], or an alias of the
+                                    BF16/FP32 accumulation buffer; None for ungated
     """
     validate_inputs(config, workspace, schedule, x, router_weights, grad_output)
     if not isinstance(forward_context, MoKForwardContext):
@@ -1224,12 +1227,12 @@ def backward(
         if gate is None or shared_output is None:
             raise ValueError("gated backward requires saved S/G from the original gated forward context")
         if shared_output_gate_main_grad is not None and (
-            shared_output_gate_main_grad.dtype != torch.float32
+            shared_output_gate_main_grad.dtype not in (torch.bfloat16, torch.float32)
             or shared_output_gate_main_grad.device != x.device
             or tuple(shared_output_gate_main_grad.shape) != (1, x.shape[1])
             or not shared_output_gate_main_grad.is_contiguous()
         ):
-            raise ValueError("shared output gate main-grad must be contiguous FP32 [1, H] on the input device")
+            raise ValueError("shared output gate main-grad must be contiguous BF16/FP32 [1, H] on the input device")
 
     shared_grad_kwargs = {}
     if gate is not None:

@@ -120,7 +120,8 @@ def test_gate_reference_zero_boundaries(context, zero_input):
             assert torch.count_nonzero(ds) == 0
 
 
-def test_gated_moe_reference_preserves_ungated_and_fp32_accum_contract(context):
+@pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
+def test_gated_moe_reference_preserves_ungated_and_accum_contract(context, main_grad_dtype):
     inputs, weight = _dense_inputs(context)
     legacy = run_reference_bf16(*inputs)
     explicit_none = run_reference_bf16(*inputs, shared_output_gate_weight=None)
@@ -133,7 +134,7 @@ def test_gated_moe_reference_preserves_ungated_and_fp32_accum_contract(context):
     assert fresh[-1].dtype == torch.float32
     fresh_snapshot = fresh[-1].clone()
 
-    main_grad = torch.full_like(weight, 0.25, dtype=torch.float32)
+    main_grad = torch.full_like(weight, 0.25, dtype=main_grad_dtype)
     expected = main_grad.clone()
     for _ in range(2):
         actual = run_reference_bf16(
@@ -164,14 +165,16 @@ def test_gated_moe_reference_b_epilogue_order(context):
     torch.testing.assert_close(actual[0], accumulator.to(torch.bfloat16), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("invalid", ["bf16_buffer", "wrong_shape", "missing_weight"])
+@pytest.mark.parametrize("invalid", ["fp16_buffer", "wrong_shape", "noncontiguous", "missing_weight"])
 def test_reference_rejects_invalid_gate_accum_contract(context, invalid):
     inputs, weight = _dense_inputs(context)
     buffer = torch.zeros_like(weight, dtype=torch.float32)
-    if invalid == "bf16_buffer":
-        buffer = buffer.to(torch.bfloat16)
+    if invalid == "fp16_buffer":
+        buffer = buffer.to(torch.float16)
     elif invalid == "wrong_shape":
         buffer = buffer.flatten()
+    elif invalid == "noncontiguous":
+        buffer = torch.zeros(1, 2 * weight.shape[1], device=weight.device)[:, ::2]
     else:
         weight = None
     with pytest.raises(ValueError, match="gate main-grad"):
@@ -204,7 +207,8 @@ def _check_saved_gate(saved, x, weight):
         id="qwen-target",
     ),
 ])
-def test_production_gate_wgrad_fp32_without_bf16_intermediate(context, shape):
+@pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
+def test_production_gate_wgrad_fp32_without_bf16_intermediate(context, shape, main_grad_dtype):
     rank, _, device = context
     rows, hidden = shape
     generator = torch.Generator(device=device).manual_seed(2819 + rank)
@@ -235,7 +239,7 @@ def test_production_gate_wgrad_fp32_without_bf16_intermediate(context, shape):
     assert fresh.dtype == torch.float32
     torch.testing.assert_close(fresh, expected, rtol=0, atol=0)
     fresh_snapshot = fresh.clone()
-    main_grad = torch.full_like(expected, 0.25)
+    main_grad = torch.full_like(expected, 0.25, dtype=main_grad_dtype)
     accumulated = main_grad.clone()
     for _ in range(2):
         returned = functional._shared_output_gate_wgrad(exact_dz, exact_x, main_grad)
@@ -321,12 +325,13 @@ def test_mok_gate_backward_uses_bf16_product_rounding(context):
     assert x.shape[0] == 512
 
 
-@pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("main_grad_dtype", [None, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("macrobatch_size", [4096, 512])
-def test_mok_gated_dense_matches_reference(context, accumulate, macrobatch_size):
+def test_mok_gated_dense_matches_reference(context, main_grad_dtype, macrobatch_size):
     inputs, weight = _dense_inputs(context)
     x, _, probs, *rest = inputs
     weights, dy = rest[:-1], rest[-1]
+    accumulate = main_grad_dtype is not None
     if not accumulate:
         # Even trainable inputs/weights must not retain an inner gate/Z graph.
         x.requires_grad_(True)
@@ -336,10 +341,10 @@ def test_mok_gated_dense_matches_reference(context, accumulate, macrobatch_size)
     gate_main_grad = None
     if accumulate:
         main_grads = tuple(
-            torch.zeros_like(w, dtype=torch.float32)
+            torch.zeros_like(w, dtype=main_grad_dtype)
             for w in (weights[0], weights[3], weights[1], weights[4], weights[2], weights[5])
         )
-        gate_main_grad = torch.full_like(weight, 0.25, dtype=torch.float32)
+        gate_main_grad = torch.full_like(weight, 0.25, dtype=main_grad_dtype)
 
     reference = run_reference_bf16(*inputs, shared_output_gate_weight=weight)
     expected_gate = torch.zeros_like(weight, dtype=torch.float32) if not accumulate else gate_main_grad.clone()
@@ -356,7 +361,7 @@ def test_mok_gated_dense_matches_reference(context, accumulate, macrobatch_size)
             shared_output_gate_main_grad=gate_main_grad,
         )
         assert len(gradients) == 9
-        assert gradients[-1].dtype == torch.float32
+        assert gradients[-1].dtype == (main_grad_dtype or torch.float32)
         expected_gate.add_(reference[-1])
         if accumulate:
             assert gradients[-1] is gate_main_grad
@@ -368,12 +373,18 @@ def test_mok_gated_dense_matches_reference(context, accumulate, macrobatch_size)
             check_correctness(name, golden, actual, BF16_TOLERANCE, print_stats=context[0] == 0)
 
 
-def test_mok_gated_multiple_live_contexts(context):
+@pytest.mark.parametrize("main_grad_dtype", [None, torch.bfloat16])
+def test_mok_gated_multiple_live_contexts(context, main_grad_dtype):
     inputs, weight = _dense_inputs(context)
     second = list(inputs)
     second[0] = inputs[0] * -0.5
     second[-1] = inputs[-1] * 2
     batches = (inputs, tuple(second))
+    gate_main_grad = (
+        torch.full_like(weight, 0.25, dtype=main_grad_dtype)
+        if main_grad_dtype is not None else None
+    )
+    expected_gate = gate_main_grad.clone() if gate_main_grad is not None else None
     pending = []
     for batch in batches:
         x, _, probs, *rest = batch
@@ -396,8 +407,13 @@ def test_mok_gated_multiple_live_contexts(context):
         gradients = functional.backward(
             config, workspace, schedule, saved, dy, x, probs, *weights,
             shared_output_gate_weight=weight,
+            shared_output_gate_main_grad=gate_main_grad,
         )
-        reference = run_reference_bf16(*batch, shared_output_gate_weight=weight)
+        reference = list(run_reference_bf16(*batch, shared_output_gate_weight=weight))
+        if gate_main_grad is not None:
+            expected_gate.add_(reference[-1])
+            reference[-1] = expected_gate
+            assert gradients[-1] is gate_main_grad
         assert len(gradients) == 9
         for name, actual, golden in zip(GATED_RESULT_NAMES, (output, *gradients), reference, strict=True):
             check_correctness(name, golden, actual, BF16_TOLERANCE, print_stats=context[0] == 0)
@@ -420,7 +436,10 @@ def test_mok_gated_forward_rejects_unsupported_inputs(context, invalid):
         )
 
 
-@pytest.mark.parametrize("invalid", ["missing_saved_state", "missing_weight", "bf16_main_grad"])
+@pytest.mark.parametrize("invalid", [
+    "missing_saved_state", "missing_weight", "fp16_main_grad",
+    "main_grad_shape", "main_grad_device", "main_grad_noncontiguous",
+])
 def test_mok_gated_backward_rejects_inconsistent_state(context, invalid):
     inputs, weight = _dense_inputs(context)
     x, _, probs, *rest = inputs
@@ -430,9 +449,18 @@ def test_mok_gated_backward_rejects_inconsistent_state(context, invalid):
         config, workspace, schedule, x, probs, *weights,
         shared_output_gate_weight=None if invalid == "missing_saved_state" else weight,
     )
+    buffer = None
+    if invalid == "fp16_main_grad":
+        buffer = torch.zeros_like(weight, dtype=torch.float16)
+    elif invalid == "main_grad_shape":
+        buffer = torch.zeros_like(weight).flatten()
+    elif invalid == "main_grad_device":
+        buffer = torch.zeros_like(weight, device="cpu")
+    elif invalid == "main_grad_noncontiguous":
+        buffer = torch.zeros(1, 2 * weight.shape[1], device=weight.device)[:, ::2]
     with pytest.raises(ValueError):
         functional.backward(
             config, workspace, schedule, saved, dy, x, probs, *weights,
             shared_output_gate_weight=None if invalid == "missing_weight" else weight,
-            shared_output_gate_main_grad=torch.zeros_like(weight) if invalid == "bf16_main_grad" else None,
+            shared_output_gate_main_grad=buffer,
         )
