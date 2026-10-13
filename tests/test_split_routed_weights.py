@@ -58,14 +58,17 @@ def _quantize_experts(
 
 @pytest.mark.parametrize("precision,gated", [
     ("bf16", False), ("mxfp8", False), ("mxfp8", True),
+    pytest.param("bf16", None, id="bf16-routed-only"),
+    pytest.param("mxfp8", None, id="mxfp8-routed-only"),
 ])
 def test_split_routed_weights_match_dense(
-    context: tuple[int, int, torch.device], precision: str, gated: bool
+    context: tuple[int, int, torch.device], precision: str, gated: bool | None
 ) -> None:
+    has_shared = gated is not None
     rank, world_size, device = context
     num_local_experts = 2
     num_experts = world_size * num_local_experts
-    hidden_dim = 256
+    hidden_dim = 256 if has_shared else 512
     intermediate_dim = 256
     topk = 1
     num_local_tokens = 512
@@ -106,6 +109,8 @@ def test_split_routed_weights_match_dense(
         w_routed_down,
         d_output,
     ) = inputs
+    if not has_shared:
+        w_shared_gate = w_shared_up = w_shared_down = None
     gate_kwargs = {}
     if gated:
         gate_kwargs["shared_output_gate_weight"] = x.new_full((1, hidden_dim), hidden_dim ** -0.5)
@@ -192,11 +197,11 @@ def test_split_routed_weights_match_dense(
     dense_fc1_main_grad = torch.zeros_like(routed_fc1, dtype=torch.float32)
     dense_down_main_grad = torch.zeros_like(w_routed_down, dtype=torch.float32)
     dense_main_grads = (
-        torch.zeros_like(w_shared_gate, dtype=torch.float32),
+        torch.zeros_like(w_shared_gate, dtype=torch.float32) if has_shared else None,
         dense_fc1_main_grad,
-        torch.zeros_like(w_shared_up, dtype=torch.float32),
+        torch.zeros_like(w_shared_up, dtype=torch.float32) if has_shared else None,
         dense_fc1_main_grad,
-        torch.zeros_like(w_shared_down, dtype=torch.float32),
+        torch.zeros_like(w_shared_down, dtype=torch.float32) if has_shared else None,
         dense_down_main_grad,
     )
     dense_output, dense_context = functional.forward(
@@ -244,11 +249,11 @@ def test_split_routed_weights_match_dense(
         split_down_main_grads
     )
     split_main_grads = (
-        torch.zeros_like(w_shared_gate, dtype=torch.float32),
+        torch.zeros_like(w_shared_gate, dtype=torch.float32) if has_shared else None,
         split_fc1_main_grads[0],
-        torch.zeros_like(w_shared_up, dtype=torch.float32),
+        torch.zeros_like(w_shared_up, dtype=torch.float32) if has_shared else None,
         split_fc1_main_grads[0],
-        torch.zeros_like(w_shared_down, dtype=torch.float32),
+        torch.zeros_like(w_shared_down, dtype=torch.float32) if has_shared else None,
         split_down_main_grads[0],
     )
     split_output, split_context = functional.forward(
@@ -323,6 +328,10 @@ def test_split_routed_weights_match_dense(
         ("shared_up", dense_main_grads[2], split_main_grads[2]),
         ("shared_down", dense_main_grads[4], split_main_grads[4]),
     ):
+        if not has_shared:
+            assert dense_grad is split_grad is None
+            assert all(value is None for value in dense_backward[5:] + split_backward[5:])
+            continue
         check_correctness(
             f"split/main_grad_{name}", dense_grad, split_grad, tolerance, rank == 0
         )

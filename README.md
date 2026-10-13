@@ -137,6 +137,16 @@ Because symmetric buffers are expensive to allocate, we recommend creating a sin
 
 To run MoK in MXFP8 mode, pass the activations as-is in BF16 while prequantizing the weights to MXFP8. We *could* quantize the weights inside our kernels, but prequantizing leaves better opportunities for things like FSDP, so we keep it separate and provide the `mxfp8_quantize(...)` function at the ops layer so you can prequantize the weights yourself.
 
+### Routed-only execution
+
+Pass `None` for all three shared weights to `functional.forward` and
+`functional.backward` to run only dispatch, routed experts and combine.
+No shared activation or weight-gradient buffers are allocated. The shared
+output gate must also be absent. The nine backward result slots are unchanged;
+the final four shared/gate entries are `None`. For gradient accumulation, keep
+the six-buffer order and pass `None` in the three shared main-grad slots.
+Dense context recomputation also accepts absent shared gate/up weights.
+
 ### BF16 shared output gate
 
 MoK supports an optional, bias-free BF16 output gate `W_g[1, H]`:
