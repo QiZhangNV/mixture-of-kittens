@@ -495,7 +495,7 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
                 }
                 __syncthreads();
             } else if constexpr (IS_SHARED) {
-                if constexpr (IS_CLAMPED) {
+                if constexpr (IS_CLAMPED || IS_SITU) {
                     rt_bf<config::SWIGLU_Mb / config::NUM_WARPS, config::SWIGLU_Nb> gate, up, d_hidden;
                     compute_group::load(gate, gate_smem[stage]);
                     compute_group::load(up, up_smem[stage]);

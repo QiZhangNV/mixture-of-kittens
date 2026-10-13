@@ -238,7 +238,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
             if constexpr (HAS_SHARED) {
             // Shared Swiglu bwd: d_gate_shared, d_up_shared = swiglu_bwd(d_hidden_shared, gate_shared, up_shared)
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks;
-            swiglu_bwd_kernel<true, IS_CLAMPED>(g.d_hidden_shared, g.gate_shared, g.up_shared, g.d_gate_shared, g.d_up_shared,
+            swiglu_bwd_kernel<true, IS_CLAMPED, IS_SITU>(g.d_hidden_shared, g.gate_shared, g.up_shared, g.d_gate_shared, g.d_up_shared,
                              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr,
                              g.d_hidden_ready, nullptr, g.d_gate_up_ready, nullptr,
@@ -901,10 +901,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     };
 
     if (situ_beta1 > 0.0f) {
-        if constexpr (!HAS_SHARED)
-            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
-        else
-            TORCH_CHECK(false, "MoK: SiTU currently requires routed-only execution");
+        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
     } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else
@@ -1249,10 +1246,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     };
 
     if (situ_beta1 > 0.0f) {
-        if constexpr (!HAS_SHARED)
-            kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
-        else
-            TORCH_CHECK(false, "MoK: SiTU currently requires routed-only execution");
+        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
     } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else

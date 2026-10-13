@@ -51,9 +51,9 @@ static shared_gl<Layout> shared_layout(const at::Tensor &tensor) {
 
 static void validate_situ(std::optional<float> limit, float beta1, float beta2) {
     if (beta1 == 0.0f && beta2 == 0.0f) return;
-    TORCH_CHECK(!HAS_SHARED && !limit.has_value() &&
+    TORCH_CHECK(!limit.has_value() &&
                 std::isfinite(beta1) && std::isfinite(beta2) && beta1 > 0.0f && beta2 > 0.0f,
-                "MoK: SiTU needs positive finite betas, no shared weights and no SwiGLU clamp");
+                "MoK: SiTU needs positive finite betas and no SwiGLU clamp");
 }
 
 #include "types.cuh"

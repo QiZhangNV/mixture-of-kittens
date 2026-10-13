@@ -199,3 +199,60 @@ def test_mok_gated_matches_reference(context, precision, main_grad_dtype):
             for index, (name, actual, golden) in enumerate(zip(GATED_RESULT_NAMES, (output, *gradients), reference, strict=True)):
                 tolerance = MXFP8_TOLERANCE if precision == "mxfp8" and index < 6 else BF16_TOLERANCE
                 check_correctness(name, golden, actual, tolerance, print_stats=context[0] == 0)
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("gated", [False, True])
+def test_situ_fused_shared(context, precision, gated):
+    inputs, weight = _dense_inputs(context)
+    x, _, probs = inputs[:3]
+    weights = inputs[3:9]
+    fwd_weights, bwd_weights = _routed_weight_args(weights[3:], precision)
+    state = _mok_schedule(context, inputs, macrobatch_size=512)  # Force routed replay.
+    gate_kw = dict(shared_output_gate_weight=weight) if gated else {}
+    beta = (2.0, 8.0)  # Non-default values detect a dropped activation parameter.
+
+    def activation(a, u):
+        a, u = a.float(), u.float()
+        return (beta[0] * torch.tanh(a / beta[0]) * torch.sigmoid(a)
+                * beta[1] * torch.tanh(u / beta[1])).bfloat16()
+
+    golden = run_reference_bf16(
+        *inputs, **gate_kw, routed_activation=activation, shared_activation=activation,
+    )
+    for dtype in (None, torch.float32, torch.bfloat16):
+        buffers = None if dtype is None else tuple(
+            torch.zeros_like(weights[i], dtype=dtype) for i in (0, 3, 1, 4, 2, 5)
+        )
+        gate_grad = torch.zeros_like(weight, dtype=dtype) if gated and dtype else None
+        expected = [torch.zeros_like(g, dtype=dtype) for g in golden[3:]] if dtype else None
+        for step in range(2 if dtype else 1):
+            y, ctx = functional.forward(*state, x, probs, *weights[:3], *fwd_weights,
+                                        **gate_kw, situ_beta=beta)
+            if not gated:
+                ctx = functional.recompute_forward_context(
+                    *state, x, *weights[:2], *fwd_weights[:2], situ_beta=beta,
+                )
+            else:
+                torch.testing.assert_close(ctx.shared_output_gate,
+                                           torch.sigmoid(x @ weight.T), rtol=0, atol=0)
+                shared = activation(x @ weights[0].T, x @ weights[1].T) @ weights[2].T
+                check_correctness("shared SiTU", shared, ctx.shared_output, BF16_TOLERANCE)
+            assert ctx.situ_beta == beta
+            grads = functional.backward(
+                *state, ctx, inputs[-1], x, probs, *weights[:3], *bwd_weights,
+                main_grads=buffers, shared_output_gate_main_grad=gate_grad, **gate_kw,
+            )
+            assert len(grads) == 9 and (gated or grads[-1] is None)
+            reference = list(golden)
+            if dtype:
+                returned = tuple(buffers[i] for i in (1, 3, 5, 0, 2, 4))
+                if gated:
+                    returned += (gate_grad,)
+                for actual, buffer, total, contribution in zip(grads[2:], returned, expected, golden[3:]):
+                    assert actual is buffer
+                    total.add_(contribution)
+                reference[3:] = expected
+            for index, (name, actual, target) in enumerate(zip(GATED_RESULT_NAMES, (y, *grads), reference)):
+                tolerance = MXFP8_TOLERANCE if precision == "mxfp8" and index < 6 else BF16_TOLERANCE
+                check_correctness(name, target, actual, tolerance, print_stats=context[0] == 0)

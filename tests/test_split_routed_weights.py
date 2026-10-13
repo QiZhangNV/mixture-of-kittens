@@ -56,13 +56,15 @@ def _quantize_experts(
     return rowwise, rowwise_scale, columnwise, columnwise_scale
 
 
-@pytest.mark.parametrize("precision,gated", [
-    ("bf16", False), ("mxfp8", False), ("mxfp8", True),
-    pytest.param("bf16", None, id="bf16-routed-only"),
-    pytest.param("mxfp8", None, id="mxfp8-routed-only"),
+@pytest.mark.parametrize("precision,gated,situ", [
+    ("bf16", False, False), ("mxfp8", False, False), ("mxfp8", True, False),
+    pytest.param("bf16", None, True, id="bf16-routed-only"),
+    pytest.param("mxfp8", None, True, id="mxfp8-routed-only"),
+    pytest.param("bf16", False, True, id="bf16-situ-shared"),
+    pytest.param("mxfp8", True, True, id="mxfp8-situ-shared-gated"),
 ])
 def test_split_routed_weights_match_dense(
-    context: tuple[int, int, torch.device], precision: str, gated: bool | None
+    context: tuple[int, int, torch.device], precision: str, gated: bool | None, situ: bool
 ) -> None:
     has_shared = gated is not None
     rank, world_size, device = context
@@ -217,7 +219,7 @@ def test_split_routed_weights_match_dense(
         dense_forward_up,
         dense_forward_down,
         **gate_kwargs,
-        routed_situ_beta=(4.0, 25.0) if not has_shared else None,
+        situ_beta=(4.0, 25.0) if situ else None,
     )
     dense_backward = functional.backward(
         config,
@@ -270,7 +272,7 @@ def test_split_routed_weights_match_dense(
         split_fc1,
         split_down,
         **gate_kwargs,
-        routed_situ_beta=(4.0, 25.0) if not has_shared else None,
+        situ_beta=(4.0, 25.0) if situ else None,
     )
     split_backward = functional.backward(
         config,

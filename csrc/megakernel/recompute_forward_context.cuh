@@ -138,7 +138,7 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
             if constexpr (HAS_SHARED) {
             // Shared Swiglu (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks * 2;
-            swiglu_fwd_kernel<true, IS_CLAMPED>(g.gate_shared, g.up_shared, g.hidden_shared, nullptr, nullptr, nullptr,
+            swiglu_fwd_kernel<true, IS_CLAMPED, IS_SITU>(g.gate_shared, g.up_shared, g.hidden_shared, nullptr, nullptr, nullptr,
                              g.gate_up_tile_ready, g.hidden_row_block_ready,
                              swiglu_inputs_arrived, swiglu_bitfield,
                              g.x_shared.rows(), g.swiglu_limit, g.situ_beta, g.macrobatch_size, g.minibatch_size,
@@ -335,10 +335,7 @@ recompute_forward_context_mxfp8(
     };
 
     if (situ_beta1 > 0.0f) {
-        if constexpr (!HAS_SHARED)
-            kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
-        else
-            TORCH_CHECK(false, "MoK: SiTU currently requires routed-only execution");
+        kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
     } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<true>>(g);
     else
@@ -443,10 +440,7 @@ recompute_forward_context_bf16(
     };
 
     if (situ_beta1 > 0.0f) {
-        if constexpr (!HAS_SHARED)
-            kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
-        else
-            TORCH_CHECK(false, "MoK: SiTU currently requires routed-only execution");
+        kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
     } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<true>>(g);
     else

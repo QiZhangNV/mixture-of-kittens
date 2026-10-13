@@ -50,16 +50,16 @@ def test_routed_only_reference_and_accumulation(context, precision, grad_dtype, 
         xx, ddy = (x * -0.5, dy * 2) if step == 1 else (x, dy)
         beta = ((2.0, 8.0) if step == 1 else (4.0, 25.0)) if situ else None
         y, ctx = functional.forward(config, workspace, schedule, xx, probs, None, None, None, *fwd_weights,
-                                    routed_situ_beta=beta)
+                                    situ_beta=beta)
         assert ctx.gate_shared is ctx.up_shared is ctx.hidden_shared is None
         assert ctx.shared_output is ctx.shared_output_gate is None
         if not grad_dtype or (situ and step == 0):
             ctx = functional.recompute_forward_context(
                 config, workspace, schedule, xx, None, None, *fwd_weights[:2],
-                routed_situ_beta=beta,
+                situ_beta=beta,
             )
             assert ctx.gate_shared is ctx.up_shared is ctx.hidden_shared is None
-        assert ctx.routed_situ_beta == beta
+        assert ctx.situ_beta == beta
         grads = functional.backward(
             config, workspace, schedule, ctx, ddy, xx, probs, None, None, None, *bwd_weights,
             main_grads=main_grads,
@@ -88,7 +88,7 @@ def test_routed_only_reference_and_accumulation(context, precision, grad_dtype, 
         # to cover the fresh and BF16-main-grad kernel specializations as well.
         for dtype in (None, torch.bfloat16):
             y, ctx = functional.forward(config, workspace, schedule, x, probs, None, None, None,
-                                        *fwd_weights, routed_situ_beta=(4.0, 25.0))
+                                        *fwd_weights, situ_beta=(4.0, 25.0))
             extra_grads = None if dtype is None else tuple(
                 value for w in weights for value in (None, torch.zeros_like(w, dtype=dtype))
             )
