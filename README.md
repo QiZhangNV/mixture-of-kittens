@@ -322,6 +322,25 @@ forward_context = functional.recompute_forward_context(
 gradients = functional.backward(...)  # same backward call as above
 ```
 
+### Eager fast path
+
+MoK ops are registered with `torch.library.custom_op`, so `torch.compile` sees each one as a single graph node. In plain eager mode, though, every call still goes through the PyTorch dispatcher's Autograd, ADInplaceOrView and backend kernels. On torch 2.13 that costs roughly 40-200 µs of host time per call, and none of it is needed when the inputs are plain tensors with nothing for autograd to record.
+
+The op objects in `mok.ops` are still `CustomOpDef`s, so all `torch.library` APIs accept them. They call their implementation directly when that is equivalent to the dispatcher. The conditions are:
+
+- no `torch.compile` tracing, JIT tracing or functorch transform is in progress;
+- no `TorchDispatchMode` (for example `FakeTensorMode`) or `TorchFunctionMode` is active;
+- no other kernel, autocast rule or vmap rule has been registered for the op;
+- every tensor argument is a non-meta `torch.Tensor` or `torch.nn.Parameter`, and grad mode is off or no tensor argument requires grad;
+- every other argument already has the exact Python type of its schema type. A tuple passed for an `int[]` argument, for example, goes through the dispatcher, which converts it.
+
+Otherwise they dispatch as before. The direct call still increments the version counters of mutated arguments. While a profiler is active it records the same `mok::<op>` event the dispatcher would. It skips only the output aliasing check.
+
+Two environment variables control this, and both are read at import time:
+
+- `MOK_EAGER_FAST_PATH=0` always uses the dispatcher.
+- `MOK_EAGER_FAST_PATH_STATS=1` prints, at exit, how many eager calls of each op took the direct path and why the others did not.
+
 ## Contributing
 
 Contributions are welcome! See [`CONTRIBUTING.md`](CONTRIBUTING.md) for guidelines.
