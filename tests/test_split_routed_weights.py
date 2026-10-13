@@ -217,6 +217,7 @@ def test_split_routed_weights_match_dense(
         dense_forward_up,
         dense_forward_down,
         **gate_kwargs,
+        routed_situ_beta=(4.0, 25.0) if not has_shared else None,
     )
     dense_backward = functional.backward(
         config,
@@ -269,6 +270,7 @@ def test_split_routed_weights_match_dense(
         split_fc1,
         split_down,
         **gate_kwargs,
+        routed_situ_beta=(4.0, 25.0) if not has_shared else None,
     )
     split_backward = functional.backward(
         config,

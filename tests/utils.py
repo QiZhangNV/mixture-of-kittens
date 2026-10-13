@@ -387,11 +387,13 @@ def run_reference_bf16(
     *,
     group: dist.ProcessGroup | None = None,
     shared_output_gate_weight: torch.Tensor | None = None,
+    routed_activation=None,
 ) -> tuple[torch.Tensor, ...]:
     """Return Y and eight gradients, appending FP32 dW_gate when gated.
 
     MLP wgrads remain BF16. Gated forward accumulates S*G and routed outputs
     in FP32; gate backward uses the BF16-product rounding defined above.
+    routed_activation optionally replaces routed SwiGLU with an independent oracle.
     """
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
@@ -430,7 +432,10 @@ def run_reference_bf16(
         expert_x = recv_x[rows]
         gate = expert_x @ w_routed_gate[expert_idx].T
         up = expert_x @ w_routed_up[expert_idx].T
-        hidden_activations = run_swiglu_reference(gate, up, swiglu_limit)
+        hidden_activations = (
+            run_swiglu_reference(gate, up, swiglu_limit)
+            if routed_activation is None else routed_activation(gate, up)
+        )
         recv_output = recv_output.index_copy(0, rows, hidden_activations @ w_routed_down[expert_idx].T)
 
     # Routed token weighted sum

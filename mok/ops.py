@@ -341,6 +341,8 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     w_routed_gate_sc_storage_table: torch.Tensor | None = None,
     w_routed_up_sc_storage_table: torch.Tensor | None = None,
     w_routed_down_sc_storage_table: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -581,6 +583,7 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         w_routed_down_storage_table,
         w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
         w_routed_down_sc_storage_table,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
@@ -608,6 +611,8 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     w_routed_gate_storage_table: torch.Tensor | None = None,
     w_routed_up_storage_table: torch.Tensor | None = None,
     w_routed_down_storage_table: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor | None,
@@ -784,6 +789,7 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
         w_routed_gate_storage_table, w_routed_up_storage_table,
         w_routed_down_storage_table,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
@@ -806,6 +812,8 @@ def recompute_forward_context_mxfp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -934,6 +942,7 @@ def recompute_forward_context_mxfp8(
         w_shared_up, w_routed_up, w_routed_up_sc,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
@@ -954,6 +963,8 @@ def recompute_forward_context_bf16(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor | None,
@@ -1056,6 +1067,7 @@ def recompute_forward_context_bf16(
         w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
@@ -1112,6 +1124,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     minibatch_size: int,
     routed_weights_are_native_columnwise: bool = False,
     shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor | None,
     torch.Tensor,
@@ -1411,6 +1425,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
         routed_weights_are_native_columnwise,
         shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
@@ -1444,6 +1459,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         torch.Tensor,
     ] | None = None,
     shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
     """Runs MXFP8 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
@@ -1492,7 +1509,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         _validate_shared_grad_output(shared_grad_output, args[0])
     if weight_storage_tables is None:
         outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, shared_grad_output=shared_grad_output
+            *args, *main_grads, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
         )
     else:
         if (
@@ -1506,7 +1524,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
             )
         outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
             *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
-            *main_grad_storage_tables, shared_grad_output=shared_grad_output
+            *main_grad_storage_tables, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
         )
     return outputs[:12]
 
@@ -1560,6 +1579,8 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     macrobatch_size: int,
     minibatch_size: int,
     shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor | None,
     torch.Tensor,
@@ -1739,6 +1760,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
         shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
@@ -1763,6 +1785,8 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
         torch.Tensor,
     ] | None = None,
     shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
     """Runs BF16 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
@@ -1805,7 +1829,8 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
         _validate_shared_grad_output(shared_grad_output, args[0])
     if weight_storage_tables is None:
         outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, shared_grad_output=shared_grad_output
+            *args, *main_grads, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
         )
     else:
         if len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3:
@@ -1815,6 +1840,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
         outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
             *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
             shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
         )
     return outputs[:9]
 

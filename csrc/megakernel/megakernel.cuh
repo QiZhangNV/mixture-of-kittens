@@ -9,6 +9,7 @@
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros.h>
+#include <cmath>
 #include <cstring>
 
 using namespace kittens;
@@ -46,6 +47,13 @@ static shared_gl<Layout> shared_layout(const at::Tensor &tensor) {
     else return {tensor.defined() ? reinterpret_cast<bf16 *>(tensor.data_ptr()) : nullptr,
                  nullptr, nullptr, tensor.defined() ? static_cast<size_t>(tensor.size(-2)) : 0,
                  tensor.defined() ? static_cast<size_t>(tensor.size(-1)) : 0};
+}
+
+static void validate_situ(std::optional<float> limit, float beta1, float beta2) {
+    if (beta1 == 0.0f && beta2 == 0.0f) return;
+    TORCH_CHECK(!HAS_SHARED && !limit.has_value() &&
+                std::isfinite(beta1) && std::isfinite(beta2) && beta1 > 0.0f && beta2 > 0.0f,
+                "MoK: SiTU needs positive finite betas, no shared weights and no SwiGLU clamp");
 }
 
 #include "types.cuh"

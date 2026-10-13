@@ -1,4 +1,4 @@
-template <bool IS_CLAMPED>
+template <bool IS_CLAMPED, bool IS_SITU = false>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(const globals_fwd &g) {
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
@@ -187,7 +187,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
             swiglu_fwd_kernel<true, IS_CLAMPED>(g.gate_shared, g.up_shared, g.hidden_shared, nullptr, nullptr, nullptr,
                              g.gate_up_tile_ready, g.hidden_row_block_ready,
                              swiglu_inputs_arrived, swiglu_bitfield,
-                             g.x_shared.rows(), g.swiglu_limit, macrobatch_size, g.minibatch_size,
+                             g.x_shared.rows(), g.swiglu_limit, g.situ_beta, macrobatch_size, g.minibatch_size,
                              0, 0, task_idx, cta_rank, 0, 0, smem_base_addr);
         }
         } else if (HAS_SHARED && compute_cluster_idx < shared_tasks) {
@@ -239,11 +239,11 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
             } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2 + minibatch_routed_swiglu_tasks) {
                 // Routed Swiglu
                 const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
-                swiglu_fwd_kernel<false, IS_CLAMPED>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
+                swiglu_fwd_kernel<false, IS_CLAMPED, IS_SITU>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
                                   &g.hidden_sc_routed, &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
                                   g.gate_up_tile_ready, g.hidden_row_block_ready,
                                   swiglu_inputs_arrived, swiglu_bitfield,
-                                  num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
+                                  num_tokens, g.swiglu_limit, g.situ_beta, macrobatch_size, g.minibatch_size,
                                   macrobatch_idx, minibatch_idx, task_idx, cta_rank,
                                   shared_gate_up_tasks, shared_row_blocks, smem_base_addr);
             } else {
@@ -336,8 +336,11 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
     const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt,
     const std::optional<at::Tensor> &w_routed_gate_sc_storage_table = std::nullopt,
     const std::optional<at::Tensor> &w_routed_up_sc_storage_table = std::nullopt,
-    const std::optional<at::Tensor> &w_routed_down_sc_storage_table = std::nullopt
+    const std::optional<at::Tensor> &w_routed_down_sc_storage_table = std::nullopt,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
     const int hidden_dim = x.size(1);
@@ -469,12 +472,18 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
         .y_routed_done = kittens::py::tensor_to_gl<index_gl>(y_routed_done),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        if constexpr (!HAS_SHARED)
+            kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false, true>>(g);
+        else
+            TORCH_CHECK(false, "MoK: SiTU currently requires routed-only execution");
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false>>(g);
@@ -510,8 +519,11 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
     int minibatch_size,
     const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
     const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
-    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt
+    const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     static_assert(!USE_MXFP8);
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
@@ -611,12 +623,18 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
         .y_routed_done = kittens::py::tensor_to_gl<index_gl>(y_routed_done),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        if constexpr (!HAS_SHARED)
+            kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false, true>>(g);
+        else
+            TORCH_CHECK(false, "MoK: SiTU currently requires routed-only execution");
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false>>(g);

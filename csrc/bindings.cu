@@ -42,7 +42,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("w_routed_down_storage_table") = pybind11::none(),
           pybind11::arg("w_routed_gate_sc_storage_table") = pybind11::none(),
           pybind11::arg("w_routed_up_sc_storage_table") = pybind11::none(),
-          pybind11::arg("w_routed_down_sc_storage_table") = pybind11::none());
+          pybind11::arg("w_routed_down_sc_storage_table") = pybind11::none(),
+          pybind11::arg("situ_beta1") = 0.0f, pybind11::arg("situ_beta2") = 0.0f);
     m.def("dispatch_mlp_swiglu_combine_bwd_mxfp8", &dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint, "",
           pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
@@ -63,7 +64,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
           pybind11::arg("routed_weights_are_native_columnwise"),
-          pybind11::arg("shared_grad_output") = pybind11::none());
+          pybind11::arg("shared_grad_output") = pybind11::none(),
+          pybind11::arg("situ_beta1") = 0.0f, pybind11::arg("situ_beta2") = 0.0f);
     m.def("dispatch_mlp_swiglu_combine_bwd_mxfp8_accum", &dispatch_mlp_swiglu_combine_bwd_mxfp8_accum, "",
           pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
@@ -103,7 +105,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("main_grad_routed_gate_storage_table") = pybind11::none(),
           pybind11::arg("main_grad_routed_up_storage_table") = pybind11::none(),
           pybind11::arg("main_grad_routed_down_storage_table") = pybind11::none(),
-          pybind11::arg("shared_grad_output") = pybind11::none());
+          pybind11::arg("shared_grad_output") = pybind11::none(),
+          pybind11::arg("situ_beta1") = 0.0f, pybind11::arg("situ_beta2") = 0.0f);
     m.def("dispatch_mlp_swiglu_combine_fwd_bf16", &dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
@@ -116,7 +119,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
           pybind11::arg("w_routed_gate_storage_table") = pybind11::none(),
           pybind11::arg("w_routed_up_storage_table") = pybind11::none(),
-          pybind11::arg("w_routed_down_storage_table") = pybind11::none());
+          pybind11::arg("w_routed_down_storage_table") = pybind11::none(),
+          pybind11::arg("situ_beta1") = 0.0f, pybind11::arg("situ_beta2") = 0.0f);
     m.def("dispatch_mlp_swiglu_combine_bwd_bf16", &dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint, "",
           pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
@@ -146,7 +150,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("main_grad_routed_gate_storage_table") = pybind11::none(),
           pybind11::arg("main_grad_routed_up_storage_table") = pybind11::none(),
           pybind11::arg("main_grad_routed_down_storage_table") = pybind11::none(),
-          pybind11::arg("shared_grad_output") = pybind11::none());
+          pybind11::arg("shared_grad_output") = pybind11::none(),
+          pybind11::arg("situ_beta1") = 0.0f, pybind11::arg("situ_beta2") = 0.0f);
     m.def("fwd_epilogue", &utils::fwd_epilogue::fwd_epilogue_entrypoint, "",
           pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"), pybind11::arg("top_experts"),
           pybind11::arg("shared_output_gate") = pybind11::none());
@@ -159,7 +164,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
-          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
+          pybind11::arg("situ_beta1") = 0.0f, pybind11::arg("situ_beta2") = 0.0f);
     m.def("recompute_forward_context_bf16", &recompute_forward_context_bf16_entrypoint, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("w_shared_gate"), pybind11::arg("w_routed_gate"),
@@ -167,5 +173,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("schedule_peer_rank"), pybind11::arg("schedule_peer_token_idx"),
           pybind11::arg("num_tokens"), pybind11::arg("tokens_per_expert"),
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
-          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
+          pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"),
+          pybind11::arg("situ_beta1") = 0.0f, pybind11::arg("situ_beta2") = 0.0f);
 }

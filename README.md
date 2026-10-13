@@ -147,6 +147,14 @@ the final four shared/gate entries are `None`. For gradient accumulation, keep
 the six-buffer order and pass `None` in the three shared main-grad slots.
 Dense context recomputation also accepts absent shared gate/up weights.
 
+Routed-only BF16/MXFP8 also accepts `routed_situ_beta=(4.0, 25.0)` in
+`functional.forward` to select SiTU-GLU instead of SwiGLU. Backward reads the
+betas from its forward context; explicit context recomputation needs the same
+argument. SiTU cannot be combined with `swiglu_limit` or fused shared weights.
+The activation is `beta1*tanh(gate/beta1)*sigmoid(gate) * beta2*tanh(up/beta2)`,
+computed in FP32 and rounded to BF16 before the existing down-projection path
+(including its MXFP8 quantization when enabled).
+
 ### BF16 shared output gate
 
 MoK supports an optional, bias-free BF16 output gate `W_g[1, H]`:
