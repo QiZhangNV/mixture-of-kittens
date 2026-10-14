@@ -45,11 +45,11 @@ class MoKSchedule:
 @dataclass(frozen=True, slots=True)
 class MoKForwardContext:
     x_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    gate_shared: torch.Tensor
+    gate_shared: torch.Tensor | None
     gate_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    up_shared: torch.Tensor
+    up_shared: torch.Tensor | None
     up_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    hidden_shared: torch.Tensor
+    hidden_shared: torch.Tensor | None
     hidden_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     # Per-forward tensors, never workspace/ring-buffer views. Ungated keeps neither.
     shared_output: torch.Tensor | None = None
@@ -576,9 +576,9 @@ def forward(
     schedule: MoKSchedule,
     x: torch.Tensor,
     router_weights: torch.Tensor,
-    shared_gate_weights: torch.Tensor,
-    shared_up_weights: torch.Tensor,
-    shared_down_weights: torch.Tensor,
+    shared_gate_weights: torch.Tensor | None,
+    shared_up_weights: torch.Tensor | None,
+    shared_down_weights: torch.Tensor | None,
     routed_gate_weights: torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
     | SplitRoutedWeight,
@@ -596,6 +596,8 @@ def forward(
     MoKForwardContext,
 ]:
     """Runs the MoE forward pass.
+
+    All three shared weights may be None for routed-only execution.
 
     Routed weights use one of three representations:
       * ``torch.Tensor``: contiguous single-grouped BF16 payload.
@@ -623,6 +625,8 @@ def forward(
         forward_context: MoKForwardContext
     """
     validate_inputs(config, workspace, schedule, x, router_weights)
+    if shared_output_gate_weight is not None and shared_gate_weights is None:
+        raise ValueError("shared output gate requires shared expert weights")
     if shared_output_gate_weight is not None and (
         shared_output_gate_weight.dtype != torch.bfloat16
         or shared_output_gate_weight.device != x.device
@@ -821,8 +825,8 @@ def recompute_forward_context(
     workspace: MoKWorkspace,
     schedule: MoKSchedule,
     x: torch.Tensor,
-    shared_gate_weights: torch.Tensor,
-    shared_up_weights: torch.Tensor,
+    shared_gate_weights: torch.Tensor | None,
+    shared_up_weights: torch.Tensor | None,
     routed_gate_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     swiglu_limit: float | None = None,
@@ -1120,9 +1124,9 @@ def backward(
     grad_output: torch.Tensor,
     x: torch.Tensor,
     router_weights: torch.Tensor,
-    shared_gate_weights: torch.Tensor,
-    shared_up_weights: torch.Tensor,
-    shared_down_weights: torch.Tensor,
+    shared_gate_weights: torch.Tensor | None,
+    shared_up_weights: torch.Tensor | None,
+    shared_down_weights: torch.Tensor | None,
     routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     routed_down_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
@@ -1151,9 +1155,9 @@ def backward(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
     torch.Tensor | None,
 ]:
     """Runs the MoE backward pass.
@@ -1211,6 +1215,8 @@ def backward(
     validate_inputs(config, workspace, schedule, x, router_weights, grad_output)
     if not isinstance(forward_context, MoKForwardContext):
         raise TypeError("forward_context must be a MoKForwardContext")
+    if (forward_context.gate_shared is None) != (shared_gate_weights is None):
+        raise ValueError("shared weight presence must match the forward context")
 
     gate = forward_context.shared_output_gate
     shared_output = forward_context.shared_output

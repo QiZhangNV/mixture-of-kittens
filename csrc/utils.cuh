@@ -34,12 +34,12 @@ struct globals {
     activation_gl output;          // (num_local_tokens, H)
 
     __host__ inline dim3 grid() const {
-        const int col_blocks = (y_shared.cols() + Nb - 1) / Nb;
-        const int token_blocks = y_shared.rows() / TOKENS_PER_CTA;
+        const int col_blocks = (output.cols() + Nb - 1) / Nb;
+        const int token_blocks = output.rows() / TOKENS_PER_CTA;
         return dim3(col_blocks * token_blocks);
     }
     __host__ inline int dynamic_shared_memory() const {
-        return TOKENS_PER_CTA * ((topk_weights.cols() + 1) * sizeof(token_vec) + topk_weights.cols() * (sizeof(float) + sizeof(int))) + 1024;
+        return TOKENS_PER_CTA * ((topk_weights.cols() + (y_shared.raw_ptr != nullptr)) * sizeof(token_vec) + topk_weights.cols() * (sizeof(float) + sizeof(int))) + 1024;
     }
 };
 
@@ -48,7 +48,7 @@ struct gated_globals : globals {
     const bf16 *shared_output_gate;
 };
 
-template <bool GATED>
+template <bool GATED, bool HAS_SHARED = true>
 static __device__ __forceinline__ void fwd_epilogue_kernel_impl(
     const globals &g, const bf16 *shared_output_gate
 ) {
@@ -57,8 +57,8 @@ static __device__ __forceinline__ void fwd_epilogue_kernel_impl(
 
     const int tid = threadIdx.x;
     const int topk = g.topk_weights.cols();
-    const int num_tokens_per_stage = topk + 1;
-    const int col_blocks = (g.y_shared.cols() + globals::Nb - 1) / globals::Nb;
+    const int num_tokens_per_stage = topk + int(HAS_SHARED);
+    const int col_blocks = (g.output.cols() + globals::Nb - 1) / globals::Nb;
     const int col_block_idx = blockIdx.x % col_blocks;
     const int first_token_idx = blockIdx.x / col_blocks * TOKENS_PER_CTA;
 
@@ -84,10 +84,13 @@ static __device__ __forceinline__ void fwd_epilogue_kernel_impl(
     #pragma unroll
     for (int stage = 0; stage < TOKENS_PER_CTA; ++stage) {
         const int token_idx = first_token_idx + stage;
-        if (tid == 0)
-            tma::load_async(token_vecs[stage * num_tokens_per_stage], g.y_shared, {token_idx, col_block_idx}, inputs_arrived[stage]);
-        else if (tid < num_tokens_per_stage)
-            tma::load_async(token_vecs[stage * num_tokens_per_stage + tid], g.combine_buffer, {token_idx * topk + tid - 1, col_block_idx}, inputs_arrived[stage]);
+        if constexpr (HAS_SHARED) {
+            if (tid == 0)
+                tma::load_async(token_vecs[stage * num_tokens_per_stage], g.y_shared, {token_idx, col_block_idx}, inputs_arrived[stage]);
+        }
+        const int route = tid - int(HAS_SHARED);
+        if (route >= 0 && route < topk)
+            tma::load_async(token_vecs[stage * num_tokens_per_stage + tid], g.combine_buffer, {token_idx * topk + route, col_block_idx}, inputs_arrived[stage]);
     }
 
     #pragma unroll
@@ -95,7 +98,8 @@ static __device__ __forceinline__ void fwd_epilogue_kernel_impl(
         globals::token_vec *stage_vecs = token_vecs + stage * num_tokens_per_stage;
         rv_fl<globals::Nb / config::NUM_WARPS> accumulator, term;
         wait(inputs_arrived[stage], 0);
-        compute_group::load(accumulator, stage_vecs[0]);
+        if constexpr (HAS_SHARED) compute_group::load(accumulator, stage_vecs[0]);
+        else compute_group::zero(accumulator);
         if constexpr (GATED) {
             // Multiply the saved BF16 shared output and gate in FP32;
             // keep the accumulator FP32 until the final BF16 store.
@@ -104,7 +108,7 @@ static __device__ __forceinline__ void fwd_epilogue_kernel_impl(
         }
         for (int k = 0; k < topk; ++k) {
             if (top_experts[stage * topk + k] >= 0) {
-                compute_group::load(term, stage_vecs[1 + k]);
+                compute_group::load(term, stage_vecs[int(HAS_SHARED) + k]);
                 compute_group::mul(term, term, weights[stage * topk + k]);
                 compute_group::add(accumulator, accumulator, term);
             }
@@ -124,27 +128,35 @@ static __device__ __forceinline__ void fwd_epilogue_gated_kernel(const gated_glo
     fwd_epilogue_kernel_impl<true>(g, g.shared_output_gate);
 }
 
+static __device__ __forceinline__ void fwd_epilogue_routed_kernel(const globals &g) {
+    fwd_epilogue_kernel_impl<false, false>(g, nullptr);
+}
+
 static __host__ at::Tensor fwd_epilogue_entrypoint(
-    const at::Tensor &y_shared,
+    const std::optional<at::Tensor> &y_shared,
     const at::Tensor &combine_buffer,
     const at::Tensor &topk_weights,
     const at::Tensor &top_experts,
     const std::optional<at::Tensor> &shared_output_gate = std::nullopt
 ) {
     if (shared_output_gate.has_value()) {
+        TORCH_CHECK(y_shared.has_value(), "MoK: output gate requires shared output");
         TORCH_CHECK(shared_output_gate->is_cuda() &&
                     shared_output_gate->scalar_type() == at::kBFloat16 &&
                     shared_output_gate->is_contiguous() &&
-                    shared_output_gate->device() == y_shared.device() &&
+                    shared_output_gate->device() == y_shared->device() &&
                     shared_output_gate->dim() == 2 &&
-                    shared_output_gate->size(0) == y_shared.size(0) &&
+                    shared_output_gate->size(0) == y_shared->size(0) &&
                     shared_output_gate->size(1) == 1,
                     "MoK: shared_output_gate must be contiguous CUDA BF16 [T, 1] on y_shared's device");
     }
-    at::Tensor output = at::empty_like(y_shared);
+    at::Tensor output = at::empty({topk_weights.size(0), combine_buffer.size(1)}, combine_buffer.options());
+    auto routed_layout = kittens::py::tensor_to_gl<globals::activation_gl>(combine_buffer);
+    auto shared_layout = y_shared ? kittens::py::tensor_to_gl<globals::activation_gl>(*y_shared) : routed_layout;
+    if (!y_shared) shared_layout.raw_ptr = nullptr; // Reuse metadata, never load the absent branch.
     globals g {
-        .y_shared = kittens::py::tensor_to_gl<globals::activation_gl>(y_shared),
-        .combine_buffer = kittens::py::tensor_to_gl<globals::activation_gl>(combine_buffer),
+        .y_shared = shared_layout,
+        .combine_buffer = routed_layout,
         .topk_weights = kittens::py::tensor_to_gl<globals::weight_gl>(topk_weights),
         .top_experts = kittens::py::tensor_to_gl<globals::route_gl>(top_experts),
         .output = kittens::py::tensor_to_gl<globals::activation_gl>(output)
@@ -153,6 +165,8 @@ static __host__ at::Tensor fwd_epilogue_entrypoint(
         gated_globals gated_g{g, reinterpret_cast<const bf16 *>(
             shared_output_gate->data_ptr<at::BFloat16>())};
         kittens::py::launch_kernel<config, gated_globals, fwd_epilogue_gated_kernel>(gated_g);
+    } else if (!y_shared) {
+        kittens::py::launch_kernel<config, globals, fwd_epilogue_routed_kernel>(g);
     } else {
         kittens::py::launch_kernel<config, globals, fwd_epilogue_kernel>(g);
     }
@@ -182,19 +196,20 @@ struct globals {
     activation_gl d_x;               // (num_local_tokens, H)
 
     __host__ inline dim3 grid() const {
-        const int col_blocks = (d_x_shared.cols() + Nb - 1) / Nb;
-        return dim3(col_blocks * d_x_shared.rows());
+        const int col_blocks = (d_x.cols() + Nb - 1) / Nb;
+        return dim3(col_blocks * d_x.rows());
     }
-    __host__ inline int dynamic_shared_memory() const { return (d_x_routed_buffer.rows() / d_x_shared.rows() + 1) * sizeof(token_vec) + top_experts.cols() * sizeof(int) + 1024; }
+    __host__ inline int dynamic_shared_memory() const { return (top_experts.cols() + (d_x_shared.raw_ptr != nullptr)) * sizeof(token_vec) + top_experts.cols() * sizeof(int) + 1024; }
 };
 
+template <bool HAS_SHARED = true>
 static __device__ __forceinline__ void bwd_epilogue_kernel(const globals &g) {
     using compute_group = group<config::NUM_WARPS>;
 
     const int tid = threadIdx.x;
-    const int topk = g.d_x_routed_buffer.rows() / g.d_x_shared.rows();
-    const int num_vecs = topk + 1;
-    const int col_blocks = (g.d_x_shared.cols() + globals::Nb - 1) / globals::Nb;
+    const int topk = g.top_experts.cols();
+    const int num_vecs = topk + int(HAS_SHARED);
+    const int col_blocks = (g.d_x.cols() + globals::Nb - 1) / globals::Nb;
     const int token_idx = blockIdx.x / col_blocks;
     const int col_block_idx = blockIdx.x % col_blocks;
 
@@ -211,17 +226,21 @@ static __device__ __forceinline__ void bwd_epilogue_kernel(const globals &g) {
         top_experts[tid] = g.top_experts[{token_idx, tid}];
     __syncthreads();
 
-    if (tid == 0)
-        tma::load_async(token_vecs[0], g.d_x_shared, {token_idx, col_block_idx}, inputs_arrived);
-    else if (tid < num_vecs)
-        tma::load_async(token_vecs[tid], g.d_x_routed_buffer, {token_idx * topk + tid - 1, col_block_idx}, inputs_arrived);
+    if constexpr (HAS_SHARED) {
+        if (tid == 0)
+            tma::load_async(token_vecs[0], g.d_x_shared, {token_idx, col_block_idx}, inputs_arrived);
+    }
+    const int route = tid - int(HAS_SHARED);
+    if (route >= 0 && route < topk)
+        tma::load_async(token_vecs[tid], g.d_x_routed_buffer, {token_idx * topk + route, col_block_idx}, inputs_arrived);
 
     rv_fl<globals::Nb / config::NUM_WARPS> accumulator, term;
     wait(inputs_arrived, 0);
-    compute_group::load(accumulator, token_vecs[0]);
+    if constexpr (HAS_SHARED) compute_group::load(accumulator, token_vecs[0]);
+    else compute_group::zero(accumulator);
     for (int k = 0; k < topk; ++k) {
         if (top_experts[k] >= 0) {
-            compute_group::load(term, token_vecs[1 + k]);
+            compute_group::load(term, token_vecs[int(HAS_SHARED) + k]);
             compute_group::add(accumulator, accumulator, term);
         }
     }
@@ -232,18 +251,22 @@ static __device__ __forceinline__ void bwd_epilogue_kernel(const globals &g) {
 }
 
 static __host__ at::Tensor bwd_epilogue_entrypoint(
-    const at::Tensor &d_x_shared,
+    const std::optional<at::Tensor> &d_x_shared,
     const at::Tensor &d_x_routed_buffer,
     const at::Tensor &top_experts
 ) {
-    at::Tensor d_x = at::empty_like(d_x_shared);
+    at::Tensor d_x = at::empty({top_experts.size(0), d_x_routed_buffer.size(1)}, d_x_routed_buffer.options());
+    auto routed_layout = kittens::py::tensor_to_gl<globals::activation_gl>(d_x_routed_buffer);
+    auto shared_layout = d_x_shared ? kittens::py::tensor_to_gl<globals::activation_gl>(*d_x_shared) : routed_layout;
+    if (!d_x_shared) shared_layout.raw_ptr = nullptr;
     globals g {
-        .d_x_shared = kittens::py::tensor_to_gl<globals::activation_gl>(d_x_shared),
-        .d_x_routed_buffer = kittens::py::tensor_to_gl<globals::activation_gl>(d_x_routed_buffer),
+        .d_x_shared = shared_layout,
+        .d_x_routed_buffer = routed_layout,
         .top_experts = kittens::py::tensor_to_gl<globals::route_gl>(top_experts),
         .d_x = kittens::py::tensor_to_gl<globals::activation_gl>(d_x)
     };
-    kittens::py::launch_kernel<config, globals, bwd_epilogue_kernel>(g);
+    if (d_x_shared) kittens::py::launch_kernel<config, globals, bwd_epilogue_kernel<true>>(g);
+    else kittens::py::launch_kernel<config, globals, bwd_epilogue_kernel<false>>(g);
     return d_x;
 }
 

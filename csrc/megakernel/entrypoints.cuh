@@ -5,6 +5,15 @@
 
 #include "megakernel.cuh"
 
+// Select the shared specialization once on the host, keeping EP dispatch common.
+template <int N, RoutedPrecision P = RoutedPrecision::MXFP8,
+          bool Accumulate = false, bool BF16Grad = false, typename F>
+static auto dispatch_shared(bool has_shared, F &&fn) {
+    if (has_shared)
+        return fn.template operator()<dispatch_mlp_swiglu_combiner<N, P, Accumulate, BF16Grad, true>>();
+    return fn.template operator()<dispatch_mlp_swiglu_combiner<N, P, Accumulate, BF16Grad, false>>();
+}
+
 // Descriptor layouts are independent of NUM_DEVICES; EP4 is only a
 // convenient template instantiation for these host-side builders.
 static __host__ at::Tensor make_routed_weight_storage_table_mxfp8(
@@ -57,13 +66,13 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
     const std::vector<int64_t> &combine_buffer_ptrs,
 
     // Weights
-    const at::Tensor &w_shared_gate,
+    const std::optional<at::Tensor> &w_shared_gate_optional,
     const at::Tensor &w_routed_gate,
     const at::Tensor &w_routed_gate_sc,
-    const at::Tensor &w_shared_up,
+    const std::optional<at::Tensor> &w_shared_up_optional,
     const at::Tensor &w_routed_up,
     const at::Tensor &w_routed_up_sc,
-    const at::Tensor &w_shared_down,
+    const std::optional<at::Tensor> &w_shared_down_optional,
     const at::Tensor &w_routed_down,
     const at::Tensor &w_routed_down_sc,
 
@@ -86,11 +95,18 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
     const std::optional<at::Tensor> &w_routed_up_sc_storage_table = std::nullopt,
     const std::optional<at::Tensor> &w_routed_down_sc_storage_table = std::nullopt
 ) {
+    const at::Tensor w_shared_gate = w_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_up = w_shared_up_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_down = w_shared_down_optional.value_or(at::Tensor{});
+    TORCH_CHECK(w_shared_gate.defined() == w_shared_up.defined() &&
+                w_shared_gate.defined() == w_shared_down.defined(),
+                "MoK: shared weights must be all present or all absent");
     const int num_devices = static_cast<int>(x_ptrs.size());
 
     switch (num_devices) {
         case 1:
-            return dispatch_mlp_swiglu_combiner<1>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
+            return dispatch_shared<1>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
@@ -101,8 +117,10 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_routed_down_storage_table,
                 w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
                 w_routed_down_sc_storage_table);
+            });
         case 4:
-            return dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
+            return dispatch_shared<4>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
@@ -113,8 +131,10 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_routed_down_storage_table,
                 w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
                 w_routed_down_sc_storage_table);
+            });
         case 8:
-            return dispatch_mlp_swiglu_combiner<8>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
+            return dispatch_shared<8>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
@@ -125,8 +145,10 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_routed_down_storage_table,
                 w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
                 w_routed_down_sc_storage_table);
+            });
         case 16:
-            return dispatch_mlp_swiglu_combiner<16>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
+            return dispatch_shared<16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
@@ -137,8 +159,10 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_routed_down_storage_table,
                 w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
                 w_routed_down_sc_storage_table);
+            });
         case 32:
-            return dispatch_mlp_swiglu_combiner<32>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
+            return dispatch_shared<32>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
@@ -149,8 +173,10 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_routed_down_storage_table,
                 w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
                 w_routed_down_sc_storage_table);
+            });
         case 64:
-            return dispatch_mlp_swiglu_combiner<64>::dispatch_mlp_swiglu_combine_fwd_mxfp8(
+            return dispatch_shared<64>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_mxfp8(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
@@ -161,6 +187,7 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8_entrypoint(
                 w_routed_down_storage_table,
                 w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
                 w_routed_down_sc_storage_table);
+            });
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_fwd_mxfp8 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
@@ -174,11 +201,11 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
     const std::vector<int64_t> &x_ptrs,
     const at::Tensor &combine_buffer,
     const std::vector<int64_t> &combine_buffer_ptrs,
-    const at::Tensor &w_shared_gate,
+    const std::optional<at::Tensor> &w_shared_gate_optional,
     const at::Tensor &w_routed_gate,
-    const at::Tensor &w_shared_up,
+    const std::optional<at::Tensor> &w_shared_up_optional,
     const at::Tensor &w_routed_up,
-    const at::Tensor &w_shared_down,
+    const std::optional<at::Tensor> &w_shared_down_optional,
     const at::Tensor &w_routed_down,
     const at::Tensor &schedule_peer_rank,
     const at::Tensor &schedule_peer_token_idx,
@@ -193,56 +220,74 @@ dispatch_mlp_swiglu_combine_fwd_bf16_entrypoint(
     const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
     const std::optional<at::Tensor> &w_routed_down_storage_table = std::nullopt
 ) {
+    const at::Tensor w_shared_gate = w_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_up = w_shared_up_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_down = w_shared_down_optional.value_or(at::Tensor{});
+    TORCH_CHECK(w_shared_gate.defined() == w_shared_up.defined() &&
+                w_shared_gate.defined() == w_shared_down.defined(),
+                "MoK: shared weights must be all present or all absent");
     const int num_devices = static_cast<int>(x_ptrs.size());
     switch (num_devices) {
         case 1:
-            return dispatch_mlp_swiglu_combiner<1, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
+            return dispatch_shared<1, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
                 w_routed_gate_storage_table, w_routed_up_storage_table,
                 w_routed_down_storage_table);
+            });
         case 4:
-            return dispatch_mlp_swiglu_combiner<4, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
+            return dispatch_shared<4, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
                 w_routed_gate_storage_table, w_routed_up_storage_table,
                 w_routed_down_storage_table);
+            });
         case 8:
-            return dispatch_mlp_swiglu_combiner<8, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
+            return dispatch_shared<8, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
                 w_routed_gate_storage_table, w_routed_up_storage_table,
                 w_routed_down_storage_table);
+            });
         case 16:
-            return dispatch_mlp_swiglu_combiner<16, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
+            return dispatch_shared<16, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
                 w_routed_gate_storage_table, w_routed_up_storage_table,
                 w_routed_down_storage_table);
+            });
         case 32:
-            return dispatch_mlp_swiglu_combiner<32, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
+            return dispatch_shared<32, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
                 w_routed_gate_storage_table, w_routed_up_storage_table,
                 w_routed_down_storage_table);
+            });
         case 64:
-            return dispatch_mlp_swiglu_combiner<64, RoutedPrecision::BF16>::dispatch_mlp_swiglu_combine_fwd_bf16(
+            return dispatch_shared<64, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_fwd_bf16(
                 x, x_ptrs, combine_buffer, combine_buffer_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
                 w_routed_gate_storage_table, w_routed_up_storage_table,
                 w_routed_down_storage_table);
+            });
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_fwd_bf16 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
@@ -264,26 +309,26 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
     const std::vector<int64_t> &d_router_weight_buffer_ptrs,
 
     // Weights (routed transposes pre-quantized to MXFP8)
-    const at::Tensor &w_shared_gate,
+    const std::optional<at::Tensor> &w_shared_gate_optional,
     const at::Tensor &w_routed_gate_T,
     const at::Tensor &w_routed_gate_T_sc,
-    const at::Tensor &w_shared_up,
+    const std::optional<at::Tensor> &w_shared_up_optional,
     const at::Tensor &w_routed_up_T,
     const at::Tensor &w_routed_up_T_sc,
-    const at::Tensor &w_shared_down,
+    const std::optional<at::Tensor> &w_shared_down_optional,
     const at::Tensor &w_routed_down_T,
     const at::Tensor &w_routed_down_T_sc,
 
     // Activations saved from the forward
     const at::Tensor &x_fp8_t_routed,
     const at::Tensor &x_sc_t_routed,
-    const at::Tensor &gate_shared,
+    const std::optional<at::Tensor> &gate_shared_optional,
     const at::Tensor &gate_fp8_routed,
     const at::Tensor &gate_sc_routed,
-    const at::Tensor &up_shared,
+    const std::optional<at::Tensor> &up_shared_optional,
     const at::Tensor &up_fp8_routed,
     const at::Tensor &up_sc_routed,
-    const at::Tensor &hidden_shared,
+    const std::optional<at::Tensor> &hidden_shared_optional,
     const at::Tensor &hidden_fp8_t_routed,
     const at::Tensor &hidden_sc_t_routed,
 
@@ -310,11 +355,21 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
     bool routed_weights_are_native_columnwise,
     const std::optional<at::Tensor> &shared_grad_output = std::nullopt
 ) {
+    const at::Tensor w_shared_gate = w_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_up = w_shared_up_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_down = w_shared_down_optional.value_or(at::Tensor{});
+    const at::Tensor gate_shared = gate_shared_optional.value_or(at::Tensor{});
+    const at::Tensor up_shared = up_shared_optional.value_or(at::Tensor{});
+    const at::Tensor hidden_shared = hidden_shared_optional.value_or(at::Tensor{});
+    TORCH_CHECK(w_shared_gate.defined() == w_shared_up.defined() &&
+                w_shared_gate.defined() == w_shared_down.defined(),
+                "MoK: shared weights must be all present or all absent");
     const int num_devices = static_cast<int>(x_ptrs.size());
 
     switch (num_devices) {
         case 1:
-            return dispatch_mlp_swiglu_combiner<1>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+            return dispatch_shared<1>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                 w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
@@ -333,8 +388,10 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, shared_grad_output);
+            });
         case 4:
-            return dispatch_mlp_swiglu_combiner<4>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+            return dispatch_shared<4>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                 w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
@@ -353,8 +410,10 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, shared_grad_output);
+            });
         case 8:
-            return dispatch_mlp_swiglu_combiner<8>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+            return dispatch_shared<8>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                 w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
@@ -373,8 +432,10 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, shared_grad_output);
+            });
         case 16:
-            return dispatch_mlp_swiglu_combiner<16>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+            return dispatch_shared<16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                 w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
@@ -393,8 +454,10 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, shared_grad_output);
+            });
         case 32:
-            return dispatch_mlp_swiglu_combiner<32>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+            return dispatch_shared<32>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                 w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
@@ -413,8 +476,10 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, shared_grad_output);
+            });
         case 64:
-            return dispatch_mlp_swiglu_combiner<64>::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+            return dispatch_shared<64>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                 w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
@@ -433,6 +498,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_entrypoint(
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                 std::nullopt, std::nullopt, std::nullopt, shared_grad_output);
+            });
         default:
             throw std::runtime_error("MoK: dispatch_mlp_swiglu_combine_bwd_mxfp8 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
@@ -451,24 +517,24 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     const std::vector<int64_t> &router_weight_buffer_ptrs,
     const at::Tensor &d_router_weight_buffer,
     const std::vector<int64_t> &d_router_weight_buffer_ptrs,
-    const at::Tensor &w_shared_gate,
+    const std::optional<at::Tensor> &w_shared_gate_optional,
     const at::Tensor &w_routed_gate_T,
     const at::Tensor &w_routed_gate_T_sc,
-    const at::Tensor &w_shared_up,
+    const std::optional<at::Tensor> &w_shared_up_optional,
     const at::Tensor &w_routed_up_T,
     const at::Tensor &w_routed_up_T_sc,
-    const at::Tensor &w_shared_down,
+    const std::optional<at::Tensor> &w_shared_down_optional,
     const at::Tensor &w_routed_down_T,
     const at::Tensor &w_routed_down_T_sc,
     const at::Tensor &x_fp8_t_routed,
     const at::Tensor &x_sc_t_routed,
-    const at::Tensor &gate_shared,
+    const std::optional<at::Tensor> &gate_shared_optional,
     const at::Tensor &gate_fp8_routed,
     const at::Tensor &gate_sc_routed,
-    const at::Tensor &up_shared,
+    const std::optional<at::Tensor> &up_shared_optional,
     const at::Tensor &up_fp8_routed,
     const at::Tensor &up_sc_routed,
-    const at::Tensor &hidden_shared,
+    const std::optional<at::Tensor> &hidden_shared_optional,
     const at::Tensor &hidden_fp8_t_routed,
     const at::Tensor &hidden_sc_t_routed,
     const at::Tensor &x,
@@ -487,11 +553,11 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     int macrobatch_size,
     int minibatch_size,
     bool routed_weights_are_native_columnwise,
-    const at::Tensor &main_grad_shared_gate,
+    const std::optional<at::Tensor> &main_grad_shared_gate_optional,
     const at::Tensor &main_grad_routed_gate,
-    const at::Tensor &main_grad_shared_up,
+    const std::optional<at::Tensor> &main_grad_shared_up_optional,
     const at::Tensor &main_grad_routed_up,
-    const at::Tensor &main_grad_shared_down,
+    const std::optional<at::Tensor> &main_grad_shared_down_optional,
     const at::Tensor &main_grad_routed_down,
     const std::optional<at::Tensor> &w_routed_gate_storage_table = std::nullopt,
     const std::optional<at::Tensor> &w_routed_up_storage_table = std::nullopt,
@@ -508,11 +574,22 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt,
     const std::optional<at::Tensor> &shared_grad_output = std::nullopt
 ) {
+    const at::Tensor w_shared_gate = w_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_up = w_shared_up_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_down = w_shared_down_optional.value_or(at::Tensor{});
+    const at::Tensor gate_shared = gate_shared_optional.value_or(at::Tensor{});
+    const at::Tensor up_shared = up_shared_optional.value_or(at::Tensor{});
+    const at::Tensor hidden_shared = hidden_shared_optional.value_or(at::Tensor{});
+    const at::Tensor main_grad_shared_gate = main_grad_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor main_grad_shared_up = main_grad_shared_up_optional.value_or(at::Tensor{});
+    const at::Tensor main_grad_shared_down = main_grad_shared_down_optional.value_or(at::Tensor{});
+    TORCH_CHECK(w_shared_gate.defined() == w_shared_up.defined() &&
+                w_shared_gate.defined() == w_shared_down.defined(),
+                "MoK: shared weights must be all present or all absent");
     auto dispatch_for_ep = [&]<int EP_SIZE>() {
         auto dispatch_for_main_grad = [&]<bool USE_BF16_MAIN_GRAD>() {
-            return dispatch_mlp_swiglu_combiner<
-                EP_SIZE, RoutedPrecision::MXFP8, true, USE_BF16_MAIN_GRAD
-            >::dispatch_mlp_swiglu_combine_bwd_mxfp8(
+            return dispatch_shared<EP_SIZE, RoutedPrecision::MXFP8, true, USE_BF16_MAIN_GRAD>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::dispatch_mlp_swiglu_combine_bwd_mxfp8(
                 d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                 router_weight_buffer, router_weight_buffer_ptrs,
                 d_router_weight_buffer, d_router_weight_buffer_ptrs,
@@ -540,8 +617,9 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
                 main_grad_routed_gate_storage_table,
                 main_grad_routed_up_storage_table,
                 main_grad_routed_down_storage_table, shared_grad_output);
+            });
         };
-        const at::ScalarType main_grad_dtype = main_grad_shared_gate.scalar_type();
+        const at::ScalarType main_grad_dtype = main_grad_routed_gate.scalar_type();
         TORCH_CHECK(main_grad_dtype == at::kFloat || main_grad_dtype == at::kBFloat16,
                     "MoK: main_grad tensors must have dtype float32 or bfloat16");
         if (main_grad_dtype == at::kBFloat16)
@@ -574,18 +652,18 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
     const std::vector<int64_t> &router_weight_buffer_ptrs,
     const at::Tensor &d_router_weight_buffer,
     const std::vector<int64_t> &d_router_weight_buffer_ptrs,
-    const at::Tensor &w_shared_gate,
+    const std::optional<at::Tensor> &w_shared_gate_optional,
     const at::Tensor &w_routed_gate,
-    const at::Tensor &w_shared_up,
+    const std::optional<at::Tensor> &w_shared_up_optional,
     const at::Tensor &w_routed_up,
-    const at::Tensor &w_shared_down,
+    const std::optional<at::Tensor> &w_shared_down_optional,
     const at::Tensor &w_routed_down,
     const at::Tensor &x_routed,
-    const at::Tensor &gate_shared,
+    const std::optional<at::Tensor> &gate_shared_optional,
     const at::Tensor &gate_routed,
-    const at::Tensor &up_shared,
+    const std::optional<at::Tensor> &up_shared_optional,
     const at::Tensor &up_routed,
-    const at::Tensor &hidden_shared,
+    const std::optional<at::Tensor> &hidden_shared_optional,
     const at::Tensor &hidden_routed,
     const at::Tensor &x,
     const std::vector<int64_t> &x_ptrs,
@@ -612,43 +690,52 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
     const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt,
     const std::optional<at::Tensor> &shared_grad_output = std::nullopt
 ) {
-    const bool accumulate_wgrad = main_grad_shared_gate.has_value();
-    TORCH_CHECK(main_grad_routed_gate.has_value() == accumulate_wgrad &&
-                main_grad_shared_up.has_value() == accumulate_wgrad &&
+    const at::Tensor w_shared_gate = w_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_up = w_shared_up_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_down = w_shared_down_optional.value_or(at::Tensor{});
+    const at::Tensor gate_shared = gate_shared_optional.value_or(at::Tensor{});
+    const at::Tensor up_shared = up_shared_optional.value_or(at::Tensor{});
+    const at::Tensor hidden_shared = hidden_shared_optional.value_or(at::Tensor{});
+    TORCH_CHECK(w_shared_gate.defined() == w_shared_up.defined() &&
+                w_shared_gate.defined() == w_shared_down.defined(),
+                "MoK: shared weights must be all present or all absent");
+    const bool accumulate_wgrad = main_grad_routed_gate.has_value();
+    const bool accumulate_shared = accumulate_wgrad && w_shared_gate.defined();
+    TORCH_CHECK(main_grad_shared_gate.has_value() == accumulate_shared &&
+                main_grad_shared_up.has_value() == accumulate_shared &&
                 main_grad_routed_up.has_value() == accumulate_wgrad &&
-                main_grad_shared_down.has_value() == accumulate_wgrad &&
+                main_grad_shared_down.has_value() == accumulate_shared &&
                 main_grad_routed_down.has_value() == accumulate_wgrad,
                 "MoK: main_grad tensors must be provided all together");
     auto dispatch_for_ep = [&]<int EP_SIZE>() {
         if (accumulate_wgrad) {
             auto dispatch_for_main_grad = [&]<bool USE_BF16_MAIN_GRAD>() {
-                return dispatch_mlp_swiglu_combiner<
-                    EP_SIZE, RoutedPrecision::BF16, true, USE_BF16_MAIN_GRAD
-                >::dispatch_mlp_swiglu_combine_bwd_bf16(
+                return dispatch_shared<EP_SIZE, RoutedPrecision::BF16, true, USE_BF16_MAIN_GRAD>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                    return Kernel::dispatch_mlp_swiglu_combine_bwd_bf16(
                     d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
                     router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
                     w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
                     x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, x, x_ptrs,
                     schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                     topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
-                    &*main_grad_shared_gate, &*main_grad_routed_gate, &*main_grad_shared_up,
-                    &*main_grad_routed_up, &*main_grad_shared_down, &*main_grad_routed_down,
+                    (main_grad_shared_gate ? &*main_grad_shared_gate : nullptr), &*main_grad_routed_gate, (main_grad_shared_up ? &*main_grad_shared_up : nullptr),
+                    &*main_grad_routed_up, (main_grad_shared_down ? &*main_grad_shared_down : nullptr), &*main_grad_routed_down,
                     w_routed_gate_storage_table, w_routed_up_storage_table,
                     w_routed_down_storage_table,
                     main_grad_routed_gate_storage_table,
                     main_grad_routed_up_storage_table,
                     main_grad_routed_down_storage_table, shared_grad_output);
+                });
             };
-            const at::ScalarType main_grad_dtype = main_grad_shared_gate->scalar_type();
+            const at::ScalarType main_grad_dtype = main_grad_routed_gate->scalar_type();
             TORCH_CHECK(main_grad_dtype == at::kFloat || main_grad_dtype == at::kBFloat16,
                         "MoK: main_grad tensors must have dtype float32 or bfloat16");
             if (main_grad_dtype == at::kBFloat16)
                 return dispatch_for_main_grad.template operator()<true>();
             return dispatch_for_main_grad.template operator()<false>();
         }
-        return dispatch_mlp_swiglu_combiner<
-            EP_SIZE, RoutedPrecision::BF16
-        >::dispatch_mlp_swiglu_combine_bwd_bf16(
+        return dispatch_shared<EP_SIZE, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+            return Kernel::dispatch_mlp_swiglu_combine_bwd_bf16(
             d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
             router_weight_buffer, router_weight_buffer_ptrs, d_router_weight_buffer, d_router_weight_buffer_ptrs,
             w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down,
@@ -661,6 +748,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint(
             main_grad_routed_gate_storage_table,
             main_grad_routed_up_storage_table,
             main_grad_routed_down_storage_table, shared_grad_output);
+        });
     };
     switch (x_ptrs.size()) {
         case 1: return dispatch_for_ep.template operator()<1>();
@@ -682,10 +770,10 @@ recompute_forward_context_mxfp8_entrypoint(
     const std::vector<int64_t> &x_ptrs,
 
     // Weights
-    const at::Tensor &w_shared_gate,
+    const std::optional<at::Tensor> &w_shared_gate_optional,
     const at::Tensor &w_routed_gate,
     const at::Tensor &w_routed_gate_sc,
-    const at::Tensor &w_shared_up,
+    const std::optional<at::Tensor> &w_shared_up_optional,
     const at::Tensor &w_routed_up,
     const at::Tensor &w_routed_up_sc,
 
@@ -702,51 +790,67 @@ recompute_forward_context_mxfp8_entrypoint(
     int macrobatch_size,
     int minibatch_size
 ) {
+    const at::Tensor w_shared_gate = w_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_up = w_shared_up_optional.value_or(at::Tensor{});
+    TORCH_CHECK(w_shared_gate.defined() == w_shared_up.defined(),
+                "MoK: shared weights must be all present or all absent");
     const int num_devices = static_cast<int>(x_ptrs.size());
 
     switch (num_devices) {
         case 1:
-            return dispatch_mlp_swiglu_combiner<1>::recompute_forward_context_mxfp8(
+            return dispatch_shared<1>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_mxfp8(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 4:
-            return dispatch_mlp_swiglu_combiner<4>::recompute_forward_context_mxfp8(
+            return dispatch_shared<4>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_mxfp8(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 8:
-            return dispatch_mlp_swiglu_combiner<8>::recompute_forward_context_mxfp8(
+            return dispatch_shared<8>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_mxfp8(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 16:
-            return dispatch_mlp_swiglu_combiner<16>::recompute_forward_context_mxfp8(
+            return dispatch_shared<16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_mxfp8(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 32:
-            return dispatch_mlp_swiglu_combiner<32>::recompute_forward_context_mxfp8(
+            return dispatch_shared<32>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_mxfp8(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 64:
-            return dispatch_mlp_swiglu_combiner<64>::recompute_forward_context_mxfp8(
+            return dispatch_shared<64>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_mxfp8(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_routed_gate_sc,
                 w_shared_up, w_routed_up, w_routed_up_sc,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         default:
             throw std::runtime_error("MoK: recompute_forward_context_mxfp8 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");
@@ -761,9 +865,9 @@ recompute_forward_context_bf16_entrypoint(
     const std::vector<int64_t> &x_ptrs,
 
     // Weights
-    const at::Tensor &w_shared_gate,
+    const std::optional<at::Tensor> &w_shared_gate_optional,
     const at::Tensor &w_routed_gate,
-    const at::Tensor &w_shared_up,
+    const std::optional<at::Tensor> &w_shared_up_optional,
     const at::Tensor &w_routed_up,
 
     // Dispatch schedule
@@ -779,45 +883,61 @@ recompute_forward_context_bf16_entrypoint(
     int macrobatch_size,
     int minibatch_size
 ) {
+    const at::Tensor w_shared_gate = w_shared_gate_optional.value_or(at::Tensor{});
+    const at::Tensor w_shared_up = w_shared_up_optional.value_or(at::Tensor{});
+    TORCH_CHECK(w_shared_gate.defined() == w_shared_up.defined(),
+                "MoK: shared weights must be all present or all absent");
     const int num_devices = static_cast<int>(x_ptrs.size());
 
     switch (num_devices) {
         case 1:
-            return dispatch_mlp_swiglu_combiner<1, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+            return dispatch_shared<1, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_bf16(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 4:
-            return dispatch_mlp_swiglu_combiner<4, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+            return dispatch_shared<4, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_bf16(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 8:
-            return dispatch_mlp_swiglu_combiner<8, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+            return dispatch_shared<8, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_bf16(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 16:
-            return dispatch_mlp_swiglu_combiner<16, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+            return dispatch_shared<16, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_bf16(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 32:
-            return dispatch_mlp_swiglu_combiner<32, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+            return dispatch_shared<32, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_bf16(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         case 64:
-            return dispatch_mlp_swiglu_combiner<64, RoutedPrecision::BF16>::recompute_forward_context_bf16(
+            return dispatch_shared<64, RoutedPrecision::BF16>(w_shared_gate.defined(), [&]<typename Kernel>() {
+                return Kernel::recompute_forward_context_bf16(
                 x, x_ptrs,
                 w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
                 schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
                 topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size);
+            });
         default:
             throw std::runtime_error("MoK: recompute_forward_context_bf16 unsupported num_devices=" +
                                      std::to_string(num_devices) + " (supported: 1, 4, 8, 16, 32, 64)");

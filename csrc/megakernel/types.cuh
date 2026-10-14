@@ -347,37 +347,37 @@ static __host__ inline routed_scale_view make_routed_scale_view(
 }
 
 struct globals_fwd {
-    mlp_bf16_gl x_shared;                     // (num_local_tokens, H) gate/up GEMM A
+    shared_gl<mlp_bf16_gl> x_shared;                     // (num_local_tokens, H) gate/up GEMM A
     routed_activation_gl x_fp8_routed;        // (macrobatch_size, H) gate/up GEMM A + dispatch out
     routed_sc_gl x_sc_routed;                 // MXFP8 only: (macrobatch_size / 128, H / 128, 32, 16)
     routed_transposed_gl x_fp8_t_routed;      // MXFP8 only: (H, macrobatch_size) dispatch out
     routed_sc_gl x_sc_t_routed;               // MXFP8 only: (H / 128, macrobatch_size / 128, 32, 16)
-    epi_bf16_gl gate_shared;                  // (num_local_tokens, I) gate GEMM D + swiglu in
+    shared_gl<epi_bf16_gl> gate_shared;                  // (num_local_tokens, I) gate GEMM D + swiglu in
     epi_bf16_gl gate_routed;                  // (macrobatch_size, I) gate GEMM D + swiglu in
     routed_gate_up_gl gate_fp8_routed;        // (macrobatch_size, I) routed gate saved for backward
     routed_sc_gl gate_sc_routed;              // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
-    epi_bf16_gl up_shared;                    // (num_local_tokens, I) up GEMM D + swiglu in
+    shared_gl<epi_bf16_gl> up_shared;                    // (num_local_tokens, I) up GEMM D + swiglu in
     epi_bf16_gl up_routed;                    // (macrobatch_size, I) up GEMM D + swiglu in
     routed_gate_up_gl up_fp8_routed;          // (macrobatch_size, I) routed up saved for backward
     routed_sc_gl up_sc_routed;                // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
-    mlp_bf16_gl hidden_shared;                // (num_local_tokens, I) swiglu out + down GEMM A
+    shared_gl<mlp_bf16_gl> hidden_shared;                // (num_local_tokens, I) swiglu out + down GEMM A
     routed_activation_gl hidden_fp8_routed;   // (macrobatch_size, I) swiglu out + down GEMM A
     routed_sc_gl hidden_sc_routed;            // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
     routed_transposed_gl hidden_fp8_t_routed; // MXFP8 only: (I, macrobatch_size) swiglu out
     routed_sc_gl hidden_sc_t_routed;          // MXFP8 only: (I / 128, macrobatch_size / 128, 32, 16)
-    epi_bf16_gl y_shared;                     // (num_local_tokens, H) down GEMM D
+    shared_gl<epi_bf16_gl> y_shared;                     // (num_local_tokens, H) down GEMM D
     epi_bf16_gl y_routed;                     // (macrobatch_size, H) down GEMM D + combine
 
     activation_bf16_pgl x_routed_send_buffer; // (num_local_tokens, H)
     activation_bf16_pgl y_routed_recv_buffer; // (num_local_tokens * topk, H)
 
-    weight_bf16_gl w_shared_gate;             // (I, H)
+    shared_gl<weight_bf16_gl> w_shared_gate;             // (I, H)
     routed_weight_gl w_routed_gate;           // (num_local_experts, I, H)
     routed_weight_sc_gl w_routed_gate_sc;     // MXFP8 only: logical gate view
-    weight_bf16_gl w_shared_up;               // (I, H)
+    shared_gl<weight_bf16_gl> w_shared_up;               // (I, H)
     routed_weight_gl w_routed_up;             // (num_local_experts, I, H)
     routed_weight_sc_gl w_routed_up_sc;       // MXFP8 only: logical up view
-    weight_bf16_gl w_shared_down;             // (H, I)
+    shared_gl<weight_bf16_gl> w_shared_down;             // (H, I)
     routed_weight_gl w_routed_down;           // (num_local_experts, H, I)
     routed_weight_sc_gl w_routed_down_sc;     // MXFP8 only: logical down view
 
@@ -400,11 +400,11 @@ struct globals_fwd {
 
     __host__ inline dim3 grid() const {
         const int num_minibatches = (schedule_peer_rank.cols() + minibatch_size - 1) / minibatch_size; // across all macrobatches
-        const int shared_row_blocks = x_shared.rows() / config::MLP_Mb;
+        const int shared_row_blocks = HAS_SHARED ? (x_shared.rows() / config::MLP_Mb) : 0;
         const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
         const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
         const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
-        const int shared_swiglu_tiles = (hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb);
+        const int shared_swiglu_tiles = HAS_SHARED ? ((hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
         const int minibatch_routed_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
         const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
         const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
@@ -418,44 +418,44 @@ struct globals_fwd {
 
 struct globals_bwd {
     // Saved/replayed forward activations
-    wgrad_bf16_gl x_shared;                               // (num_local_tokens, H) wgrad gate/up B
+    shared_gl<wgrad_bf16_gl> x_shared;                               // (num_local_tokens, H) wgrad gate/up B
     routed_activation_gl x_fp8_routed;                    // (macrobatch_size, H) replay gate/up A + replay-dispatch out
     routed_sc_gl x_sc_routed;                             // MXFP8 only: (macrobatch_size / 128, H / 128, 32, 16)
     routed_transposed_gl x_fp8_t_routed;                  // MXFP8 only: (H, macrobatch_size) wgrad gate/up B
     routed_sc_gl x_sc_t_routed;                           // MXFP8 only: (H / 128, macrobatch_size / 128, 32, 16)
-    swiglu_bf16_gl gate_shared;                           // (num_local_tokens, I) swiglu bwd in
+    shared_gl<swiglu_bf16_gl> gate_shared;                           // (num_local_tokens, I) swiglu bwd in
     epi_bf16_gl gate_routed;                              // (macrobatch_size, I) replay gate D + swiglu fwd in
     routed_gate_up_gl gate_fp8_routed;                    // (macrobatch_size, I) replay gate D + swiglu (fwd/bwd) in
     routed_sc_gl gate_sc_routed;                          // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
-    swiglu_bf16_gl up_shared;                             // (num_local_tokens, I) swiglu bwd in
+    shared_gl<swiglu_bf16_gl> up_shared;                             // (num_local_tokens, I) swiglu bwd in
     epi_bf16_gl up_routed;                                // (macrobatch_size, I) replay up D + swiglu fwd in
     routed_gate_up_gl up_fp8_routed;                      // (macrobatch_size, I) replay up D + swiglu (fwd/bwd) in
     routed_sc_gl up_sc_routed;                            // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
-    wgrad_bf16_gl hidden_shared;                          // (num_local_tokens, I) wgrad down B
+    shared_gl<wgrad_bf16_gl> hidden_shared;                          // (num_local_tokens, I) wgrad down B
     routed_activation_gl hidden_fp8_routed;               // (macrobatch_size, I) replay swiglu out
     routed_sc_gl hidden_sc_routed;                        // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
     routed_transposed_gl hidden_fp8_t_routed;             // MXFP8 only: (I, macrobatch_size) wgrad down B
     routed_sc_gl hidden_sc_t_routed;                      // MXFP8 only: (I / 128, macrobatch_size / 128, 32, 16)
 
     // Activation gradients
-    mlp_bf16_gl d_y_shared;                               // (num_local_tokens, H) dgrad down A + wgrad down A
+    shared_gl<mlp_bf16_gl> d_y_shared;                               // (num_local_tokens, H) dgrad down A + wgrad down A
     routed_activation_gl d_y_fp8_routed;                  // (macrobatch_size, H) dgrad/wgrad down A + reverse-combine out
     routed_sc_gl d_y_sc_routed;                           // MXFP8 only: (macrobatch_size / 128, H / 128, 32, 16)
     routed_transposed_gl d_y_fp8_t_routed;                // MXFP8 only: (H, macrobatch_size) wgrad down A
     routed_sc_gl d_y_sc_t_routed;                         // MXFP8 only: (H / 128, macrobatch_size / 128, 32, 16)
-    epi_bf16_gl d_hidden_shared;                          // (num_local_tokens, I) dgrad down out + swiglu bwd in
+    shared_gl<epi_bf16_gl> d_hidden_shared;                          // (num_local_tokens, I) dgrad down out + swiglu bwd in
     epi_bf16_gl d_hidden_routed;                          // (macrobatch_size, I) dgrad down out + swiglu bwd in
-    mlp_bf16_gl d_gate_shared;                            // (num_local_tokens, I) swiglu bwd out + dgrad/wgrad gate A
+    shared_gl<mlp_bf16_gl> d_gate_shared;                            // (num_local_tokens, I) swiglu bwd out + dgrad/wgrad gate A
     routed_activation_gl d_gate_fp8_routed;               // (macrobatch_size, I) swiglu bwd out + dgrad/wgrad gate A
     routed_sc_gl d_gate_sc_routed;                        // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
     routed_transposed_gl d_gate_fp8_t_routed;             // MXFP8 only: (I, macrobatch_size) wgrad gate A
     routed_sc_gl d_gate_sc_t_routed;                      // MXFP8 only: (I / 128, macrobatch_size / 128, 32, 16)
-    mlp_bf16_gl d_up_shared;                              // (num_local_tokens, I) swiglu bwd out + dgrad/wgrad up A
+    shared_gl<mlp_bf16_gl> d_up_shared;                              // (num_local_tokens, I) swiglu bwd out + dgrad/wgrad up A
     routed_activation_gl d_up_fp8_routed;                 // (macrobatch_size, I) swiglu bwd out + dgrad/wgrad up A
     routed_sc_gl d_up_sc_routed;                          // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
     routed_transposed_gl d_up_fp8_t_routed;               // MXFP8 only: (I, macrobatch_size) wgrad up A
     routed_sc_gl d_up_sc_t_routed;                        // MXFP8 only: (I / 128, macrobatch_size / 128, 32, 16)
-    epi_bf16_gl d_x_shared;                               // (num_local_tokens, H) dgrad gate/up out
+    shared_gl<epi_bf16_gl> d_x_shared;                               // (num_local_tokens, H) dgrad gate/up out
     epi_bf16_gl d_x_routed;                               // (macrobatch_size, H) dgrad gate/up out + reverse-dispatch in
 
     // Symmetric buffers
@@ -474,22 +474,22 @@ struct globals_bwd {
     routed_weight_sc_gl w_routed_gate_sc;                 // MXFP8 only: logical gate view
     routed_weight_gl w_routed_up;                         // (num_local_experts, I, H) replay
     routed_weight_sc_gl w_routed_up_sc;                   // MXFP8 only: logical up view
-    weight_bf16_gl w_shared_gate;                         // (I, H)
+    shared_gl<weight_bf16_gl> w_shared_gate;                         // (I, H)
     routed_weight_gl w_routed_gate_T;                     // MXFP8: transposed; BF16: normal (I, H)
     routed_weight_sc_gl w_routed_gate_T_sc;               // MXFP8 only: logical transposed gate view
-    weight_bf16_gl w_shared_up;                           // (I, H)
+    shared_gl<weight_bf16_gl> w_shared_up;                           // (I, H)
     routed_weight_gl w_routed_up_T;                       // MXFP8: transposed; BF16: normal (I, H)
     routed_weight_sc_gl w_routed_up_T_sc;                 // MXFP8 only: logical transposed up view
-    weight_bf16_gl w_shared_down;                         // (H, I)
+    shared_gl<weight_bf16_gl> w_shared_down;                         // (H, I)
     routed_weight_gl w_routed_down_T;                     // MXFP8: transposed; BF16: normal (H, I)
     routed_weight_sc_gl w_routed_down_T_sc;               // MXFP8 only: logical transposed down view
 
     // Weight gradients
-    d_weight_gl d_w_shared_gate;                          // (I, H)
+    shared_gl<d_weight_gl> d_w_shared_gate;                          // (I, H)
     routed_d_weight_gl d_w_routed_gate;                   // logical gate view
-    d_weight_gl d_w_shared_up;                            // (I, H)
+    shared_gl<d_weight_gl> d_w_shared_up;                            // (I, H)
     routed_d_weight_gl d_w_routed_up;                     // logical up view
-    d_weight_gl d_w_shared_down;                          // (H, I)
+    shared_gl<d_weight_gl> d_w_shared_down;                          // (H, I)
     routed_d_weight_gl d_w_routed_down;                   // logical down view
 
     // Schedules
@@ -520,16 +520,16 @@ struct globals_bwd {
         const int capacity = schedule_peer_rank.cols();
         const int num_minibatches = (capacity + minibatch_size - 1) / minibatch_size; // across all macrobatches
         const int num_macrobatches = (capacity + macrobatch_size - 1) / macrobatch_size;
-        const int shared_row_blocks = d_y_shared.rows() / config::MLP_Mb;
+        const int shared_row_blocks = HAS_SHARED ? (d_y_shared.rows() / config::MLP_Mb) : 0;
         const int minibatch_row_blocks = minibatch_size / config::MLP_Mb;
-        const int intermediate_dim_col_blocks = hidden_shared.cols() / config::MLP_Nb;
+        const int intermediate_dim_col_blocks = w_routed_gate.rows() / config::MLP_Nb;
         const int hidden_dim_col_blocks = d_y_shared.cols() / config::MLP_Nb;
-        const int shared_swiglu_bwd_tiles = (hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb);
+        const int shared_swiglu_bwd_tiles = HAS_SHARED ? ((hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
         const int minibatch_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
         const int shared_swiglu_bwd_tasks = (shared_swiglu_bwd_tiles + config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH);
         const int minibatch_swiglu_bwd_tasks = (minibatch_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH);
         const int minibatch_swiglu_fwd_tasks = (minibatch_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
-        const int shared_tasks = shared_row_blocks * intermediate_dim_col_blocks + shared_swiglu_bwd_tasks + shared_row_blocks * hidden_dim_col_blocks + 3 * intermediate_dim_col_blocks * hidden_dim_col_blocks;
+        const int shared_tasks = HAS_SHARED ? (shared_row_blocks * intermediate_dim_col_blocks + shared_swiglu_bwd_tasks + shared_row_blocks * hidden_dim_col_blocks + 3 * intermediate_dim_col_blocks * hidden_dim_col_blocks) : 0;
         const int minibatch_bwd_tasks = minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_bwd_tasks + minibatch_row_blocks * hidden_dim_col_blocks;
         const int minibatch_replay_tasks = 2 * minibatch_row_blocks * intermediate_dim_col_blocks + minibatch_swiglu_fwd_tasks;
         const int num_replay_minibatches = (num_macrobatches - 1) * (macrobatch_size / minibatch_size);
@@ -540,20 +540,20 @@ struct globals_bwd {
 
 struct globals_recompute_forward_context {
     // Recomputed forward activations
-    mlp_bf16_gl x_shared;                     // (num_local_tokens, H) gate/up GEMM A
+    shared_gl<mlp_bf16_gl> x_shared;                     // (num_local_tokens, H) gate/up GEMM A
     routed_activation_gl x_fp8_routed;        // (macrobatch_size, H) gate/up GEMM A + dispatch out
     routed_sc_gl x_sc_routed;                 // MXFP8 only: (macrobatch_size / 128, H / 128, 32, 16)
     routed_transposed_gl x_fp8_t_routed;      // MXFP8 only: (H, macrobatch_size) dispatch out
     routed_sc_gl x_sc_t_routed;               // MXFP8 only: (H / 128, macrobatch_size / 128, 32, 16)
-    epi_bf16_gl gate_shared;                  // (num_local_tokens, I) gate GEMM D + swiglu in
+    shared_gl<epi_bf16_gl> gate_shared;                  // (num_local_tokens, I) gate GEMM D + swiglu in
     epi_bf16_gl gate_routed;                  // (macrobatch_size, I) gate GEMM D + swiglu in
     routed_gate_up_gl gate_fp8_routed;        // (macrobatch_size, I) routed gate saved for backward
     routed_sc_gl gate_sc_routed;              // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
-    epi_bf16_gl up_shared;                    // (num_local_tokens, I) up GEMM D + swiglu in
+    shared_gl<epi_bf16_gl> up_shared;                    // (num_local_tokens, I) up GEMM D + swiglu in
     epi_bf16_gl up_routed;                    // (macrobatch_size, I) up GEMM D + swiglu in
     routed_gate_up_gl up_fp8_routed;          // (macrobatch_size, I) routed up saved for backward
     routed_sc_gl up_sc_routed;                // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
-    mlp_bf16_gl hidden_shared;                // (num_local_tokens, I) swiglu out + down GEMM A
+    shared_gl<mlp_bf16_gl> hidden_shared;                // (num_local_tokens, I) swiglu out + down GEMM A
     routed_activation_gl hidden_fp8_routed;   // (macrobatch_size, I) swiglu out + down GEMM A
     routed_sc_gl hidden_sc_routed;            // MXFP8 only: (macrobatch_size / 128, I / 128, 32, 16)
     routed_transposed_gl hidden_fp8_t_routed; // MXFP8 only: (I, macrobatch_size) swiglu out
@@ -563,10 +563,10 @@ struct globals_recompute_forward_context {
     activation_bf16_pgl x_routed_send_buffer; // (num_local_tokens, H)
 
     // Weights
-    weight_bf16_gl w_shared_gate;             // (I, H)
+    shared_gl<weight_bf16_gl> w_shared_gate;             // (I, H)
     routed_weight_gl w_routed_gate;           // (num_local_experts, I, H)
     routed_weight_sc_gl w_routed_gate_sc;     // MXFP8 only: logical gate view
-    weight_bf16_gl w_shared_up;               // (I, H)
+    shared_gl<weight_bf16_gl> w_shared_up;               // (I, H)
     routed_weight_gl w_routed_up;             // (num_local_experts, I, H)
     routed_weight_sc_gl w_routed_up_sc;       // MXFP8 only: logical up view
 
@@ -590,11 +590,11 @@ struct globals_recompute_forward_context {
     __host__ inline dim3 grid() const {
         const int routed_capacity = min(schedule_peer_rank.cols(), macrobatch_size);
         const int num_minibatches = (routed_capacity + minibatch_size - 1) / minibatch_size;
-        const int shared_row_blocks = x_shared.rows() / config::MLP_Mb;
+        const int shared_row_blocks = HAS_SHARED ? (x_shared.rows() / config::MLP_Mb) : 0;
         const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
         const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
         const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
-        const int shared_swiglu_tiles = (hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb);
+        const int shared_swiglu_tiles = HAS_SHARED ? ((hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
         const int minibatch_routed_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
         const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
         const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
