@@ -186,6 +186,29 @@ experts retain their original upstream gradient and quantization path.
 Gated `recompute_forward_context` is unsupported; internal routed replay is
 unchanged. Ungated BF16/MXFP8 retain their original numerical paths.
 
+### Router-weight gradients of unrouted slots
+
+`backward` zeroes `d_router_weights` wherever `top_experts` is `-1`. A caller
+that reads `d_router_weights` only at routed slots can skip this masking with
+`backward(..., zero_unrouted_router_grads=False)`. The unrouted entries are
+then unspecified: zero, or a gradient that an earlier call wrote there.
+
+### Eager launches and cached validation
+
+For plain tensors in eager mode, the functional layer launches its kernels
+directly instead of through the `mok.ops` custom ops. Under `torch.compile`,
+under a dispatch mode and for tensor subclasses, it calls the custom ops. The
+caller's activations and routes are checked on every call. Weights, main
+grads and descriptor tables are checked when they are first used, and the
+functional layer then remembers them by tensor identity. Updating their
+values in place, as an optimizer step does, needs nothing else. If you change
+such a tensor while keeping the same Python object, for example by assigning
+a tensor of another shape or dtype to its `.data`, call
+`functional.clear_workspace_cache()` before the next call. In the same way,
+`get_workspace` validates a repeated set of arguments once and
+`build_schedule` validates its config once per device and shape;
+`clear_workspace_cache()` clears these caches as well.
+
 ### Example (MXFP8 forward and backward using the functional layer)
 
 The following is a canonical example of implementing MoE forward and backward with MoK in MXFP8 mode:

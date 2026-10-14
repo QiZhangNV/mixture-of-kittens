@@ -10,7 +10,10 @@ token. Per token row, the backward keeps every BF16 tensor boundary of the eager
 
 gate_bwd_pre computes d_shared and d_z in one pass over dY and S; gate_bwd_post_ merges d_z @ Wg into the backward
 epilogue's d_x in place. Both match the eager operations bitwise, except that the FP32 summation order of d_gate
-differs from the PyTorch reduction.
+differs from the PyTorch reduction. The kernels index their operands as BF16 with the shapes documented below, so
+both wrappers raise ValueError for any other dtype, shape or device instead of misreading the memory. MoK's backward
+calls the unchecked _launch_* functions: it checks the gate weight itself, and its other operands are valid by
+construction.
 """
 
 import torch
@@ -79,6 +82,27 @@ def gate_bwd_pre(
         d_shared: bfloat16 [num_local_tokens, hidden_size]
         d_z:      bfloat16 [num_local_tokens, 1]
     """
+    if (
+        dy.dim() != 2
+        or dy.dtype != torch.bfloat16
+        or shared_output.dtype != torch.bfloat16
+        or gate.dtype != torch.bfloat16
+        or tuple(shared_output.shape) != tuple(dy.shape)
+        or tuple(gate.shape) != (dy.shape[0], 1)
+        or not dy.is_cuda
+        or shared_output.device != dy.device
+        or gate.device != dy.device
+    ):
+        raise ValueError("gate_bwd_pre needs BF16 dy, shared_output [T, H] and gate [T, 1] on one CUDA device")
+    return _launch_gate_bwd_pre(dy, shared_output, gate)
+
+
+def _launch_gate_bwd_pre(
+    dy: torch.Tensor,
+    shared_output: torch.Tensor,
+    gate: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """gate_bwd_pre without its argument checks, for operands that are valid by construction (MoK's backward)."""
     dy = dy.contiguous()
     shared_output = shared_output.contiguous()
     gate = gate.contiguous()
@@ -103,8 +127,25 @@ def gate_bwd_post_(d_x: torch.Tensor, d_z: torch.Tensor, weight: torch.Tensor) -
     Outputs:
         d_x: the updated input tensor
     """
+    if (
+        d_x.dim() != 2
+        or d_x.dtype != torch.bfloat16
+        or d_z.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or tuple(d_z.shape) != (d_x.shape[0], 1)
+        or tuple(weight.shape) != (1, d_x.shape[1])
+        or not d_x.is_cuda
+        or d_z.device != d_x.device
+        or weight.device != d_x.device
+    ):
+        raise ValueError("gate_bwd_post_ needs BF16 d_x [T, H], d_z [T, 1] and weight [1, H] on one CUDA device")
     if not d_x.is_contiguous() or not weight.is_contiguous():
         raise ValueError("d_x and weight must be contiguous")
+    return _launch_gate_bwd_post_(d_x, d_z, weight)
+
+
+def _launch_gate_bwd_post_(d_x: torch.Tensor, d_z: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """gate_bwd_post_ without its argument checks, for operands that are valid by construction (MoK's backward)."""
     num_local_tokens, hidden_size = d_x.shape
     if num_local_tokens:
         block_h = triton.next_power_of_2(hidden_size)

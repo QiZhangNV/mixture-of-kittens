@@ -100,6 +100,56 @@ def test_gate_bwd_post_rejects_non_contiguous(context):
             _gate_fused.gate_bwd_post_(*operands)
 
 
+def test_gate_bwd_post_rejects_wrong_dtype_shape_or_device(context):
+    """The merge kernel reads d_z and Wg as BF16 [T, 1] and [1, H]; other operands raise instead of being misread.
+
+    The eager d_x + d_z @ Wg raised for the weight and d_z operands below (trimgf review, part K); the fused wrapper
+    used to launch on them unchecked.
+    """
+    _, _, device = context
+    rows, hidden = 64, 2048
+    d_x = torch.zeros(rows, hidden, device=device, dtype=torch.bfloat16)
+    d_z = torch.ones(rows, 1, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(1, hidden, device=device, dtype=torch.bfloat16)
+    wide = torch.ones(1, 2 * hidden, device=device, dtype=torch.bfloat16)
+    tall = torch.ones(2 * rows, 1, device=device, dtype=torch.bfloat16)
+    short_weight = wide[:, : hidden // 2]  # contiguous [1, H/2] view: the kernel would read past it
+    assert short_weight.is_contiguous()
+    for operands in (
+        (d_x, d_z, weight.float()),
+        (d_x, d_z, short_weight),
+        (d_x, d_z, weight.reshape(hidden, 1)),
+        (d_x, tall[: rows // 2], weight),
+        (d_x, d_z.float(), weight),
+        (d_x, d_z, weight.cpu()),
+        (d_x.float(), d_z, weight),
+        (d_x[0], d_z, weight),
+    ):
+        with pytest.raises(ValueError, match="gate_bwd_post_ needs"):
+            _gate_fused.gate_bwd_post_(*operands)
+    torch.cuda.synchronize()
+    assert not d_x.any(), "a rejected merge wrote d_x"
+
+
+def test_gate_bwd_pre_rejects_wrong_dtype_shape_or_device(context):
+    _, _, device = context
+    rows, hidden = 64, 2048
+    dy = torch.ones(rows, hidden, device=device, dtype=torch.bfloat16)
+    gate = torch.full((rows, 1), 0.5, device=device, dtype=torch.bfloat16)
+    for operands in (
+        (dy.float(), dy, gate),
+        (dy, dy.float(), gate),
+        (dy, dy, gate.float()),
+        (dy, dy[:, : hidden // 2], gate),
+        (dy, dy, gate[: rows // 2]),
+        (dy, dy, gate.reshape(1, rows)),
+        (dy, dy, gate.cpu()),
+        (dy[0], dy[0], gate[0]),
+    ):
+        with pytest.raises(ValueError, match="gate_bwd_pre needs"):
+            _gate_fused.gate_bwd_pre(*operands)
+
+
 def test_gate_bwd_empty_rows(context):
     _, _, device = context
     dy = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
