@@ -199,3 +199,35 @@ def test_mok_gated_matches_reference(context, precision, main_grad_dtype):
             for index, (name, actual, golden) in enumerate(zip(GATED_RESULT_NAMES, (output, *gradients), reference, strict=True)):
                 tolerance = MXFP8_TOLERANCE if precision == "mxfp8" and index < 6 else BF16_TOLERANCE
                 check_correctness(name, golden, actual, tolerance, print_stats=context[0] == 0)
+
+
+@pytest.mark.parametrize("precision,gated", [("bf16", False), ("mxfp8", True)])
+def test_situ_fused_shared(context, precision, gated):
+    inputs, weight = _dense_inputs(context)
+    x, _, probs = inputs[:3]
+    weights = inputs[3:9]
+    fwd_weights, bwd_weights = _routed_weight_args(weights[3:], precision)
+    state = _mok_schedule(context, inputs, macrobatch_size=512)  # Force routed replay.
+    gate_kw = dict(shared_output_gate_weight=weight) if gated else {}
+    beta = (2.0, 8.0)  # Non-default values detect a dropped activation parameter.
+
+    def activation(a, u):
+        a, u = a.float(), u.float()
+        return (beta[0] * torch.tanh(a / beta[0]) * torch.sigmoid(a)
+                * beta[1] * torch.tanh(u / beta[1])).bfloat16()
+
+    golden = run_reference_bf16(
+        *inputs, **gate_kw, routed_activation=activation, shared_activation=activation,
+    )
+    y, ctx = functional.forward(*state, x, probs, *weights[:3], *fwd_weights,
+                                **gate_kw, situ_beta=beta)
+    if not gated:
+        ctx = functional.recompute_forward_context(
+            *state, x, *weights[:2], *fwd_weights[:2], situ_beta=beta,
+        )
+    grads = functional.backward(*state, ctx, inputs[-1], x, probs, *weights[:3],
+                                *bwd_weights, **gate_kw)
+    assert len(grads) == 9 and (gated or grads[-1] is None)
+    for index, (name, actual, target) in enumerate(zip(GATED_RESULT_NAMES, (y, *grads), golden)):
+        tolerance = MXFP8_TOLERANCE if precision == "mxfp8" and index < 6 else BF16_TOLERANCE
+        check_correctness(name, target, actual, tolerance, print_stats=context[0] == 0)

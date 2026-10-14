@@ -1,4 +1,4 @@
-template <bool IS_CLAMPED>
+template <bool IS_CLAMPED, bool IS_SITU = false>
 static __device__ __forceinline__ void recompute_forward_context_kernel(const globals_recompute_forward_context &g) {
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
@@ -138,10 +138,10 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
             if constexpr (HAS_SHARED) {
             // Shared Swiglu (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks * 2;
-            swiglu_fwd_kernel<true, IS_CLAMPED>(g.gate_shared, g.up_shared, g.hidden_shared, nullptr, nullptr, nullptr,
+            swiglu_fwd_kernel<true, IS_CLAMPED, IS_SITU>(g.gate_shared, g.up_shared, g.hidden_shared, nullptr, nullptr, nullptr,
                              g.gate_up_tile_ready, g.hidden_row_block_ready,
                              swiglu_inputs_arrived, swiglu_bitfield,
-                             g.x_shared.rows(), g.swiglu_limit, g.macrobatch_size, g.minibatch_size,
+                             g.x_shared.rows(), g.swiglu_limit, g.situ_beta, g.macrobatch_size, g.minibatch_size,
                              0, 0, task_idx, cta_rank, 0, 0, smem_base_addr);
         }
         } else {
@@ -172,11 +172,11 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
             } else {
                 // Routed Swiglu
                 const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
-                swiglu_fwd_kernel<false, IS_CLAMPED>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
+                swiglu_fwd_kernel<false, IS_CLAMPED, IS_SITU>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
                                   &g.hidden_sc_routed, &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
                                   g.gate_up_tile_ready, g.hidden_row_block_ready,
                                   swiglu_inputs_arrived, swiglu_bitfield,
-                                  num_tokens, g.swiglu_limit, g.macrobatch_size, g.minibatch_size,
+                                  num_tokens, g.swiglu_limit, g.situ_beta, g.macrobatch_size, g.minibatch_size,
                                   0, minibatch_idx, task_idx, cta_rank,
                                   shared_gate_up_tasks, shared_row_blocks, smem_base_addr);
             }
@@ -248,8 +248,11 @@ recompute_forward_context_mxfp8(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
     const int num_routed_tokens = min(schedule_capacity, macrobatch_size);
@@ -325,12 +328,15 @@ recompute_forward_context_mxfp8(
         .x_routed_ready = kittens::py::tensor_to_gl<index_gl>(x_routed_ready),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false>>(g);
@@ -358,8 +364,11 @@ recompute_forward_context_bf16(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     static_assert(!USE_MXFP8);
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
@@ -424,12 +433,15 @@ recompute_forward_context_bf16(
         .x_routed_ready = kittens::py::tensor_to_gl<index_gl>(x_routed_ready),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false>>(g);

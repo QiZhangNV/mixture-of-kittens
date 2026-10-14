@@ -1,4 +1,4 @@
-template <bool IS_CLAMPED>
+template <bool IS_CLAMPED, bool IS_SITU = false>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(const globals_bwd &g) {
     const int num_local_experts = g.w_routed_gate.depth();
     const int intermediate_dim_col_blocks = g.w_routed_gate.rows() / config::MLP_Nb;
@@ -238,12 +238,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
             if constexpr (HAS_SHARED) {
             // Shared Swiglu bwd: d_gate_shared, d_up_shared = swiglu_bwd(d_hidden_shared, gate_shared, up_shared)
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks;
-            swiglu_bwd_kernel<true, IS_CLAMPED>(g.d_hidden_shared, g.gate_shared, g.up_shared, g.d_gate_shared, g.d_up_shared,
+            swiglu_bwd_kernel<true, IS_CLAMPED, IS_SITU>(g.d_hidden_shared, g.gate_shared, g.up_shared, g.d_gate_shared, g.d_up_shared,
                              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr,
                              g.d_hidden_ready, nullptr, g.d_gate_up_ready, nullptr,
                              swiglu_bwd_inputs_arrived, swiglu_bwd_bitfield,
-                             g.gate_shared.rows(), g.swiglu_limit, macrobatch_size, g.minibatch_size,
+                             g.gate_shared.rows(), g.swiglu_limit, g.situ_beta, macrobatch_size, g.minibatch_size,
                              0, 0, task_idx, cta_rank,
                              0, 0, 0, 0, smem_base_addr);
         }
@@ -331,11 +331,11 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 } else {
                     // Replay Swiglu refreshes the routed hidden activation.
                     const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
-                    swiglu_fwd_kernel<false, IS_CLAMPED>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
+                    swiglu_fwd_kernel<false, IS_CLAMPED, IS_SITU>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
                                       &g.hidden_sc_routed, &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
                                       g.replayed_gate_up_ready, g.replayed_hidden_ready,
                                       swiglu_fwd_inputs_arrived, swiglu_fwd_bitfield,
-                                      num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
+                                      num_tokens, g.swiglu_limit, g.situ_beta, macrobatch_size, g.minibatch_size,
                                       macrobatch_idx, minibatch_idx,
                                       task_idx, cta_rank, 0, 0, smem_base_addr);
                 }
@@ -366,13 +366,13 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                            minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks) {
                     // Routed Swiglu backward
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks;
-                    swiglu_bwd_kernel<false, IS_CLAMPED>(g.d_hidden_routed, g.gate_fp8_routed, g.up_fp8_routed, g.d_gate_fp8_routed, g.d_up_fp8_routed,
+                    swiglu_bwd_kernel<false, IS_CLAMPED, IS_SITU>(g.d_hidden_routed, g.gate_fp8_routed, g.up_fp8_routed, g.d_gate_fp8_routed, g.d_up_fp8_routed,
                                       &g.gate_sc_routed, &g.up_sc_routed, &g.d_gate_sc_routed, &g.d_up_sc_routed,
                                       &g.d_gate_fp8_t_routed, &g.d_gate_sc_t_routed, &g.d_up_fp8_t_routed, &g.d_up_sc_t_routed,
                                       &g.router_weights, &g.d_router_weight_partials, &g.schedule_peer_rank,
                                       g.d_hidden_ready, replayed ? &g.replayed_gate_up_ready : nullptr, g.d_gate_up_ready, buffer_done,
                                       swiglu_bwd_inputs_arrived, swiglu_bwd_bitfield,
-                                      num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
+                                      num_tokens, g.swiglu_limit, g.situ_beta, macrobatch_size, g.minibatch_size,
                                       macrobatch_idx, minibatch_idx,
                                       task_idx, cta_rank, shared_dgrad_down_tasks, 0, shared_row_blocks, macrobatch_idx, smem_base_addr);
                 } else if (routed_task_idx < num_routed_tasks) {
@@ -549,8 +549,11 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     const std::optional<at::Tensor> &main_grad_routed_gate_storage_table = std::nullopt,
     const std::optional<at::Tensor> &main_grad_routed_up_storage_table = std::nullopt,
     const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt,
-    const std::optional<at::Tensor> &shared_grad_output = std::nullopt
+    const std::optional<at::Tensor> &shared_grad_output = std::nullopt,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     const at::Tensor &d_y_shared = shared_grad_output.has_value() ? *shared_grad_output : d_y_buffer;
     if (shared_grad_output.has_value()) {
         TORCH_CHECK(d_y_shared.is_cuda() && d_y_shared.scalar_type() == at::kBFloat16 &&
@@ -891,12 +894,15 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         .routed_weights_are_native_columnwise = routed_weights_are_native_columnwise,
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
@@ -967,8 +973,11 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     const std::optional<at::Tensor> &main_grad_routed_gate_storage_table = std::nullopt,
     const std::optional<at::Tensor> &main_grad_routed_up_storage_table = std::nullopt,
     const std::optional<at::Tensor> &main_grad_routed_down_storage_table = std::nullopt,
-    const std::optional<at::Tensor> &shared_grad_output = std::nullopt
+    const std::optional<at::Tensor> &shared_grad_output = std::nullopt,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     static_assert(!USE_MXFP8);
     const at::Tensor &d_y_shared = shared_grad_output.has_value() ? *shared_grad_output : d_y_buffer;
     if (shared_grad_output.has_value()) {
@@ -1230,12 +1239,15 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .routed_buffers_done = kittens::py::tensor_to_gl<index_gl>(routed_buffers_done),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false, true>>(g);
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);

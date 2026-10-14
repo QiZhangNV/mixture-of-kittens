@@ -387,11 +387,14 @@ def run_reference_bf16(
     *,
     group: dist.ProcessGroup | None = None,
     shared_output_gate_weight: torch.Tensor | None = None,
+    routed_activation=None,
+    shared_activation=None,
 ) -> tuple[torch.Tensor, ...]:
     """Return Y and eight gradients, appending FP32 dW_gate when gated.
 
     MLP wgrads remain BF16. Gated forward accumulates S*G and routed outputs
     in FP32; gate backward uses the BF16-product rounding defined above.
+    Activation overrides provide independent routed/shared MLP oracles.
     """
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
@@ -430,7 +433,10 @@ def run_reference_bf16(
         expert_x = recv_x[rows]
         gate = expert_x @ w_routed_gate[expert_idx].T
         up = expert_x @ w_routed_up[expert_idx].T
-        hidden_activations = run_swiglu_reference(gate, up, swiglu_limit)
+        hidden_activations = (
+            run_swiglu_reference(gate, up, swiglu_limit)
+            if routed_activation is None else routed_activation(gate, up)
+        )
         recv_output = recv_output.index_copy(0, rows, hidden_activations @ w_routed_down[expert_idx].T)
 
     # Routed token weighted sum
@@ -451,7 +457,11 @@ def run_reference_bf16(
     w_shared_down = w_shared_down.detach().requires_grad_()
     gate_shared = x_shared @ w_shared_gate.T
     up_shared = x_shared @ w_shared_up.T
-    shared_output = run_swiglu_reference(gate_shared, up_shared, swiglu_limit) @ w_shared_down.T
+    shared_hidden = (
+        run_swiglu_reference(gate_shared, up_shared, swiglu_limit)
+        if shared_activation is None else shared_activation(gate_shared, up_shared)
+    )
+    shared_output = shared_hidden @ w_shared_down.T
 
     # Preserve the ungated reference; gated mode accumulates shared first,
     # then each valid route, in FP32 to match the forward epilogue.

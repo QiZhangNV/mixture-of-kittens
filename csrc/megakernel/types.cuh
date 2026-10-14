@@ -394,6 +394,7 @@ struct globals_fwd {
 
     const int topk;
     const float swiglu_limit;
+    const float2 situ_beta;
     const int num_comm_sms;
     const int macrobatch_size;
     const int minibatch_size;
@@ -512,6 +513,7 @@ struct globals_bwd {
     const bool routed_weights_are_native_columnwise;
     const int topk;
     const float swiglu_limit;
+    const float2 situ_beta;
     const int num_comm_sms;
     const int macrobatch_size;
     const int minibatch_size;
@@ -583,6 +585,7 @@ struct globals_recompute_forward_context {
 
     const int topk;
     const float swiglu_limit;
+    const float2 situ_beta;
     const int num_comm_sms;
     const int macrobatch_size;
     const int minibatch_size;

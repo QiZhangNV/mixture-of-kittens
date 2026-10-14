@@ -8,12 +8,12 @@ from mok import functional, ops
 from .utils import BF16_TOLERANCE, MXFP8_TOLERANCE, check_correctness, generate_inputs, run_reference_bf16
 
 
-@pytest.mark.parametrize("precision,grad_dtype", [
-    ("bf16", None), ("mxfp8", None),
-    ("bf16", torch.float32), ("mxfp8", torch.float32),
-    ("bf16", torch.bfloat16), ("mxfp8", torch.bfloat16),
+@pytest.mark.parametrize("precision,grad_dtype,situ", [
+    ("bf16", None, False), ("mxfp8", None, False),
+    ("bf16", torch.float32, True), ("mxfp8", torch.float32, True),
+    ("bf16", torch.bfloat16, True), ("mxfp8", torch.bfloat16, True),
 ])
-def test_routed_only_reference_and_accumulation(context, precision, grad_dtype):
+def test_routed_only_reference_and_accumulation(context, precision, grad_dtype, situ):
     rank, world, device = context
     inputs = generate_inputs(rank, device, 2 * world, 2, 2, 512, 512, 256)
     x, routes, probs, *rest = inputs
@@ -43,20 +43,32 @@ def test_routed_only_reference_and_accumulation(context, precision, grad_dtype):
     tolerance = MXFP8_TOLERANCE if precision == "mxfp8" else BF16_TOLERANCE
     for step in range(2 if grad_dtype else 1):
         xx, ddy = (x * -0.5, dy * 2) if step == 1 else (x, dy)
-        y, ctx = functional.forward(config, workspace, schedule, xx, probs, None, None, None, *fwd_weights)
+        beta = ((2.0, 8.0) if step == 1 else (4.0, 25.0)) if situ else None
+        y, ctx = functional.forward(config, workspace, schedule, xx, probs, None, None, None, *fwd_weights,
+                                    situ_beta=beta)
         assert ctx.gate_shared is ctx.up_shared is ctx.hidden_shared is None
         assert ctx.shared_output is ctx.shared_output_gate is None
-        if not grad_dtype:
+        if not grad_dtype or (situ and step == 0):
             ctx = functional.recompute_forward_context(
                 config, workspace, schedule, xx, None, None, *fwd_weights[:2],
+                situ_beta=beta,
             )
             assert ctx.gate_shared is ctx.up_shared is ctx.hidden_shared is None
+        assert ctx.situ_beta == beta
         grads = functional.backward(
             config, workspace, schedule, ctx, ddy, xx, probs, None, None, None, *bwd_weights,
             main_grads=main_grads,
         )
         assert len(grads) == 9 and all(g is None for g in grads[5:])
-        golden = list(run_reference_bf16(xx, routes, probs, *shared, *weights, ddy)[:6])
+        def situ_reference(a, u):
+            a, u = a.float(), u.float()
+            return (beta[0] * torch.tanh(a / beta[0]) * torch.sigmoid(a)
+                    * beta[1] * torch.tanh(u / beta[1])).bfloat16()
+
+        golden = list(run_reference_bf16(
+            xx, routes, probs, *shared, *weights, ddy,
+            routed_activation=situ_reference if situ else None,
+        )[:6])
         if grad_dtype:
             for actual, buffer, total, contribution in zip(grads[2:5], buffers, expected, golden[3:]):
                 assert actual is buffer
