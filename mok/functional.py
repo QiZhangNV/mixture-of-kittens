@@ -10,6 +10,8 @@ from .ops import (
     all_gather_top_experts,
     barrier_all,
     bwd_epilogue,
+    copy_routed_grad_inputs,
+    copy_routed_inputs,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
     dispatch_mlp_swiglu_combine_bwd_mxfp8_accum,
@@ -555,6 +557,36 @@ def validate_inputs(
         raise ValueError("schedule capacity does not match the workspace")
 
 
+def _can_stand_in_for_buffer(tensor: torch.Tensor) -> bool:
+    """Whether a validated caller activation can replace its workspace buffer as a kernel's local operand.
+
+    The megakernels read the local operand (x, or grad_output via shared_grad_output) only for the shared expert,
+    through TMA descriptors; peers read the symmetric buffers only at routed rows, through the buffer pointers.
+    A traced graph has no data pointers and takes this path; the copy op's runtime checks reject a misaligned tensor.
+    """
+    return torch.compiler.is_compiling() or tensor.data_ptr() % 256 == 0
+
+
+def _stage_forward_inputs(
+    workspace: MoKWorkspace,
+    schedule: MoKSchedule,
+    x: torch.Tensor,
+    router_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Fills the symmetric buffers peers read in forward and returns the shared-expert operand.
+
+    Only rows with a route are copied into x_buffer and the shared expert reads x itself; the other x_buffer rows
+    keep stale data that no kernel reads.
+    """
+    if _can_stand_in_for_buffer(x):
+        copy_routed_inputs(schedule.top_experts, x, workspace.x_buffer,
+                           router_weights, workspace.router_weight_buffer)
+        return x
+    workspace.x_buffer.copy_(x)
+    workspace.router_weight_buffer.copy_(router_weights)
+    return workspace.x_buffer
+
+
 def _shared_output_gate_wgrad(
     d_z: torch.Tensor, x: torch.Tensor, main_grad: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -631,8 +663,7 @@ def forward(
     ):
         raise ValueError("shared_output_gate_weight must be contiguous BF16 [1, H] on the input device")
 
-    workspace.x_buffer.copy_(x)  # TODO: we can remove this
-    workspace.router_weight_buffer.copy_(router_weights)
+    x_shared = _stage_forward_inputs(workspace, schedule, x, router_weights)
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
 
@@ -708,7 +739,7 @@ def forward(
             y_shared,
             y_routed,
         ) = dispatch_mlp_swiglu_combine_fwd_mxfp8(
-            workspace.x_buffer,
+            x_shared,
             workspace.x_buffer_ptrs,
             workspace.combine_buffer,
             workspace.combine_buffer_ptrs,
@@ -770,7 +801,7 @@ def forward(
             y_shared,
             y_routed,
         ) = dispatch_mlp_swiglu_combine_fwd_bf16(
-            workspace.x_buffer,
+            x_shared,
             workspace.x_buffer_ptrs,
             workspace.combine_buffer,
             workspace.combine_buffer_ptrs,
@@ -1239,9 +1270,18 @@ def backward(
             d_gate = (grad_output * shared_output).sum(-1, keepdim=True)
         shared_grad_kwargs["shared_grad_output"] = d_shared
 
-    workspace.d_y_buffer.copy_(grad_output)                # TODO: we can remove this
-    workspace.x_buffer.copy_(x)                            # TODO: we can remove this
-    workspace.router_weight_buffer.copy_(router_weights)   # TODO: we can remove this
+    if _can_stand_in_for_buffer(grad_output) and _can_stand_in_for_buffer(x):
+        # Peers read d_y_buffer and x_buffer only at routed rows; the shared expert reads grad_output (or the gated
+        # d_shared) and x themselves.
+        copy_routed_grad_inputs(schedule.top_experts, grad_output, workspace.d_y_buffer, x, workspace.x_buffer,
+                                router_weights, workspace.router_weight_buffer)
+        shared_grad_kwargs.setdefault("shared_grad_output", grad_output)
+        x_shared = x
+    else:
+        workspace.d_y_buffer.copy_(grad_output)
+        workspace.x_buffer.copy_(x)
+        workspace.router_weight_buffer.copy_(router_weights)
+        x_shared = workspace.x_buffer
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
     weight_args = _parse_backward_weight_arguments(
@@ -1285,7 +1325,7 @@ def backward(
             forward_context.hidden_shared,
             hidden_fp8_t_routed,
             hidden_sc_t_routed,
-            workspace.x_buffer,
+            x_shared,
             workspace.x_buffer_ptrs,
             weight_args.gate_row_data,
             weight_args.gate_row_scale,
@@ -1384,7 +1424,7 @@ def backward(
             up_routed,
             forward_context.hidden_shared,
             hidden_routed,
-            workspace.x_buffer,
+            x_shared,
             workspace.x_buffer_ptrs,
             schedule.peer_rank,
             schedule.peer_token_idx,
