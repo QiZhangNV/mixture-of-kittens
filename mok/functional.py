@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from . import _gate_fused
 from .ops import (
     all_gather_top_experts,
     barrier_all,
@@ -1264,10 +1265,10 @@ def backward(
     shared_grad_kwargs = {}
     if gate is not None:
         with torch.no_grad():
-            # Native-style BF16 tensor boundaries: multiply uses FP32 opmath,
-            # then dG sums BF16 products with an FP32 accumulator.
-            d_shared = grad_output * gate
-            d_gate = (grad_output * shared_output).sum(-1, keepdim=True)
+            # One pass over the caller's full grad_output and S with native-style BF16 tensor boundaries:
+            # dS = dY * G uses FP32 opmath, dG sums BF16 products with an FP32 accumulator, and
+            # dZ = sigmoid_backward(dG, G) rounds like aten on BF16 (see _gate_fused).
+            d_shared, d_z = _gate_fused.gate_bwd_pre(grad_output, shared_output, gate)
         shared_grad_kwargs["shared_grad_output"] = d_shared
 
     if _can_stand_in_for_buffer(grad_output) and _can_stand_in_for_buffer(x):
@@ -1491,10 +1492,9 @@ def backward(
     d_w_output_gate = None
     if gate is not None:
         with torch.no_grad():
-            d_z = torch.ops.aten.sigmoid_backward.default(d_gate, gate)
-            d_x_gate = d_z @ shared_output_gate_weight
             d_w_output_gate = _shared_output_gate_wgrad(d_z, x, shared_output_gate_main_grad)
-            d_x = d_x + d_x_gate  # Deliberate BF16 merge after the original MLP epilogue.
+            # Deliberate BF16 merge of dZ @ Wg after the original MLP epilogue, in place on its fresh d_x.
+            d_x = _gate_fused.gate_bwd_post_(d_x, d_z, shared_output_gate_weight)
     d_router_weights = workspace.d_router_weight_buffer.clone()  # TODO: we can remove this
     d_router_weights.masked_fill_(schedule.top_experts < 0, 0.0)
     return (

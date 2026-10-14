@@ -21,6 +21,7 @@ See our [blog post](https://cursor.com/blog/mixture-of-kittens) for the methodol
 - NVIDIA Blackwell SM100 or SM103 GPUs (e.g., GB200 NVL72 or GB300 NVL72)
 - Python 3.12 or later
 - PyTorch 2.10 or later
+- Triton (`mok.functional` imports it for the shared output gate backward)
 - CUDA toolkit 13.0 or later
 
 ### PyTorch and CUDA
@@ -141,9 +142,14 @@ To run MoK in MXFP8 mode, pass the activations as-is in BF16 while prequantizing
 
 MoK supports an optional, bias-free BF16 output gate `W_g[1, H]`:
 `Y = routed_output + sigmoid(linear(X, W_g)) * shared_output`. It is distinct
-from the shared SwiGLU gate projection. Gate projection, sigmoid and gate
-backward use PyTorch operations; the shared-output multiplication is fused
-into the MOK forward epilogue.
+from the shared SwiGLU gate projection. Gate projection and sigmoid use
+PyTorch operations, and the shared-output multiplication is fused into the
+MOK forward epilogue. The gate backward runs two fused Triton kernels
+(`mok/_gate_fused.py`). They keep every BF16 rounding step of the PyTorch
+operations they replace; only the FP32 summation order of the gate gradient
+differs. Because these kernels are launched directly, `torch.compile` is the
+only supported tracer of a gated backward: `FakeTensorMode` or `make_fx` on
+their own do not intercept the launches.
 
 Example with BF16 routed and shared weights:
 
