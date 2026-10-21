@@ -42,7 +42,8 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
     const int input_row_block_ready_required_count,
     const int output_tile_ready_base_index,
     const int buffer_done_index,
-    const uint64_t smem_base_addr
+    const uint64_t smem_base_addr,
+    const int benchmark_mode = 0
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
     using a_tile = std::conditional_t<USE_ROUTED_MXFP8, mlp_fp8_tile,
@@ -150,6 +151,28 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
             }
         }
     };
+
+    // COMM_ONLY: no operand traffic, MMA or epilogue stores. Keep the
+    // original dependencies and publish exactly the normal task's signals.
+    if (benchmark_mode == 1) {
+        if (threadIdx.x == 0) {
+            if constexpr (IS_WGRAD) {
+                for (int row = k_start; row < k_end; row += MLP_Kb)
+                    wait_for_wgrad_operands(row - k_start, row);
+            } else {
+                wait_for_a_operand();
+            }
+            if (output_tile_ready != nullptr)
+                barrier_arrive(*output_tile_ready, output_tile_ready_base_index +
+                    (macrobatch_row_block_offset + tile_coord.x) * col_blocks + tile_coord.y);
+            else if (output_minibatch_ready != nullptr)
+                barrier_arrive(*output_minibatch_ready, global_minibatch_idx);
+            if (buffer_done != nullptr)
+                barrier_arrive(*buffer_done, buffer_done_index);
+        }
+        __syncthreads();
+        return;
+    }
 
     if (warpgroup::groupid() == config::NUM_CONSUMERS) {
         if (warpgroup::warpid() == 3 && warp::elect_leader()) {
@@ -291,7 +314,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                 update_phasebit<0>(gemm_bitfield, input_ring);
                 input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
             }
-            detail::tcgen05::commit<config::CLUSTER_SIZE>(gemm_outputs_arrived);
+            kittens::detail::tcgen05::commit<config::CLUSTER_SIZE>(gemm_outputs_arrived);
         }
     } else {
         using epilogue_group = group<WARPGROUP_WARPS>;

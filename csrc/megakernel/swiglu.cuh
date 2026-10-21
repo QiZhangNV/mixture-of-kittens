@@ -57,7 +57,8 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
     const int cta_rank,
     const int gate_up_tile_ready_base_index,
     const int hidden_row_block_ready_base_index,
-    const uint64_t smem_base_addr
+    const uint64_t smem_base_addr,
+    const int benchmark_mode = 0
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
     using input_bf16_tile = std::conditional_t<USE_ROUTED_MXFP8, quant_bf16_tile, swiglu_tile>;
@@ -88,6 +89,25 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
 
     const int first_row = first_tile_idx / col_blocks;
     const int first_col = first_tile_idx % col_blocks;
+
+    if (benchmark_mode == 1) {
+        if (threadIdx.x == 0) {
+            for (int stage = 0; stage < config::SWIGLU_FWD_PIPE_DEPTH; ++stage) {
+                const int tile_idx = first_tile_idx + stage;
+                if (tile_idx >= tile_end) continue;
+                const int row = tile_idx / col_blocks;
+                const int col = tile_idx % col_blocks;
+                const int parent_task_idx = (row / (config::MLP_Mb / config::SWIGLU_Mb)) *
+                    intermediate_dim_col_blocks + col / (config::MLP_Nb / config::SWIGLU_Nb);
+                barrier_wait(gate_up_tile_ready, gate_up_tile_ready_base_index + parent_task_idx,
+                             2 * config::CLUSTER_SIZE);
+                barrier_arrive(hidden_row_block_ready, hidden_row_block_ready_base_index +
+                               row / (config::MLP_Mb / config::SWIGLU_Mb));
+            }
+        }
+        __syncthreads();
+        return;
+    }
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -242,7 +262,8 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
     const int replayed_gate_up_tile_ready_base_index,
     const int d_gate_up_row_block_ready_base_index,
     const int buffer_done_index,
-    const uint64_t smem_base_addr
+    const uint64_t smem_base_addr,
+    const int benchmark_mode = 0
 ) {
     static constexpr bool USE_ROUTED_MXFP8 = !IS_SHARED && USE_MXFP8;
     using gate_up_tile = std::conditional_t<USE_ROUTED_MXFP8, quant_fp8_tile, swiglu_tile>;
@@ -286,6 +307,31 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
 
     const int first_row = first_tile_idx / col_blocks;
     const int first_col = first_tile_idx % col_blocks;
+
+    if (benchmark_mode == 1) {
+        if (threadIdx.x == 0) {
+            for (int stage = 0; stage < config::SWIGLU_BWD_PIPE_DEPTH; ++stage) {
+                const int tile_idx = first_tile_idx + stage;
+                if (tile_idx >= tile_end) continue;
+                const int row = tile_idx / col_blocks;
+                const int col = tile_idx % col_blocks;
+                const int parent_task_idx = (row / (config::MLP_Mb / config::SWIGLU_Mb)) *
+                    intermediate_dim_col_blocks + col / (config::MLP_Nb / config::SWIGLU_Nb);
+                barrier_wait(d_hidden_tile_ready, d_hidden_tile_ready_base_index + parent_task_idx,
+                             config::CLUSTER_SIZE);
+                if (replayed_gate_up_tile_ready != nullptr)
+                    barrier_wait(*replayed_gate_up_tile_ready,
+                                 replayed_gate_up_tile_ready_base_index + parent_task_idx,
+                                 2 * config::CLUSTER_SIZE);
+                barrier_arrive(d_gate_up_row_block_ready, d_gate_up_row_block_ready_base_index +
+                               row / (config::MLP_Mb / config::SWIGLU_Mb));
+            }
+            if (buffer_done != nullptr)
+                barrier_arrive(*buffer_done, buffer_done_index);
+        }
+        __syncthreads();
+        return;
+    }
 
     if (threadIdx.x == 0) {
         #pragma unroll

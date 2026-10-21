@@ -4,6 +4,20 @@
 #include "utils.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ablation_capture", [](bool enabled) { mok_distribution_ablation::capture_enabled = enabled; });
+    m.def("ablation_reset", &mok_distribution_ablation::reset);
+    m.def("ablation_launch", &mok_distribution_ablation::launch);
+    m.def("ablation_observables", &mok_distribution_ablation::observables);
+    m.def("ablation_clear", []() { mok_distribution_ablation::clear(); mok_distribution_replica::clear(); });
+    m.def("replica_configure", &mok_distribution_replica::configure);
+    m.def("replica_reset", &mok_distribution_replica::reset);
+    m.def("replica_launch", [](int sms, int prefix) {
+        TORCH_CHECK(bool(mok_distribution_replica::launch), "Capture a forward first"); mok_distribution_replica::launch(sms, prefix);
+    });
+    m.def("replica_resources", []() {
+        TORCH_CHECK(bool(mok_distribution_replica::resources), "Capture a forward first"); return mok_distribution_replica::resources();
+    });
+
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));

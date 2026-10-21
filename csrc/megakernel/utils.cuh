@@ -25,7 +25,8 @@ static __device__ __forceinline__ void preload_router_weights_kernel(
     const int task_idx,
     const int num_workers,
     const int previous_macrobatch_idx,
-    const int buffer_ready_required_count
+    const int buffer_ready_required_count,
+    const int benchmark_mode = 0
 ) {
     if (threadIdx.x == 0 && buffer_ready != nullptr)
         barrier_wait(*buffer_ready, previous_macrobatch_idx, buffer_ready_required_count);
@@ -33,6 +34,7 @@ static __device__ __forceinline__ void preload_router_weights_kernel(
 
     const int macrobatch_offset = macrobatch_idx * macrobatch_size;
     const int macrobatch_tokens = min(macrobatch_size, num_tokens - macrobatch_offset);
+    if (benchmark_mode != 2)
     for (int row = task_idx * config::NUM_THREADS + threadIdx.x; row < macrobatch_tokens; row += num_workers * config::NUM_THREADS) {
         const int peer_rank = schedule_peer_rank[{macrobatch_offset + row}];
         const int peer_token_idx = schedule_peer_token_idx[{macrobatch_offset + row}];

@@ -360,9 +360,12 @@ struct globals_fwd {
 
     const int topk;
     const float swiglu_limit;
-    const int num_comm_sms;
+    int num_comm_sms;
     const int macrobatch_size;
     const int minibatch_size;
+
+    int benchmark_mode = 0; // 0 full, 1 comm-only, 2 compute-only
+    mok_distribution_replica::Parameters replica{};
 
     __host__ inline dim3 grid() const {
         const int num_minibatches = (schedule_peer_rank.cols() + minibatch_size - 1) / minibatch_size; // across all macrobatches
@@ -478,9 +481,11 @@ struct globals_bwd {
     const bool routed_weights_are_native_columnwise;
     const int topk;
     const float swiglu_limit;
-    const int num_comm_sms;
+    int num_comm_sms;
     const int macrobatch_size;
     const int minibatch_size;
+
+    int benchmark_mode = 0; // 0 full, 1 comm-only, 2 compute-only
 
     __host__ inline dim3 grid() const {
         const int capacity = schedule_peer_rank.cols();

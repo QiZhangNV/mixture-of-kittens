@@ -135,14 +135,14 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                      nullptr, nullptr, g.d_y_routed_ready,
                                      dispatch_inputs_arrived, dispatch_bitfield,
                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
-                                     -1, 0, smem_base_addr);
+                                     -1, 0, smem_base_addr, g.benchmark_mode);
         };
         auto reverse_dispatch = [&](int macrobatch_idx, int task_idx) {
             combine_kernel(g.d_x_routed_buffer, g.d_x_routed, &g.d_router_weight_buffer, &g.d_router_weight_partials,
                            g.schedule_peer_rank, g.schedule_peer_token_idx,
                            g.d_x_routed_ready, num_macrobatches > 1 ? &g.routed_buffers_done : nullptr,
                            combine_inputs_arrived, combine_bitfield,
-                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr);
+                           num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr, g.benchmark_mode);
         };
         auto replay_dispatch = [&](int macrobatch_idx, int task_idx) {
             dispatch_kernel<false>(g.x_routed_send_buffer, g.x_fp8_routed, &g.x_sc_routed, &g.x_fp8_t_routed, &g.x_sc_t_routed,
@@ -150,12 +150,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                      nullptr, nullptr, g.replayed_x_routed_ready,
                                      dispatch_inputs_arrived, dispatch_bitfield,
                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
-                                     -1, 0, smem_base_addr);
+                                     -1, 0, smem_base_addr, g.benchmark_mode);
         };
         preload_router_weights_kernel(g.router_weight_buffer, g.router_weights,
                                       g.schedule_peer_rank, g.schedule_peer_token_idx,
                                       nullptr, g.router_weights_ready,
-                                      num_tokens, macrobatch_size, 0, comm_cta_idx, g.num_comm_sms, -1, 0);
+                                      num_tokens, macrobatch_size, 0, comm_cta_idx, g.num_comm_sms, -1, 0, g.benchmark_mode);
         for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(0); task_idx += g.num_comm_sms)
             reverse_combine(0, task_idx);
         for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
@@ -168,7 +168,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                               g.schedule_peer_rank, g.schedule_peer_token_idx,
                                               &g.routed_buffers_done, g.router_weights_ready,
                                               num_tokens, macrobatch_size, macrobatch_idx + 1, comm_cta_idx, g.num_comm_sms,
-                                              macrobatch_idx, routed_buffers_done_required_count_of(macrobatch_idx));
+                                              macrobatch_idx, routed_buffers_done_required_count_of(macrobatch_idx), g.benchmark_mode);
                 for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(macrobatch_idx + 1); task_idx += g.num_comm_sms) {
                     reverse_combine(macrobatch_idx + 1, task_idx);
                     replay_dispatch(macrobatch_idx + 1, task_idx);
@@ -231,7 +231,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       d_tt, a_sc_tt, b_sc_tt,
                                       gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                       num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                      0, 0, 0, 0, 0, smem_base_addr);
+                                      0, 0, 0, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_dgrad_down_tasks + shared_swiglu_bwd_tasks) {
             // Shared Swiglu bwd: d_gate_shared, d_up_shared = swiglu_bwd(d_hidden_shared, gate_shared, up_shared)
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks;
@@ -242,7 +242,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                              swiglu_bwd_inputs_arrived, swiglu_bwd_bitfield,
                              g.gate_shared.rows(), g.swiglu_limit, macrobatch_size, g.minibatch_size,
                              0, 0, task_idx, cta_rank,
-                             0, 0, 0, 0, smem_base_addr);
+                             0, 0, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_dgrad_down_tasks + shared_swiglu_bwd_tasks + shared_dgrad_gate_up_tasks) {
             // Shared dgrad gate+up: d_x_shared = d_gate_shared @ w_shared_gate + d_up_shared @ w_shared_up
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks;
@@ -252,7 +252,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       d_tt, a_sc_tt, b_sc_tt,
                                       gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                       num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                      0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr);
+                                      0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_dgrad_down_tasks + shared_swiglu_bwd_tasks + shared_dgrad_gate_up_tasks + shared_wgrad_tasks) {
             // Shared wgrad down: d_w_shared_down += d_y_shared^T @ hidden_shared
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks;
@@ -262,7 +262,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                             d_tt, a_sc_tt, b_sc_tt,
                                             gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                             num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                            0, 0, 0, 0, 0, smem_base_addr);
+                                            0, 0, 0, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_tasks - shared_wgrad_tasks) {
             // Shared wgrad gate: d_w_shared_gate += d_gate_shared^T @ x_shared
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks - shared_wgrad_tasks;
@@ -272,7 +272,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                             d_tt, a_sc_tt, b_sc_tt,
                                             gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                             num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr);
+                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_tasks) {
             // Shared wgrad up: d_w_shared_up += d_up_shared^T @ x_shared
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks - 2 * shared_wgrad_tasks;
@@ -282,7 +282,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                             d_tt, a_sc_tt, b_sc_tt,
                                             gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                             num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr);
+                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr, g.benchmark_mode);
         } else {
             // Routed / replay tasks
             const int global_routed_task_idx = compute_cluster_idx - shared_tasks;
@@ -305,7 +305,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, a_sc_tt, b_sc_tt,
                                                gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, 0, 0, 0, 0, smem_base_addr);
+                                               0, 0, 0, 0, 0, smem_base_addr, g.benchmark_mode);
                 } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2) {
                     // Replay up GEMM refreshes the routed activation.
                     const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks;
@@ -315,7 +315,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, a_sc_tt, b_sc_tt,
                                                gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, 0, 0, 0, 0, smem_base_addr);
+                                               0, 0, 0, 0, 0, smem_base_addr, g.benchmark_mode);
                 } else {
                     // Replay Swiglu refreshes the routed hidden activation.
                     const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
@@ -325,7 +325,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       swiglu_fwd_inputs_arrived, swiglu_fwd_bitfield,
                                       num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
                                       macrobatch_idx, minibatch_idx,
-                                      task_idx, cta_rank, 0, 0, smem_base_addr);
+                                      task_idx, cta_rank, 0, 0, smem_base_addr, g.benchmark_mode);
                 }
             } else {
                 const int num_routed_tasks = macrobatch_num_minibatches * minibatch_routed_bwd_tasks;
@@ -342,13 +342,13 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, a_sc_tt, b_sc_tt,
                                                gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
+                                               0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                     } else {
                         expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_y_fp8_routed, g.w_routed_down_T, &g.d_y_sc_routed, &g.w_routed_down_T_sc, nullptr, nullptr, nullptr, nullptr,
                                                    g.d_hidden_routed, nullptr, nullptr, g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
                                                    d_tt, a_sc_tt, b_sc_tt, gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                    num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                                   0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr);
+                                                   0, 0, 0, shared_dgrad_down_tasks, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                     }
                 } else if (routed_task_idx < num_routed_tasks &&
                            minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks) {
@@ -362,7 +362,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                       swiglu_bwd_inputs_arrived, swiglu_bwd_bitfield,
                                       num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
                                       macrobatch_idx, minibatch_idx,
-                                      task_idx, cta_rank, shared_dgrad_down_tasks, 0, shared_row_blocks, macrobatch_idx, smem_base_addr);
+                                      task_idx, cta_rank, shared_dgrad_down_tasks, 0, shared_row_blocks, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                 } else if (routed_task_idx < num_routed_tasks) {
                     // Dgrad gate+up: d_x_routed = d_gate @ w_routed_gate + d_up @ w_routed_up
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks - minibatch_routed_swiglu_bwd_tasks;
@@ -374,14 +374,14 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                d_tt, a_sc_tt, b_sc_tt,
                                                gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                               0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                                               0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                     } else {
                         expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_gate_fp8_routed, g.w_routed_gate_T, &g.d_gate_sc_routed, &g.w_routed_gate_T_sc,
                                                    &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,
                                                    g.d_x_routed, nullptr, nullptr, g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, &g.d_x_routed_ready, buffer_done,
                                                    d_tt, a_sc_tt, b_sc_tt, gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                    num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                                   0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                                                   0, shared_row_blocks, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                     }
                 } else if (routed_task_idx < num_routed_tasks + wgrad_matrix_tasks) {
                     // Wgrad down: d_w_routed_down += d_y_routed^T @ hidden_routed
@@ -393,7 +393,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                      d_tt, a_sc_tt, b_sc_tt,
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
-                                                     g.d_y_shared.cols(), 0, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr);
+                                                     g.d_y_shared.cols(), 0, d_gate_up_row_block_ready_required_count, 0, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                 } else if (routed_task_idx < num_routed_tasks + 2 * wgrad_matrix_tasks) {
                     // Wgrad gate: d_w_routed_gate += d_gate_routed^T @ x_routed
                     const int task_idx = routed_task_idx - num_routed_tasks - wgrad_matrix_tasks;
@@ -405,7 +405,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
                                                      g.d_y_shared.cols(), shared_row_blocks, d_gate_up_row_block_ready_required_count,
-                                                     0, macrobatch_idx, smem_base_addr);
+                                                     0, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                 } else {
                     // Wgrad up: d_w_routed_up += d_up_routed^T @ x_routed
                     const int task_idx = routed_task_idx - num_routed_tasks - 2 * wgrad_matrix_tasks;
@@ -417,7 +417,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
                                                      g.d_y_shared.cols(), shared_row_blocks, d_gate_up_row_block_ready_required_count,
-                                                     0, macrobatch_idx, smem_base_addr);
+                                                     0, macrobatch_idx, smem_base_addr, g.benchmark_mode);
                 }
             }
         }
@@ -875,6 +875,22 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
+
+    if (mok_distribution_ablation::capture_enabled) {
+        auto &captured = mok_distribution_ablation::bwd;
+        captured.keepalive = {d_y_buffer, d_x_routed_buffer, router_weight_buffer, d_router_weight_buffer, w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc, w_shared_up, w_routed_up_T, w_routed_up_T_sc, w_shared_down, w_routed_down_T, w_routed_down_T_sc, x_fp8_t_routed, x_sc_t_routed, gate_shared, gate_fp8_routed, gate_sc_routed, up_shared, up_fp8_routed, up_sc_routed, hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed, x, w_routed_gate, w_routed_gate_sc, w_routed_up, w_routed_up_sc, schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, x_fp8_routed, x_sc_routed, gate_routed, up_routed, hidden_fp8_routed, hidden_sc_routed, router_weights, d_router_weight_partials, d_y_fp8_routed, d_y_sc_routed, d_y_fp8_t_routed, d_y_sc_t_routed, d_hidden_shared, d_hidden_routed, d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed, d_gate_fp8_t_routed, d_gate_sc_t_routed, d_up_fp8_routed, d_up_sc_routed, d_up_fp8_t_routed, d_up_sc_t_routed, d_up_shared, d_x_shared, d_x_routed, d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up, d_w_shared_down, d_w_routed_down, d_y_routed_ready, d_hidden_ready, d_gate_up_ready, d_x_routed_ready, replayed_x_routed_ready, replayed_gate_up_ready, replayed_hidden_ready, routed_buffers_done, router_weights_ready};
+        captured.ready = {d_y_routed_ready, d_hidden_ready, d_gate_up_ready, d_x_routed_ready, replayed_x_routed_ready, replayed_gate_up_ready, replayed_hidden_ready, routed_buffers_done, router_weights_ready};
+        captured.observables = {d_x_shared, d_x_routed, d_router_weight_partials, router_weights};
+        const bool clamped = swiglu_limit.has_value();
+        captured.launch = [g, clamped](int mode, int comm_sms) mutable {
+            g.benchmark_mode = mode;
+            g.num_comm_sms = comm_sms;
+            if (clamped)
+                kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);
+            else
+                kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<false>>(g);
+        };
+    }
 
     if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_bwd, dispatch_mlp_swiglu_combine_bwd_kernel<true>>(g);

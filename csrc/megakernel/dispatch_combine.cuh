@@ -21,7 +21,8 @@ static __device__ __forceinline__ void dispatch_kernel(
     const int row_divisor,
     const int previous_macrobatch_idx,
     const int buffer_ready_required_count,
-    const uint64_t smem_base_addr
+    const uint64_t smem_base_addr,
+    const int benchmark_mode = 0
 ) {
     auto &token_chunks        = *reinterpret_cast<bf16 (*)[config::DISPATCH_Mb][config::DISPATCH_Nb]>(smem_base_addr);
     auto &x_fp8_tiles         = *reinterpret_cast<quant_fp8_tile (*)[config::DISPATCH_OUT_TILES]>(smem_base_addr + sizeof(token_chunks));
@@ -44,6 +45,28 @@ static __device__ __forceinline__ void dispatch_kernel(
     const int col_block_idx = task_idx % col_blocks;
     const int chunk_cols = min(config::DISPATCH_Nb, cols - col_block_idx * config::DISPATCH_Nb);
     const uint32_t chunk_bytes = chunk_cols * sizeof(bf16);
+
+    if (benchmark_mode == 2) {
+        // Compute inputs were populated by an untimed FULL launch. Do not
+        // perform peer loads, quantization or local activation stores.
+        if (tid == 0) {
+            if (transfer_ready != nullptr) {
+                const int previous_offset = previous_macrobatch_idx * macrobatch_size;
+                const int previous_tokens = min(macrobatch_size, num_tokens - previous_offset);
+                if (row_idx < previous_tokens) {
+                    const int mb = (previous_offset + row_idx) / minibatch_size;
+                    const int rows = min(minibatch_size, num_tokens - mb * minibatch_size);
+                    barrier_wait(*transfer_ready, mb,
+                        (rows / config::MLP_Mb) * (cols / config::MLP_Nb) * config::CLUSTER_SIZE);
+                }
+            }
+            if (buffer_ready != nullptr)
+                barrier_wait(*buffer_ready, previous_macrobatch_idx, buffer_ready_required_count);
+            barrier_arrive(transfer_done, (macrobatch_offset + row_idx) / minibatch_size);
+        }
+        __syncthreads();
+        return;
+    }
 
     const int peer_rank = is_worker ? schedule_peer_rank[{macrobatch_offset + row_idx + tid}] : -1;
     const int peer_token_idx = is_worker ? schedule_peer_token_idx[{macrobatch_offset + row_idx + tid}] : -1;
@@ -166,7 +189,8 @@ static __device__ __forceinline__ void combine_kernel(
     const int minibatch_size,
     const int macrobatch_idx,
     const int task_idx,
-    const uint64_t smem_base_addr
+    const uint64_t smem_base_addr,
+    const int benchmark_mode = 0
 ) {
     auto &token_chunks = *reinterpret_cast<bf16 (*)[config::COMBINE_PIPE_DEPTH][config::COMBINE_Mb][config::COMBINE_Nb]>(smem_base_addr);
 
@@ -198,6 +222,37 @@ static __device__ __forceinline__ void combine_kernel(
                          : (stage == 0 || col == 0) ? __syncthreads_count(peer_rank[stage] >= 0)
                          : num_valid[stage - 1];
         if (++col == col_blocks) { col = 0; row += config::COMBINE_Mb; }
+    }
+
+    if (benchmark_mode == 2) {
+        // Keep communication CTAs alive until their real compute producers
+        // finish. An immediate return here would donate SMs to compute.
+        if (tid == 0) {
+            const int first_mb = (macrobatch_offset + first_row_idx) / minibatch_size;
+            const int last_mb = (macrobatch_offset +
+                (first_tile_idx + num_valid_tiles - 1) / col_blocks * config::COMBINE_Mb) / minibatch_size;
+            for (int mb = first_mb; mb <= last_mb; ++mb) {
+                const int rows = min(minibatch_size, num_tokens - mb * minibatch_size);
+                barrier_wait(transfer_ready, mb, ((rows + config::MLP_Mb - 1) / config::MLP_Mb) *
+                             (cols / config::MLP_Nb) * config::CLUSTER_SIZE);
+            }
+        }
+        __syncthreads();
+        if constexpr (ARRIVE_BY_ROW) {
+            if (transfer_done != nullptr) {
+                const int stage = warpid();
+                if (warp::laneid() == 0 && stage < num_valid_tiles) {
+                    const int row = (first_tile_idx + stage) / col_blocks * config::COMBINE_Mb;
+                    barrier_arrive(*transfer_done, (macrobatch_offset + row) /
+                                   (config::MLP_Mb / config::CLUSTER_SIZE));
+                }
+            }
+        } else {
+            if (tid == 0 && transfer_done != nullptr)
+                barrier_arrive(*transfer_done, macrobatch_idx);
+        }
+        __syncthreads();
+        return;
     }
 
     auto chunk_bytes = [&](int col_block) {

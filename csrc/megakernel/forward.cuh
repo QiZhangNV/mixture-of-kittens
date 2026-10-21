@@ -1,4 +1,4 @@
-template <bool IS_CLAMPED>
+template <bool IS_CLAMPED, bool FUSE_REPLICA = false>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(const globals_fwd &g) {
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
@@ -46,10 +46,15 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
     __shared__ semaphore gemm_inputs_finished[config::MLP_LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_scales_finished[config::MLP_LOAD_PIPE_DEPTH];
     __shared__ semaphore gemm_outputs_arrived, gemm_outputs_finished;
+    __shared__ semaphore replica_inputs_arrived[FUSE_REPLICA ? REPLICA_STAGES : 1];
     __shared__ semaphore dispatch_inputs_arrived;
     __shared__ semaphore combine_inputs_arrived[config::COMBINE_PIPE_DEPTH];
 
     if (threadIdx.x == 0) {
+        if constexpr (FUSE_REPLICA) {
+            #pragma unroll
+            for (int s=0; s<REPLICA_STAGES; ++s) init_semaphore(replica_inputs_arrived[s], 0, 1);
+        }
         #pragma unroll
         for (int i = 0; i < config::SWIGLU_FWD_PIPE_DEPTH; ++i) {
             init_semaphore(swiglu_inputs_arrived[i], 0, 1);
@@ -105,18 +110,33 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                      macrobatch_idx + 1 < num_macrobatches ? &g.y_routed_ready : nullptr, nullptr, g.x_routed_ready,
                                      dispatch_inputs_arrived, dispatch_bitfield,
                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
-                                     macrobatch_idx + 1, 0, smem_base_addr);
+                                     macrobatch_idx + 1, 0, smem_base_addr, g.benchmark_mode);
         };
         auto combine = [&](int macrobatch_idx, int task_idx) {
             combine_kernel<true>(g.y_routed_recv_buffer, g.y_routed, nullptr, nullptr,
                                  g.schedule_peer_rank, g.schedule_peer_token_idx,
                                  g.y_routed_ready, macrobatch_idx > 0 ? &g.y_routed_done : nullptr,
                                  combine_inputs_arrived, combine_bitfield,
-                                 num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr);
+                                 num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr, g.benchmark_mode);
         };
-        if (num_macrobatches == 0) return;
-        for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks(num_macrobatches - 1); task_idx += g.num_comm_sms)
-            dispatch(num_macrobatches - 1, task_idx);
+        if (num_macrobatches == 0) {
+            if constexpr (FUSE_REPLICA)
+                replica_copy_kernel(g, comm_cta_idx, smem_base_addr, replica_inputs_arrived);
+            return;
+        }
+        if constexpr (FUSE_REPLICA) {
+            // Host validation restricts this prototype to one macrobatch and
+            // a dispatch-tile-aligned home/replica boundary.
+            const int col_blocks = (g.x_fp8_routed.cols()+config::DISPATCH_Nb-1)/config::DISPATCH_Nb;
+            const int prefix_tasks = (g.replica.prefix_rows/config::DISPATCH_Mb)*col_blocks;
+            int task_idx = comm_cta_idx;
+            for (; task_idx<prefix_tasks; task_idx+=g.num_comm_sms) dispatch(0, task_idx);
+            replica_copy_kernel(g, comm_cta_idx, smem_base_addr, replica_inputs_arrived);
+            for (; task_idx<num_dispatch_tasks(0); task_idx+=g.num_comm_sms) dispatch(0, task_idx);
+        } else {
+            for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks(num_macrobatches - 1); task_idx += g.num_comm_sms)
+                dispatch(num_macrobatches - 1, task_idx);
+        }
         for (int macrobatch_idx = num_macrobatches - 1; macrobatch_idx >= 0; --macrobatch_idx) {
             const int combine_tasks = num_combine_tasks(macrobatch_idx);
             const int dispatch_tasks = macrobatch_idx > 0 ? num_dispatch_tasks(macrobatch_idx - 1) : 0;
@@ -165,7 +185,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                       d_tt, a_sc_tt, b_sc_tt,
                                       gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                       num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                      0, 0, 0, 0, 0, smem_base_addr);
+                                      0, 0, 0, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_gate_up_tasks * 2) {
             // Shared up (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks;
@@ -175,7 +195,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                       d_tt, a_sc_tt, b_sc_tt,
                                       gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                       num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                      0, 0, 0, 0, 0, smem_base_addr);
+                                      0, 0, 0, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_gate_up_tasks * 2 + shared_swiglu_tasks) {
             // Shared Swiglu (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks * 2;
@@ -183,7 +203,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                              g.gate_up_tile_ready, g.hidden_row_block_ready,
                              swiglu_inputs_arrived, swiglu_bitfield,
                              g.x_shared.rows(), g.swiglu_limit, macrobatch_size, g.minibatch_size,
-                             0, 0, task_idx, cta_rank, 0, 0, smem_base_addr);
+                             0, 0, task_idx, cta_rank, 0, 0, smem_base_addr, g.benchmark_mode);
         } else if (compute_cluster_idx < shared_tasks) {
             // Shared down (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks * 2 - shared_swiglu_tasks;
@@ -193,7 +213,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                       d_tt, a_sc_tt, b_sc_tt,
                                       gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                       num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                      0, 0, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
+                                      0, 0, hidden_row_block_ready_required_count, 0, 0, smem_base_addr, g.benchmark_mode);
         } else {
             // Routed expert with macro/minibatching
             const int task_ordered_global_minibatch_idx = (compute_cluster_idx - shared_tasks) / minibatch_tasks;
@@ -208,6 +228,11 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                 minibatch_idx = idx % minibatches_per_macrobatch;
             }
 
+            if constexpr (FUSE_REPLICA) {
+                if (min(num_tokens, (minibatch_idx + 1) * g.minibatch_size) > g.replica.home_rows)
+                    replica_wait(g);
+            }
+
             if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
                 // Routed gate
                 const int task_idx = minibatch_task_idx;
@@ -217,7 +242,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                            d_tt, a_sc_tt, b_sc_tt,
                                            gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                           0, 0, 0, shared_gate_up_tasks, 0, smem_base_addr);
+                                           0, 0, 0, shared_gate_up_tasks, 0, smem_base_addr, g.benchmark_mode);
             } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2) {
                 // Routed up
                 const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks;
@@ -227,7 +252,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                            d_tt, a_sc_tt, b_sc_tt,
                                            gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                           0, 0, 0, shared_gate_up_tasks, 0, smem_base_addr);
+                                           0, 0, 0, shared_gate_up_tasks, 0, smem_base_addr, g.benchmark_mode);
             } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2 + minibatch_routed_swiglu_tasks) {
                 // Routed Swiglu
                 const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
@@ -237,7 +262,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                   swiglu_inputs_arrived, swiglu_bitfield,
                                   num_tokens, g.swiglu_limit, macrobatch_size, g.minibatch_size,
                                   macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                  shared_gate_up_tasks, shared_row_blocks, smem_base_addr);
+                                  shared_gate_up_tasks, shared_row_blocks, smem_base_addr, g.benchmark_mode);
             } else {
                 // Routed down
                 const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2 - minibatch_routed_swiglu_tasks;
@@ -249,7 +274,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
                                            d_tt, a_sc_tt, b_sc_tt,
                                            gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, minibatch_idx, task_idx, cta_rank,
-                                           0, shared_row_blocks, hidden_row_block_ready_required_count, 0, 0, smem_base_addr);
+                                           0, shared_row_blocks, hidden_row_block_ready_required_count, 0, 0, smem_base_addr, g.benchmark_mode);
             }
         }
 
@@ -466,6 +491,54 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
         .minibatch_size = minibatch_size
     };
 
+    if (mok_distribution_ablation::capture_enabled) {
+        auto &captured = mok_distribution_ablation::fwd;
+        captured.keepalive = {x, combine_buffer, w_shared_gate, w_routed_gate, w_routed_gate_sc, w_shared_up, w_routed_up, w_routed_up_sc, w_shared_down, w_routed_down, w_routed_down_sc, schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, x_fp8_routed, x_sc_routed, x_fp8_t_routed, x_sc_t_routed, gate_shared, gate_routed, gate_fp8_routed, gate_sc_routed, up_shared, up_routed, up_fp8_routed, up_sc_routed, hidden_shared, hidden_fp8_routed, hidden_sc_routed, hidden_fp8_t_routed, hidden_sc_t_routed, y_shared, y_routed, x_routed_ready, gate_up_tile_ready, hidden_row_block_ready, y_routed_ready, y_routed_done};
+        captured.ready = {x_routed_ready, gate_up_tile_ready, hidden_row_block_ready, y_routed_ready, y_routed_done};
+        captured.observables = {y_shared, y_routed, x_fp8_routed};
+        const bool clamped = swiglu_limit.has_value();
+        const int routed_rows = num_tokens.item<int>();
+        mok_distribution_replica::launch = [g, clamped, routed_rows](int comm_sms, int prefix_rows) mutable {
+            TORCH_CHECK(mok_distribution_replica::ready_owner.defined(), "Configure replica transport first");
+            const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+            TORCH_CHECK(comm_sms > 0 && comm_sms < sms && comm_sms % config::CLUSTER_SIZE == 0, "Invalid communication SM count");
+            const auto &p = mok_distribution_replica::parameters;
+            TORCH_CHECK(g.w_routed_gate.depth() > p.capacity && p.home_rows <= routed_rows && routed_rows <= g.macrobatch_size,
+                        "Fused prototype requires home plus capacity slots and one macrobatch");
+            TORCH_CHECK(p.home_rows % config::MLP_Mb == 0 && prefix_rows >= 0 && prefix_rows <= p.home_rows &&
+                        prefix_rows % config::DISPATCH_Mb == 0, "Prefix/home boundary must align to dispatch/GEMM tiles");
+            g.replica = p; g.replica.prefix_rows = prefix_rows;
+            g.num_comm_sms = comm_sms; g.benchmark_mode = 0;
+            if (clamped)
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true, true>>(g);
+            else
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false, true>>(g);
+        };
+        mok_distribution_replica::resources = [clamped]() {
+            auto collect = [](auto kernel) {
+                cudaFuncAttributes attr{}; int blocks=0;
+                CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, config::DYNAMIC_SHARED_MEMORY));
+                CUDACHECK(cudaFuncGetAttributes(&attr, kernel));
+                CUDACHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, config::NUM_THREADS, config::DYNAMIC_SHARED_MEMORY));
+                return std::vector<int>{attr.numRegs, int(attr.sharedSizeBytes), config::DYNAMIC_SHARED_MEMORY, blocks,
+                                        int(attr.localSizeBytes), config::CLUSTER_SIZE};
+            };
+            auto plain = clamped ? collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>) :
+                                   collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false>>);
+            auto fused = clamped ? collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true, true>>) :
+                                   collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false, true>>);
+            plain.insert(plain.end(), fused.begin(), fused.end()); return plain;
+        };
+        captured.launch = [g, clamped](int mode, int comm_sms) mutable {
+            g.benchmark_mode = mode;
+            g.num_comm_sms = comm_sms;
+            if (clamped)
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>(g);
+            else
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false>>(g);
+        };
+    }
+
     if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>(g);
     else
@@ -607,6 +680,58 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
+
+    // Benchmark-only BF16 capture, plus an explicitly selected transport-fused instance.
+    if (mok_distribution_ablation::capture_enabled) {
+        auto &captured = mok_distribution_ablation::fwd;
+        captured.keepalive = {x, combine_buffer, w_shared_gate, w_routed_gate, w_shared_up, w_routed_up, w_shared_down, w_routed_down, schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert, x_routed, gate_shared, gate_routed, up_shared, up_routed, hidden_shared, hidden_routed, y_shared, y_routed, x_routed_ready, gate_up_tile_ready, hidden_row_block_ready, y_routed_ready, y_routed_done};
+        if (w_routed_gate_storage_table) captured.keepalive.push_back(*w_routed_gate_storage_table);
+        if (w_routed_up_storage_table) captured.keepalive.push_back(*w_routed_up_storage_table);
+        if (w_routed_down_storage_table) captured.keepalive.push_back(*w_routed_down_storage_table);
+        captured.ready = {x_routed_ready, gate_up_tile_ready, hidden_row_block_ready, y_routed_ready, y_routed_done};
+        captured.observables = {y_shared, y_routed, x_routed};
+        const bool clamped = swiglu_limit.has_value();
+        const int routed_rows = num_tokens.item<int>();
+        mok_distribution_replica::launch = [g, clamped, routed_rows](int comm_sms, int prefix_rows) mutable {
+            TORCH_CHECK(mok_distribution_replica::ready_owner.defined(), "Configure replica transport first");
+            const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+            TORCH_CHECK(comm_sms > 0 && comm_sms < sms && comm_sms % config::CLUSTER_SIZE == 0, "Invalid communication SM count");
+            const auto &p = mok_distribution_replica::parameters;
+            TORCH_CHECK(g.w_routed_gate.depth() > p.capacity && p.home_rows <= routed_rows && routed_rows <= g.macrobatch_size,
+                        "Fused prototype requires home plus capacity slots and one macrobatch");
+            TORCH_CHECK(p.home_rows % config::MLP_Mb == 0 && prefix_rows >= 0 && prefix_rows <= p.home_rows &&
+                        prefix_rows % config::DISPATCH_Mb == 0, "Prefix/home boundary must align to dispatch/GEMM tiles");
+            g.replica = p; g.replica.prefix_rows = prefix_rows;
+            g.num_comm_sms = comm_sms; g.benchmark_mode = 0;
+            if (clamped)
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true, true>>(g);
+            else
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false, true>>(g);
+        };
+        mok_distribution_replica::resources = [clamped]() {
+            auto collect = [](auto kernel) {
+                cudaFuncAttributes attr{}; int blocks=0;
+                CUDACHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, config::DYNAMIC_SHARED_MEMORY));
+                CUDACHECK(cudaFuncGetAttributes(&attr, kernel));
+                CUDACHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, config::NUM_THREADS, config::DYNAMIC_SHARED_MEMORY));
+                return std::vector<int>{attr.numRegs, int(attr.sharedSizeBytes), config::DYNAMIC_SHARED_MEMORY, blocks,
+                                        int(attr.localSizeBytes), config::CLUSTER_SIZE};
+            };
+            auto plain = clamped ? collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>) :
+                                   collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false>>);
+            auto fused = clamped ? collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true, true>>) :
+                                   collect(kittens::py::global_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false, true>>);
+            plain.insert(plain.end(), fused.begin(), fused.end()); return plain;
+        };
+        captured.launch = [g, clamped](int mode, int comm_sms) mutable {
+            g.benchmark_mode = mode;
+            g.num_comm_sms = comm_sms;
+            if (clamped)
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>(g);
+            else
+                kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<false>>(g);
+        };
+    }
 
     if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_fwd, dispatch_mlp_swiglu_combine_fwd_kernel<true>>(g);

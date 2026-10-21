@@ -11,6 +11,9 @@
 #include <ATen/ops/zeros.h>
 #include <cstring>
 
+#include "../ablation_context.cuh"
+#include "../replica_context.cuh"
+
 using namespace kittens;
 
 enum class RoutedPrecision {
@@ -33,6 +36,7 @@ static_assert(ACCUMULATE_WGRAD || !BF16_MAIN_GRAD,
 #include "swiglu.cuh"
 #include "grouped_gemm.cuh"
 
+#include "replica_copy.cuh"
 #include "forward.cuh"
 #include "backward.cuh"
 #include "recompute_forward_context.cuh"
