@@ -213,6 +213,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
     }
 }
 
+// TODO(MCore integration): support combined FC1 payloads and descriptor-backed split routed
+// weights before enabling specialized forward-context recomputation from MCore.
 static __host__ __forceinline__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                            at::Tensor>
@@ -299,11 +301,15 @@ recompute_forward_context_mxfp8(
         .hidden_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_t_routed),
         .x_routed_send_buffer = x_routed_send_buffer_data,
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_gate),
-        .w_routed_gate_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_gate_sc),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim),
+        .w_routed_gate_sc = make_routed_scale_view(
+            w_routed_gate_sc, intermediate_dim / config::QUANT_Mb),
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_up),
-        .w_routed_up_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_up_sc),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim),
+        .w_routed_up_sc = make_routed_scale_view(
+            w_routed_up_sc, intermediate_dim / config::QUANT_Mb),
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
@@ -396,10 +402,12 @@ recompute_forward_context_bf16(
         .hidden_sc_t_routed = {},
         .x_routed_send_buffer = x_routed_send_buffer_data,
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_gate),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim),
         .w_routed_gate_sc = {},
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_up),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim),
         .w_routed_up_sc = {},
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
