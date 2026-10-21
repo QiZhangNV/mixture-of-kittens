@@ -1,0 +1,4 @@
+e7dbb78b44f41c3401a1dadd6ecb93109d206874d2ce6330eb4a900ed4deca50  /lustre/fsw/portfolios/coreai/projects/coreai_devtech_all/users/qizhang/MegaMOE/MoE_scheduler_MOK/vendor/mok/mok/_C.cpython-312-aarch64-linux-gnu.so
+865ada29074c0b165069e667adfb84d13ba7077799911a06aa1c054c0a32c4dd  /lustre/fsw/portfolios/coreai/projects/coreai_devtech_all/users/qizhang/MegaMOE/MoE_scheduler_MOK/vendor/mok_bf16/mok/_C.cpython-312-aarch64-linux-gnu.so
+f6add27664a61de9921dffcbdd67273cff17ebdbb716abc269444a2c1777ebd1  /lustre/fsw/portfolios/coreai/projects/coreai_devtech_all/users/qizhang/MegaMOE/MoE_scheduler_MOK/vendor/mok_replica_distribution/mok/_C.cpython-312-aarch64-linux-gnu.so
+a768fb8b7ce3284e7eeea1c7c326d115a45be858baa696a67465ed38ccddd472  /lustre/fsw/portfolios/coreai/projects/coreai_devtech_all/users/qizhang/MegaMOE/MoE_scheduler_MOK/replica_transport_distribution/_replica_transport_distribution.cpython-312-aarch64-linux-gnu.so

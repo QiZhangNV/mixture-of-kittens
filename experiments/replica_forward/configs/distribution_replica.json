@@ -1,0 +1,66 @@
+{
+  "source": "synthetic proxy fitted to supplied screenshots, NOT real planner replay",
+  "profiles": [
+    "ECHO",
+    "UltraEP",
+    "MoonEP"
+  ],
+  "chart_step": 45,
+  "chart_budget": {
+    "ECHO": "n_slot=4",
+    "UltraEP": "n_slot=4",
+    "MoonEP": "B=EPN=8"
+  },
+  "model_precision_pairs": [
+    [
+      "dsv4_pro",
+      "bf16"
+    ],
+    [
+      "dsv4_pro",
+      "mxfp8"
+    ],
+    [
+      "glm52",
+      "bf16"
+    ],
+    [
+      "qwen35_397b",
+      "bf16"
+    ]
+  ],
+  "ep": 64,
+  "tokens": 4096,
+  "minibatch": 4096,
+  "seed": 20260921,
+  "mok_sms": [
+    24,
+    32,
+    40,
+    48,
+    56,
+    64
+  ],
+  "copy_sms": [
+    24,
+    48,
+    152
+  ],
+  "prefix_fractions": [
+    0,
+    0.5,
+    1
+  ],
+  "warmup": 50,
+  "iterations": 100,
+  "rounds": 3,
+  "assumptions": [
+    "balanced post-plan routed rows per rank",
+    "tokens per replica = half average original home-expert load",
+    "anti-correlated source/receiver degree pairing",
+    "single-hot-expert fan-out, 4+ tail minimally spread up to8",
+    "fixed sampled plan, all active replicas refreshed every call",
+    "source publication remains outside timing"
+  ],
+  "serial_semantics": "local copy then original MOK, no extra global weight barrier"
+}

@@ -1,0 +1,2 @@
+# Whitespace in unified-diff context is intentional patch data.
+patches/*.patch -whitespace

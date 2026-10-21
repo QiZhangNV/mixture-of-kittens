@@ -1,5 +1,7 @@
 # Mixture-of-Kittens (MoK)
 
+This research branch includes a reproducible [Forward replica-weight dispatch experiment](experiments/replica_forward/README.zh.md), with build/run instructions and an [EP64 GB300 benchmark report](experiments/replica_forward/report/BENCHMARK.zh.md). It is pinned to the tested integration baseline and is not an MCore integration patch.
+
 Mixture-of-Kittens (MoK) is a fully deterministic mixture-of-experts (MoE) training megakernel built from first principles for NVL72s. MoK fuses all MoE computation and communication into a single kernel, overlapping compute and inter-GPU networking at configurable granularity, and fully eliminates CPU-GPU synchronization. It supports BF16 and MXFP8, covers both forward and backward passes, and powers production training of Composer at Cursor.
 
 For a deep dive, read our [blog post](https://cursor.com/blog/mixture-of-kittens).

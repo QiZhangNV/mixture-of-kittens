@@ -1,0 +1,33 @@
+{
+  "timestamp_utc": "2026-10-21T03:09:02.781674+00:00",
+  "status": "PASS",
+  "device_source_hash_checks": {
+    "fused": 27,
+    "baseline_bf16": 26,
+    "baseline_mxfp8": 26,
+    "thunderkittens": 115
+  },
+  "python_syntax_files": 9,
+  "shell_syntax_files": 2,
+  "historical_cases_recomputed": 12,
+  "historical_validation_records": 84,
+  "raw_files_byte_identical": 12,
+  "metrics_match_all_original_fields_except_source_path": true,
+  "benchmark_only_changed_baseline_loader_path": true,
+  "new_gpu_execution": false,
+  "existing_package_gpu_check_job": 1357149,
+  "existing_package_gpu_check_state_at_validation": "PENDING",
+  "mcore_changes_in_this_work": false,
+  "launcher_command_generation_no_GPU": [
+    {
+      "nnodes": 1,
+      "ep": 4,
+      "status": "PASS"
+    },
+    {
+      "nnodes": 16,
+      "ep": 64,
+      "status": "PASS"
+    }
+  ]
+}

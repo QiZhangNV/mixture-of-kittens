@@ -1,0 +1,2015 @@
+{
+  "profile": "ECHO",
+  "source": "synthetic proxy fitted to screenshots; NOT real planner replay",
+  "step": 45,
+  "chart_budget": "n_slot=4",
+  "world": 64,
+  "seed": 20260921,
+  "home_experts": 6,
+  "replica_capacity": 4,
+  "ingress": [
+    2,
+    2,
+    2,
+    2,
+    0,
+    2,
+    0,
+    0,
+    0,
+    2,
+    0,
+    2,
+    0,
+    2,
+    0,
+    2,
+    3,
+    2,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2,
+    2,
+    0,
+    0,
+    2,
+    0,
+    2,
+    0,
+    1,
+    3,
+    0,
+    2,
+    2,
+    1,
+    0,
+    2,
+    0,
+    1,
+    0,
+    1,
+    2,
+    2,
+    2,
+    1,
+    2,
+    0,
+    0,
+    3,
+    0,
+    0,
+    1,
+    0,
+    1,
+    2,
+    0,
+    2,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "egress": [
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    2,
+    3,
+    2,
+    0,
+    2,
+    0,
+    2,
+    0,
+    2,
+    0,
+    0,
+    0,
+    2,
+    2,
+    3,
+    1,
+    2,
+    0,
+    0,
+    2,
+    1,
+    0,
+    2,
+    0,
+    2,
+    0,
+    0,
+    2,
+    0,
+    0,
+    0,
+    2,
+    0,
+    3,
+    0,
+    2,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2,
+    3,
+    0,
+    2,
+    2,
+    0,
+    1,
+    0,
+    0,
+    2,
+    0,
+    2,
+    2,
+    3,
+    2,
+    1
+  ],
+  "total_copies": 62,
+  "replica_tokens_per_copy": 2048,
+  "post_plan_rows_per_rank": 24576,
+  "home_rows": [
+    20480,
+    20480,
+    20480,
+    20480,
+    24576,
+    20480,
+    24576,
+    24576,
+    24576,
+    20480,
+    24576,
+    20480,
+    24576,
+    20480,
+    24576,
+    20480,
+    18432,
+    20480,
+    24576,
+    24576,
+    24576,
+    24576,
+    24576,
+    20480,
+    20480,
+    24576,
+    24576,
+    20480,
+    24576,
+    20480,
+    24576,
+    22528,
+    18432,
+    24576,
+    20480,
+    20480,
+    22528,
+    24576,
+    20480,
+    24576,
+    22528,
+    24576,
+    22528,
+    20480,
+    20480,
+    20480,
+    22528,
+    20480,
+    24576,
+    24576,
+    18432,
+    24576,
+    24576,
+    22528,
+    24576,
+    22528,
+    20480,
+    24576,
+    20480,
+    24576,
+    24576,
+    24576,
+    24576,
+    24576
+  ],
+  "physical_counts": [
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      2048,
+      2048,
+      2048,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584,
+      2048,
+      0,
+      0,
+      0
+    ],
+    [
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      2048,
+      2048,
+      2048,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584,
+      2048,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584,
+      2048,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584,
+      2048,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584,
+      2048,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      2048,
+      2048,
+      2048,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584,
+      2048,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584,
+      2048,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328,
+      2048,
+      2048,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      0,
+      0,
+      0,
+      0
+    ]
+  ],
+  "logical_counts": [
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      6144
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      8192,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      10240,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      8192,
+      4096,
+      4096
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      8192
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      8192,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      8192,
+      4096,
+      4096
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      3072
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      8192,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      8192,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      10240,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      6144,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      8192
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      4096,
+      8192,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      6144,
+      4096,
+      4096
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      8192
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      8192,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584
+    ],
+    [
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      3072
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      8192,
+      4096
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584
+    ],
+    [
+      4096,
+      4096,
+      8192,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      10240,
+      4096
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584
+    ],
+    [
+      8192,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      8192,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      10240,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      3072,
+      3072,
+      3072,
+      3072,
+      3072,
+      3072
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      8192,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      8192
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584
+    ],
+    [
+      4096,
+      6144,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      3840,
+      3840,
+      3840,
+      3840,
+      3584,
+      3584
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      8192,
+      4096
+    ],
+    [
+      3584,
+      3584,
+      3328,
+      3328,
+      3328,
+      3328
+    ],
+    [
+      8192,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      8192,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      10240,
+      4096,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      8192,
+      4096,
+      4096
+    ],
+    [
+      4096,
+      4096,
+      4096,
+      4096,
+      6144,
+      4096
+    ]
+  ],
+  "edges": [
+    {
+      "source_rank": 4,
+      "source_expert": 5,
+      "destination_rank": 3,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 6,
+      "source_expert": 1,
+      "destination_rank": 1,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 6,
+      "source_expert": 1,
+      "destination_rank": 38,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 7,
+      "source_expert": 2,
+      "destination_rank": 5,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 7,
+      "source_expert": 2,
+      "destination_rank": 13,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 7,
+      "source_expert": 2,
+      "destination_rank": 15,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 8,
+      "source_expert": 3,
+      "destination_rank": 17,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 8,
+      "source_expert": 3,
+      "destination_rank": 29,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 10,
+      "source_expert": 5,
+      "destination_rank": 35,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 10,
+      "source_expert": 5,
+      "destination_rank": 42,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 12,
+      "source_expert": 1,
+      "destination_rank": 29,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 12,
+      "source_expert": 1,
+      "destination_rank": 36,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 14,
+      "source_expert": 3,
+      "destination_rank": 38,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 14,
+      "source_expert": 3,
+      "destination_rank": 45,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 18,
+      "source_expert": 1,
+      "destination_rank": 13,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 18,
+      "source_expert": 1,
+      "destination_rank": 40,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 19,
+      "source_expert": 2,
+      "destination_rank": 27,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 19,
+      "source_expert": 2,
+      "destination_rank": 34,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 20,
+      "source_expert": 3,
+      "destination_rank": 5,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 20,
+      "source_expert": 3,
+      "destination_rank": 43,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 20,
+      "source_expert": 3,
+      "destination_rank": 53,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 21,
+      "source_expert": 4,
+      "destination_rank": 15,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 22,
+      "source_expert": 5,
+      "destination_rank": 32,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 22,
+      "source_expert": 5,
+      "destination_rank": 58,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 25,
+      "source_expert": 2,
+      "destination_rank": 1,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 25,
+      "source_expert": 2,
+      "destination_rank": 43,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 26,
+      "source_expert": 3,
+      "destination_rank": 34,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 28,
+      "source_expert": 5,
+      "destination_rank": 27,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 28,
+      "source_expert": 5,
+      "destination_rank": 50,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 30,
+      "source_expert": 1,
+      "destination_rank": 45,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 30,
+      "source_expert": 1,
+      "destination_rank": 46,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 33,
+      "source_expert": 4,
+      "destination_rank": 56,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 33,
+      "source_expert": 4,
+      "destination_rank": 58,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 37,
+      "source_expert": 2,
+      "destination_rank": 17,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 37,
+      "source_expert": 2,
+      "destination_rank": 47,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 39,
+      "source_expert": 4,
+      "destination_rank": 23,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 39,
+      "source_expert": 4,
+      "destination_rank": 24,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 39,
+      "source_expert": 4,
+      "destination_rank": 55,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 41,
+      "source_expert": 0,
+      "destination_rank": 2,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 41,
+      "source_expert": 0,
+      "destination_rank": 50,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 48,
+      "source_expert": 1,
+      "destination_rank": 3,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 48,
+      "source_expert": 1,
+      "destination_rank": 16,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 49,
+      "source_expert": 2,
+      "destination_rank": 0,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 49,
+      "source_expert": 2,
+      "destination_rank": 31,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 49,
+      "source_expert": 2,
+      "destination_rank": 44,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 51,
+      "source_expert": 4,
+      "destination_rank": 9,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 51,
+      "source_expert": 4,
+      "destination_rank": 24,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 52,
+      "source_expert": 5,
+      "destination_rank": 11,
+      "replica_slot": 0,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 52,
+      "source_expert": 5,
+      "destination_rank": 35,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 54,
+      "source_expert": 1,
+      "destination_rank": 0,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 57,
+      "source_expert": 4,
+      "destination_rank": 32,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 57,
+      "source_expert": 4,
+      "destination_rank": 47,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 59,
+      "source_expert": 0,
+      "destination_rank": 2,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 59,
+      "source_expert": 0,
+      "destination_rank": 50,
+      "replica_slot": 2,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 60,
+      "source_expert": 1,
+      "destination_rank": 44,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 60,
+      "source_expert": 1,
+      "destination_rank": 56,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 61,
+      "source_expert": 2,
+      "destination_rank": 9,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 61,
+      "source_expert": 2,
+      "destination_rank": 23,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 61,
+      "source_expert": 2,
+      "destination_rank": 32,
+      "replica_slot": 2,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 62,
+      "source_expert": 3,
+      "destination_rank": 11,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 62,
+      "source_expert": 3,
+      "destination_rank": 16,
+      "replica_slot": 1,
+      "tokens": 2048
+    },
+    {
+      "source_rank": 63,
+      "source_expert": 4,
+      "destination_rank": 16,
+      "replica_slot": 2,
+      "tokens": 2048
+    }
+  ],
+  "fit": {
+    "egress": {
+      "bucket_counts": [
+        33,
+        5,
+        21,
+        5,
+        0
+      ],
+      "target_total_copies": 62,
+      "actual_mean": 0.96875,
+      "fit_cost": 0.16307843701996935,
+      "tail_assumption": "minimum-spread integers, capped at 8"
+    },
+    "ingress": {
+      "bucket_counts": [
+        31,
+        7,
+        23,
+        3,
+        0
+      ],
+      "target_total_copies": 62,
+      "actual_mean": 0.96875,
+      "fit_cost": 0.13497479408464463,
+      "tail_assumption": "minimum-spread integers, capped at 4"
+    },
+    "screenshot_marginals": {
+      "egress": {
+        "planner": "ECHO",
+        "budget_parameter": "n_slot",
+        "budget_value": 4,
+        "step": 45,
+        "direction": "egress",
+        "mean_from_label": 0.97,
+        "shares_0_1_2_3_4plus": [
+          0.5261958997722096,
+          0.0683371298405467,
+          0.3348519362186788,
+          0.07061503416856492,
+          0.0
+        ],
+        "mean_lower_bound_from_pixels": 0.9498861047835991,
+        "x_center": 1635,
+        "y_range": [
+          189,
+          726
+        ],
+        "sampled_palette_pixels": 2195,
+        "source_image": "echo_dispatch_counts_by_step_and_slot_budget.png"
+      },
+      "ingress": {
+        "planner": "ECHO",
+        "budget_parameter": "n_slot",
+        "budget_value": 4,
+        "step": 45,
+        "direction": "ingress",
+        "mean_from_label": 0.97,
+        "shares_0_1_2_3_4plus": [
+          0.48081264108352145,
+          0.12415349887133183,
+          0.34988713318284426,
+          0.045146726862302484,
+          0.0
+        ],
+        "mean_lower_bound_from_pixels": 0.9593679458239278,
+        "x_center": 1635,
+        "y_range": [
+          948,
+          1469
+        ],
+        "sampled_palette_pixels": 2215,
+        "source_image": "echo_dispatch_counts_by_step_and_slot_budget.png"
+      }
+    }
+  },
+  "assumptions": [
+    "per-rank post-plan token work balanced",
+    "per-replica tokens = half original average home-expert tokens",
+    "egress/ingress ranks paired in opposite sorted order (assumed, not observed)",
+    "single-hot-expert fan-out where logical top-k uniqueness permits",
+    "4+ tail minimally spread with cap8",
+    "fixed sampled plan repeated; all active replicas copied each call"
+  ]
+}

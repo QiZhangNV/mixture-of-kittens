@@ -1,0 +1,33 @@
+{
+  "job_id": 811385,
+  "state": "COMPLETED",
+  "exit_code": "0:0",
+  "elapsed": "00:21:49",
+  "nodes": "nvl72d029-T[01-04,06-14,16-18]",
+  "preflight_job": 811337,
+  "preflight_state": "COMPLETED",
+  "preflight_elapsed": "00:05:44",
+  "initial_failed_preflight": 811282,
+  "failure": "validation expected dtype int64 vs actual int32; corrected without changing values or tolerances",
+  "mok_aot_seconds": 277,
+  "copy_aot_seconds": 57,
+  "cases": 12,
+  "timing_records": 1836,
+  "validation_checks": 140,
+  "source_archive_matches_local": true,
+  "cpu_plan_matches_run": {
+    "dsv4_pro/BF16/ECHO": true,
+    "dsv4_pro/BF16/MoonEP": true,
+    "dsv4_pro/BF16/UltraEP": true,
+    "dsv4_pro/MXFP8/ECHO": true,
+    "dsv4_pro/MXFP8/MoonEP": true,
+    "dsv4_pro/MXFP8/UltraEP": true,
+    "glm52/BF16/ECHO": true,
+    "glm52/BF16/MoonEP": true,
+    "glm52/BF16/UltraEP": true,
+    "qwen35_397b/BF16/ECHO": true,
+    "qwen35_397b/BF16/MoonEP": true,
+    "qwen35_397b/BF16/UltraEP": true
+  },
+  "data_source": "synthetic screenshot-marginal proxy; NOT raw planner replay"
+}

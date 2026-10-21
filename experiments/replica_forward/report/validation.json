@@ -1,0 +1,914 @@
+{
+  "data/history/dsv4_pro/bf16/ECHO/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:53:23.988096+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:53:24.037982+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:53:24.227278+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        8192,
+        20480
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:53:25.245329+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:53:25.335645+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:53:25.426538+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:53:25.471840+00:00"
+    }
+  ],
+  "data/history/dsv4_pro/bf16/MoonEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:57:39.546907+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:57:39.593942+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:57:39.726849+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        8192,
+        20480
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:57:41.147910+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:57:41.252236+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:57:41.355664+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:57:41.406195+00:00"
+    }
+  ],
+  "data/history/dsv4_pro/bf16/UltraEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:55:38.050566+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:55:38.099964+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:55:38.297435+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        12288,
+        24576
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:55:39.230621+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:55:39.318769+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:55:39.406852+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:55:39.446516+00:00"
+    }
+  ],
+  "data/history/dsv4_pro/mxfp8/ECHO/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:59:46.888462+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:59:46.930594+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:59:47.130209+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        8192,
+        20480
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:59:47.788880+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:59:47.877212+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:59:47.965498+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T13:59:48.012665+00:00"
+    }
+  ],
+  "data/history/dsv4_pro/mxfp8/MoonEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:03:17.252447+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:03:17.295974+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:03:17.430922+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        8192,
+        20480
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:03:18.296839+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:03:18.409378+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:03:18.521082+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:03:18.558019+00:00"
+    }
+  ],
+  "data/history/dsv4_pro/mxfp8/UltraEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:01:31.536921+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:01:31.578690+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:01:31.708624+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        12288,
+        24576
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:01:32.324140+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:01:32.410601+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:01:32.497457+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:01:32.529635+00:00"
+    }
+  ],
+  "data/history/glm52/bf16/ECHO/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:05:06.541870+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:05:06.592414+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:05:06.739507+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        12288,
+        24576
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:05:07.408703+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:05:07.480602+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:05:07.552882+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:05:07.582549+00:00"
+    }
+  ],
+  "data/history/glm52/bf16/MoonEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:08:42.085429+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:08:42.133049+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:08:42.263049+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        12288,
+        28672
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:08:43.153356+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:08:43.233327+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:08:43.313457+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:08:43.350907+00:00"
+    }
+  ],
+  "data/history/glm52/bf16/UltraEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:06:54.860026+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:06:54.906674+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:06:55.078407+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        16384,
+        32768
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:06:55.698021+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:06:55.768206+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:06:55.838307+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:06:55.866921+00:00"
+    }
+  ],
+  "data/history/qwen35_397b/bf16/ECHO/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:10:29.996559+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:10:30.043869+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:10:30.170437+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        16384,
+        32768
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:10:30.513233+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:10:30.561091+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:10:30.608757+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:10:30.631382+00:00"
+    }
+  ],
+  "data/history/qwen35_397b/bf16/MoonEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:13:23.318734+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:13:23.366187+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:13:23.492255+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        16384,
+        36864
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:13:23.909624+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:13:23.960361+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:13:24.011313+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:13:24.034739+00:00"
+    }
+  ],
+  "data/history/qwen35_397b/bf16/UltraEP/t4096/timings.jsonl.gz": [
+    {
+      "check": "copy bytes and untouched suffix/guard",
+      "copy_sms": [
+        24,
+        48,
+        152
+      ],
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:11:56.387749+00:00"
+    },
+    {
+      "check": "both scheduler outputs match independent routes",
+      "kind": "validation",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:11:56.441588+00:00"
+    },
+    {
+      "check": "new weight epoch and logical parity",
+      "kind": "validation",
+      "payload": "row",
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:11:56.567785+00:00"
+    },
+    {
+      "check": "original/modified Ready and Fused bitwise parity; poisoned weights; all SM/prefix combinations",
+      "kind": "validation",
+      "minibatch": 4096,
+      "mok_sms": [
+        24,
+        32,
+        40,
+        48,
+        56,
+        64
+      ],
+      "prefix_fractions": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "prefix_rows_rank0": [
+        0,
+        20480,
+        40960
+      ],
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:11:56.899328+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 1,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:11:56.946373+00:00"
+    },
+    {
+      "check": "fused new weight epoch and reset reuse",
+      "epoch": 0,
+      "kind": "validation",
+      "minibatch": 4096,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:11:56.993053+00:00"
+    },
+    {
+      "check": "CUDA graph replay with reset and two weight epochs",
+      "kind": "validation",
+      "minibatch": 4096,
+      "replays": 6,
+      "status": "PASS",
+      "timestamp": "2026-09-21T14:11:57.015377+00:00"
+    }
+  ]
+}
