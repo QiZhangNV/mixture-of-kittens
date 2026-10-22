@@ -413,25 +413,9 @@ def _bwd_epilogue_fake(
     return d_x_shared.new_empty(d_x_shared.shape)
 
 
-@torch.library.register_fake("mok::copy_routed_inputs")
-def _copy_routed_inputs_fake(
-    top_experts: torch.Tensor,
-    x: torch.Tensor,
-    x_buffer: torch.Tensor,
-    router_weights: torch.Tensor,
-    router_weight_buffer: torch.Tensor,
-) -> None:
-    return None
-
-
-@torch.library.register_fake("mok::copy_routed_grad_inputs")
-def _copy_routed_grad_inputs_fake(
-    top_experts: torch.Tensor,
-    grad_output: torch.Tensor,
-    d_y_buffer: torch.Tensor,
-    x: torch.Tensor,
-    x_buffer: torch.Tensor,
-    router_weights: torch.Tensor,
-    router_weight_buffer: torch.Tensor,
+@torch.library.register_fake("mok::stage_into_buffers")
+def _stage_into_buffers_fake(
+    sources: list[torch.Tensor],
+    buffers: list[torch.Tensor],
 ) -> None:
     return None

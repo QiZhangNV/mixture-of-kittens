@@ -1367,6 +1367,44 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     )
 
 
+_PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
+_TRACING_DISPATCH_MODES = (
+    torch._C._TorchDispatchModeKey.FAKE,
+    torch._C._TorchDispatchModeKey.PROXY,
+    torch._C._TorchDispatchModeKey.FUNCTIONAL,
+)
+
+
+def _check_accumulation_operands(operands: Any) -> None:
+    """Rejects the calls that the accumulating backward wrappers below cannot run correctly.
+
+    The wrappers are not custom ops: they hand every operand to the C++ entry point, which reads raw data pointers.
+    make_fx, FakeTensorMode, FunctionalTensorMode, pre-dispatch tracing and torch.func transforms would neither record
+    nor transform that launch, and a tensor subclass would make the kernels read memory that is not its data (a
+    wrapper subclass reports a null data pointer). ``operands`` holds tensors, None, other arguments (lists hold
+    pointers), and tuples of them.
+    """
+    if (
+        any(torch._C._get_dispatch_mode(key) is not None for key in _TRACING_DISPATCH_MODES)
+        or torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
+        or torch._C._are_functorch_transforms_active()
+    ):
+        raise RuntimeError(
+            "the accumulating MoK backward (main_grads) has no custom op, so make_fx, FakeTensorMode, "
+            "FunctionalTensorMode, pre-dispatch tracing and torch.func transforms cannot trace it; "
+            "pass main_grads=None to get fresh weight gradients through the custom ops"
+        )
+    for operand in operands:
+        for value in operand if isinstance(operand, tuple) else (operand,):
+            if isinstance(value, torch.Tensor) and type(value) not in _PLAIN_TENSOR_TYPES:
+                raise TypeError(
+                    "the accumulating MoK backward (main_grads) has no custom op and launches its kernels on the "
+                    "operands' raw data pointers, so every tensor operand must be a plain torch.Tensor or "
+                    f"nn.Parameter, not {type(value).__name__}; pass main_grads=None to get fresh weight gradients "
+                    "through the custom ops"
+                )
+
+
 def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     *args: Any,
     main_grads: tuple[
@@ -1406,9 +1444,13 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     non-weight-gradient outputs; the six weight gradients are side effects.
 
     This eager wrapper is separate from the original custom op because custom
-    op outputs may not alias mutated inputs.
+    op outputs may not alias mutated inputs. Not being a custom op, it accepts
+    only plain tensors and cannot be traced (see _check_accumulation_operands).
     ``shared_grad_output`` follows the fresh op's BF16 shared-only contract.
     """
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, scale_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
     if len(main_grads) != 6:
         raise ValueError("main_grads must contain six tensors")
     main_grad_dtype = main_grads[0].dtype
@@ -1716,9 +1758,14 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
 
     This eager wrapper is intentionally separate from the original custom op:
     PyTorch custom-op outputs may not alias mutated inputs, while the C++ entry
-    point returns the supplied buffers for convenient internal bookkeeping.
+    point returns the supplied buffers for convenient internal bookkeeping. Not
+    being a custom op, it accepts only plain tensors and cannot be traced (see
+    _check_accumulation_operands).
     ``shared_grad_output`` follows the fresh op's shared-only gradient contract.
     """
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
     if len(main_grads) != 6:
         raise ValueError("main_grads must contain six tensors")
     main_grad_dtype = main_grads[0].dtype
@@ -1863,94 +1910,36 @@ def bwd_epilogue(
     return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer, top_experts)
 
 
-def _validate_routed_row_copy(
-    top_experts: torch.Tensor,
-    pairs: tuple[tuple[str, torch.Tensor, str, torch.Tensor], ...],
-    router_weights: torch.Tensor,
-    router_weight_buffer: torch.Tensor,
-) -> None:
-    if (not top_experts.is_cuda or top_experts.dtype != torch.int32 or not top_experts.is_contiguous()
-            or top_experts.ndim != 2):
-        raise ValueError("top_experts must be contiguous CUDA int32 [num_local_tokens, topk]")
-    num_local_tokens, topk = top_experts.shape
-    hidden_size = pairs[0][1].shape[-1]
-    if hidden_size <= 0 or hidden_size % 8 != 0:
-        raise ValueError("hidden_size must be a positive multiple of 8")
-    for source_name, source, destination_name, destination in pairs:
-        for name, tensor in ((source_name, source), (destination_name, destination)):
-            if (tensor.device != top_experts.device or tensor.dtype != torch.bfloat16
-                    or not tensor.is_contiguous() or tuple(tensor.shape) != (num_local_tokens, hidden_size)
-                    or tensor.data_ptr() % 16 != 0):
-                raise ValueError(f"{name} must be contiguous 16-byte aligned BF16 [num_local_tokens, hidden_size] "
-                                 "on the top_experts device")
-    for name, tensor in (("router_weights", router_weights), ("router_weight_buffer", router_weight_buffer)):
-        if (tensor.device != top_experts.device or tensor.dtype != torch.float32 or not tensor.is_contiguous()
-                or tuple(tensor.shape) != (num_local_tokens, topk)):
-            raise ValueError(f"{name} must be contiguous float32 [num_local_tokens, topk] on the top_experts device")
+@torch.library.custom_op("mok::stage_into_buffers", mutates_args=("buffers",))
+def stage_into_buffers(sources: list[torch.Tensor], buffers: list[torch.Tensor]) -> None:
+    """Copies each source in full into its workspace buffer, which peers read through raw data pointers.
 
-
-@torch.library.custom_op("mok::copy_routed_inputs", mutates_args=("x_buffer", "router_weight_buffer"))
-def copy_routed_inputs(
-    top_experts: torch.Tensor,
-    x: torch.Tensor,
-    x_buffer: torch.Tensor,
-    router_weights: torch.Tensor,
-    router_weight_buffer: torch.Tensor,
-) -> None:
-    """Stages the forward inputs that peers read from this rank's symmetric buffers.
-
-    Copies the rows of x that have at least one routed slot (top_experts >= 0) into x_buffer and leaves its other
-    rows untouched (peers read x_buffer only at routed rows), and copies all router weights.
+    The functional layer stages its inputs through this op whenever it does not launch its kernels directly, with
+    one call per direction: x and router weights in forward, grad_output (first), x and router weights in backward,
+    and x in recompute_forward_context. The op declares its writes, so a compiled graph writes the buffers in place
+    where the op runs, ahead of the barrier after which peers read them in program order (the functional module
+    comment lists when Inductor reorders them). Tensor.copy_ into a workspace buffer would instead become an input
+    mutation that AOTAutograd applies at the end of the compiled graph, after the kernels that read the buffer.
+    Because the backward call takes the incoming gradient, AOTAutograd's partitioner keeps all of its copies in the
+    backward graph of a compiled autograd.Function; a copy that does not depend on the gradient could otherwise move
+    into the forward graph. The copies have no alignment requirement.
 
     Inputs:
-        top_experts:          int32 [num_local_tokens, topk], with -1 for invalid routes
-        x:                    bfloat16 [num_local_tokens, hidden_size]
-        x_buffer:             bfloat16 [num_local_tokens, hidden_size]
-        router_weights:       float32 [num_local_tokens, topk]
-        router_weight_buffer: float32 [num_local_tokens, topk]
+        sources: tensors, each with its buffer's shape, dtype and device
+        buffers: contiguous tensors, updated in place
 
     Outputs:
         None
     """
-    _validate_routed_row_copy(top_experts, (("x", x, "x_buffer", x_buffer),), router_weights, router_weight_buffer)
-    _C.copy_routed_rows(top_experts, [x], [x_buffer], router_weights, router_weight_buffer)
-
-
-@torch.library.custom_op(
-    "mok::copy_routed_grad_inputs", mutates_args=("d_y_buffer", "x_buffer", "router_weight_buffer")
-)
-def copy_routed_grad_inputs(
-    top_experts: torch.Tensor,
-    grad_output: torch.Tensor,
-    d_y_buffer: torch.Tensor,
-    x: torch.Tensor,
-    x_buffer: torch.Tensor,
-    router_weights: torch.Tensor,
-    router_weight_buffer: torch.Tensor,
-) -> None:
-    """Stages the backward inputs that peers read from this rank's symmetric buffers.
-
-    Copies the rows of grad_output and x that have at least one routed slot into d_y_buffer and x_buffer (their
-    other rows are left untouched; peers read them only at routed rows), and copies all router weights.
-
-    Inputs:
-        top_experts:          int32 [num_local_tokens, topk], with -1 for invalid routes
-        grad_output:          bfloat16 [num_local_tokens, hidden_size]
-        d_y_buffer:           bfloat16 [num_local_tokens, hidden_size]
-        x:                    bfloat16 [num_local_tokens, hidden_size]
-        x_buffer:             bfloat16 [num_local_tokens, hidden_size]
-        router_weights:       float32 [num_local_tokens, topk]
-        router_weight_buffer: float32 [num_local_tokens, topk]
-
-    Outputs:
-        None
-    """
-    _validate_routed_row_copy(
-        top_experts,
-        (("grad_output", grad_output, "d_y_buffer", d_y_buffer), ("x", x, "x_buffer", x_buffer)),
-        router_weights,
-        router_weight_buffer,
-    )
-    _C.copy_routed_rows(
-        top_experts, [grad_output, x], [d_y_buffer, x_buffer], router_weights, router_weight_buffer
-    )
+    if len(sources) != len(buffers):
+        raise ValueError("sources and buffers must have the same length")
+    for source, buffer in zip(sources, buffers):
+        if (
+            source.shape != buffer.shape
+            or source.dtype != buffer.dtype
+            or source.device != buffer.device
+            or not buffer.is_contiguous()
+        ):
+            raise ValueError("each source must have the shape, dtype and device of its contiguous buffer")
+    for source, buffer in zip(sources, buffers):
+        buffer.copy_(source)

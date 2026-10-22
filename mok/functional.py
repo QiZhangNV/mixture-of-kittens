@@ -6,15 +6,15 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch.utils import _python_dispatch
 
 from . import _C
 from . import _gate_fused
 from .ops import (
+    _check_accumulation_operands,
     all_gather_top_experts,
     barrier_all,
     bwd_epilogue,
-    copy_routed_grad_inputs,
-    copy_routed_inputs,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
     dispatch_mlp_swiglu_combine_bwd_mxfp8_accum,
@@ -25,6 +25,7 @@ from .ops import (
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fwd_epilogue,
     schedule,
+    stage_into_buffers,
 )
 
 
@@ -185,22 +186,120 @@ _WORKSPACE_LOOKUP: dict[tuple, MoKWorkspace] = {}
 # (config, device, num_local_tokens, topk) combinations whose schedule configuration build_schedule validated.
 _VALIDATED_SCHEDULE_CONFIGS: set[tuple] = set()
 
-# Eager dispatch. torch.compile, dispatch modes and tensor subclasses get the custom ops in mok.ops. Of these, only
-# torch.compile is a supported tracer: FakeTensorMode or make_fx on their own do not intercept the direct Triton
-# launches of the fused gate backward (_gate_fused). In eager mode every custom-op call spends host time on a
-# dispatcher round trip and the op's Python argument checks, and an MoE forward and backward make a dozen of them,
-# so for plain tensors outside tracing this module launches the same C++ entry points directly. Arguments derived
-# from the workspace and schedule are valid by construction, and validate_inputs checks the caller's activations
-# and routes on every call. The caller's weights, main grads and descriptor tables go through the custom op (or
-# eager wrapper) and its checks on first use; _VALIDATED_LAUNCHES then remembers that combination of tensor objects.
-_PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
+# Eager dispatch. In eager mode every custom-op call spends host time on a dispatcher round trip and the op's Python
+# argument checks, and an MoE forward and backward make a dozen of them, so this module launches the same C++ entry
+# points directly when that is safe (_eager_dispatch): only if every tensor operand of the call is a plain torch.Tensor
+# or nn.Parameter (activations, routes, router weights, schedule, forward context, weights and scales, descriptor
+# tables, main grads, gate weight and gate main grad), and only outside tracers and transforms: not under
+# torch.compile, a dispatch mode (FakeTensorMode, make_fx, FunctionalTensorMode, ...), pre-dispatch tracing
+# (make_fx(pre_dispatch=True), torch.export) or a torch.func transform (functionalize, vmap, grad, ...). A transform's
+# wrapper tensors have the exact type torch.Tensor but hold no data a kernel can use, and inside functionalize even
+# the outputs that a C++ entry point allocates for plain operands are such wrappers. Otherwise every C++ launch of the
+# call goes through the custom ops in mok.ops, which dispatch through tensor subclasses and which tracers record; under
+# a torch.func transform, which none of them supports, the call raises instead (_reject_func_transforms).
+# Arguments derived from the workspace and schedule are valid by construction, and validate_inputs checks the caller's
+# activations and routes on every call. On the direct path, the caller's weights, main grads and descriptor tables go
+# through the custom op (or accumulating wrapper) and its checks on first use; _VALIDATED_LAUNCHES then remembers that
+# combination of tensor objects, all of them plain.
+#
+# Staging. Peers read x, router weights and grad_output from this rank's symmetric workspace buffers through raw
+# pointers. Only the direct path reads data pointers: an x or grad_output that is 256-byte aligned stands in for its
+# buffer as the shared expert's operand (x_shared), so only its routed rows are copied (_can_stand_in_for_buffer), and
+# a misaligned one is copied in full with Tensor.copy_. On the direct path the forward gate and the gate-weight
+# gradient read x_shared too, so their cuBLAS results do not depend on x's alignment. A call off the direct path
+# copies the inputs in full, at any alignment, through one call of the custom op stage_into_buffers per direction: x
+# and router weights in forward; grad_output first, then x and router weights, in backward. Unlike Tensor.copy_ into a
+# workspace buffer, which AOTAutograd would apply at the end of a compiled graph, after the kernels that read the
+# buffer, the custom op writes in place where it runs, ahead of the barrier in program order. Because the backward
+# call takes the incoming gradient, AOTAutograd's partitioner keeps it in the backward graph of a compiled
+# autograd.Function; separate copies of x and router weights would not depend on the gradient and could move into the
+# forward graph (as the backward's barriers do, see Known limitations).
+#
+# Gate backward. The fused Triton kernels of a gated backward (_gate_fused) read raw pointers too, but nothing checks
+# them. They run on plain operands outside tracers and torch.func transforms, and under torch.compile, which traces
+# them; otherwise the reference torch operations they replace run instead (_fused_gate_kernels). These round like the
+# kernels, except for the FP32 summation order of the gate gradient.
+#
+# Accumulation. backward with main_grads (fused weight-gradient accumulation) has no custom op: off the direct path
+# it calls the eager accumulating wrappers in mok.ops, which hand their operands to C++ unchanged. So with main_grads,
+# backward raises before launching anything if an operand is a tensor subclass (TypeError) or if make_fx,
+# FakeTensorMode, FunctionalTensorMode, pre-dispatch tracing or a torch.func transform is active (RuntimeError).
+# torch.compile cannot trace the wrappers either: fullgraph=True fails, and otherwise the graph breaks there.
+#
+# Known limitations, none of them new with the direct path:
+# * Order of the MoK ops under torch.compile. The custom ops tie each barrier to the work around it only through
+#   data dependencies, and a barrier depends on nothing but the barrier counter: the staging op and the megakernels
+#   do not depend on the barrier before them. Inductor keeps the program order of the MoK ops in the graphs that the
+#   tests compile, but a pass that reorders independent nodes, such as its peak-memory reordering with large
+#   unrelated work in the same graph, can move a barrier past the staging op or a megakernel.
+# * A torch.autograd.Function that calls forward and backward with main_grads=None hangs under torch.compile, even
+#   with one layer and one microbatch: AOTAutograd's partitioner moves the backward's barriers, which do not depend on
+#   the incoming gradient, into the compiled forward graph, where they run on a copy of the barrier state that peers
+#   never signal. With main_grads (MCore's pattern), Dynamo breaks the graph at the accumulating backward instead and
+#   the call runs correctly (fullgraph=True fails). A compiled function that calls forward and backward directly, in
+#   one graph, is not affected.
+# * torch.func transforms and torch.jit.trace are unsupported. Under a transform (functionalize, vmap, grad, vjp, jvp,
+#   ...), build_schedule, forward, recompute_forward_context and backward raise a RuntimeError before they launch
+#   anything: the custom ops implement no transform, and some transforms would otherwise return zero derivatives for
+#   MoK's part without an error. torch.jit.trace does not record the direct launches.
+#
+# _PLAIN_TENSOR_TYPES holds the exact types of a plain operand; NoneType admits an absent optional one.
+_PLAIN_TENSOR_TYPES = frozenset((torch.Tensor, torch.nn.Parameter, type(None)))
+_dispatch_stack_len = torch._C._len_torch_dispatch_stack
+_dispatch_key_included = torch._C._dispatch_tls_is_dispatch_key_included
+_PRE_DISPATCH = torch._C.DispatchKey.PreDispatch
+_functorch_transforms_active = torch._C._are_functorch_transforms_active
 
 
-def _eager_dispatch(tensor: torch.Tensor) -> bool:
-    """Whether to launch MoK kernels through their C++ entry points instead of the custom ops."""
-    if torch.compiler.is_compiling():
+def _eager_dispatch(tensors: tuple[torch.Tensor | None, ...]) -> bool:
+    """Whether a call launches MoK kernels through their C++ entry points instead of the custom ops.
+
+    ``tensors`` are all the tensor operands of the call, None for an absent optional one.
+    """
+    # is_dynamo_compiling() comes first: Dynamo folds it to True and so never traces the queries after it. Pre-dispatch
+    # tracing keeps its modes off the dispatch-mode stack and sets the PreDispatch key instead; its modes are entered
+    # like every TorchDispatchMode, which sets the Python flag that screens the key query. A torch.func transform
+    # neither enters a dispatch mode nor changes the type of its wrapper tensors.
+    if (
+        torch.compiler.is_dynamo_compiling()
+        or _dispatch_stack_len()
+        or (_python_dispatch._is_in_torch_dispatch_mode and _dispatch_key_included(_PRE_DISPATCH))
+        or _functorch_transforms_active()
+    ):
         return False
-    return type(tensor) in _PLAIN_TENSOR_TYPES and torch._C._len_torch_dispatch_stack() == 0
+    return _PLAIN_TENSOR_TYPES.issuperset(map(type, tensors))
+
+
+def _fused_gate_kernels(*tensors: torch.Tensor) -> bool:
+    """Whether a gated backward launches its fused Triton kernels (_gate_fused) on these operands.
+
+    Like the direct C++ launches, the kernels read raw data pointers, so outside torch.compile, whose Dynamo traces
+    them, they need plain tensors and no tracer or torch.func transform (the checks of _eager_dispatch). Otherwise the
+    reference torch operations they replace run instead, which dispatch through tensor subclasses and which tracers
+    record.
+    """
+    if torch.compiler.is_dynamo_compiling():
+        return True
+    if (
+        _dispatch_stack_len()
+        or (_python_dispatch._is_in_torch_dispatch_mode and _dispatch_key_included(_PRE_DISPATCH))
+        or _functorch_transforms_active()
+    ):
+        return False
+    return _PLAIN_TENSOR_TYPES.issuperset(map(type, tensors))
+
+
+def _reject_func_transforms() -> None:
+    """Raises a RuntimeError while a torch.func transform is active, before anything is launched.
+
+    No MoK kernel supports a transform (see Known limitations). The direct path rules transforms out already, so only
+    the custom-op path calls this; under Dynamo, which folds is_dynamo_compiling() to True, it is a no-op.
+    """
+    if not torch.compiler.is_dynamo_compiling() and _functorch_transforms_active():
+        raise RuntimeError(
+            "MoK does not support torch.func transforms (functionalize, vmap, grad, vjp, jvp, ...): build_schedule, "
+            "forward, recompute_forward_context and backward raise under one before launching anything"
+        )
 
 
 class _ValidatedLaunches:
@@ -632,8 +731,9 @@ def build_schedule(
         raise TypeError("workspace must be a MoKWorkspace")
     if not isinstance(config, MoKConfig):
         raise TypeError("config must be a MoKConfig")
-    direct = _eager_dispatch(top_experts)
+    direct = _eager_dispatch((top_experts,))
     if not direct:
+        _reject_func_transforms()
         _validate_schedule_config(workspace, config)
     else:
         config_key = (config, workspace.device, workspace.num_local_tokens, workspace.topk)
@@ -743,14 +843,30 @@ def validate_inputs(
         raise ValueError("schedule capacity does not match the workspace")
 
 
-def _can_stand_in_for_buffer(tensor: torch.Tensor) -> bool:
+def _can_stand_in_for_buffer(tensor: torch.Tensor, direct: bool) -> bool:
     """Whether a validated caller activation can replace its workspace buffer as a kernel's local operand.
 
     The megakernels read the local operand (x, or grad_output via shared_grad_output) only for the shared expert,
     through TMA descriptors; peers read the symmetric buffers only at routed rows, through the buffer pointers.
-    A traced graph has no data pointers and takes this path; the copy op's runtime checks reject a misaligned tensor.
+    Only a direct launch reads the data pointer: under a tracer the pointer is unknown, unreadable (a fake tensor has
+    no data) or not the one the traced graph will run with, and a tensor subclass's pointer need not address its data,
+    so such calls always stage full copies (_stage_in_full).
     """
-    return torch.compiler.is_compiling() or tensor.data_ptr() % 256 == 0
+    return direct and tensor.data_ptr() % 256 == 0
+
+
+def _stage_in_full(direct: bool, sources: list[torch.Tensor], buffers: list[torch.Tensor]) -> None:
+    """Copies each source in full into its workspace buffer, at any alignment.
+
+    Off the direct path the copies are one call of the stage_into_buffers custom op, which declares its writes: under
+    torch.compile, Tensor.copy_ into a workspace buffer would run at the end of the compiled graph, after the barrier
+    and the kernels whose peers read the buffer.
+    """
+    if direct:
+        for source, buffer in zip(sources, buffers):
+            buffer.copy_(source)
+    else:
+        stage_into_buffers(sources, buffers)
 
 
 def _stage_forward_inputs(
@@ -758,24 +874,30 @@ def _stage_forward_inputs(
     schedule: MoKSchedule,
     x: torch.Tensor,
     router_weights: torch.Tensor,
-    direct: bool = False,
+    direct: bool,
 ) -> torch.Tensor:
     """Fills the symmetric buffers peers read in forward and returns the shared-expert operand.
 
-    Only rows with a route are copied into x_buffer and the shared expert reads x itself; the other x_buffer rows
-    keep stale data that no kernel reads.
+    On the direct path with an aligned x, only rows with a route are copied into x_buffer and the shared expert reads
+    x itself; the other x_buffer rows keep stale data that no kernel reads. Otherwise x is copied in full and the
+    shared expert reads x_buffer.
     """
-    if _can_stand_in_for_buffer(x):
-        if direct:
-            _C.copy_routed_rows(schedule.top_experts, [x], [workspace.x_buffer],
-                                router_weights, workspace.router_weight_buffer)
-        else:
-            copy_routed_inputs(schedule.top_experts, x, workspace.x_buffer,
-                               router_weights, workspace.router_weight_buffer)
+    if _can_stand_in_for_buffer(x, direct):
+        _C.copy_routed_rows(schedule.top_experts, [x], [workspace.x_buffer],
+                            router_weights, workspace.router_weight_buffer)
         return x
-    workspace.x_buffer.copy_(x)
-    workspace.router_weight_buffer.copy_(router_weights)
+    _stage_in_full(direct, [x, router_weights], [workspace.x_buffer, workspace.router_weight_buffer])
     return workspace.x_buffer
+
+
+def _gate_bwd_pre_reference(
+    grad_output: torch.Tensor, shared_output: torch.Tensor, gate: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The torch operations that _gate_fused.gate_bwd_pre replaces: d_shared = dY * G and d_z = sigmoid_backward(dG, G)
+    with dG = (dY * S).sum(-1), at the same BF16 tensor boundaries."""
+    d_shared = grad_output * gate
+    d_gate = (grad_output * shared_output).sum(-1, keepdim=True)
+    return d_shared, torch.ops.aten.sigmoid_backward.default(d_gate, gate)
 
 
 def _validate_shared_output_gate_weight(weight: torch.Tensor, x: torch.Tensor) -> None:
@@ -859,10 +981,6 @@ def forward(
     validate_inputs(config, workspace, schedule, x, router_weights)
     if shared_output_gate_weight is not None:
         _validate_shared_output_gate_weight(shared_output_gate_weight, x)
-    direct = _eager_dispatch(x)
-
-    x_shared = _stage_forward_inputs(workspace, schedule, x, router_weights, direct)
-    _barrier(workspace, direct)
 
     split_weights = isinstance(routed_gate_weights, SplitRoutedWeight)
     if split_weights != isinstance(
@@ -883,15 +1001,6 @@ def forward(
             for weight in split_triplet
         ):
             raise ValueError("split routed gate/up/down weights must use one precision")
-
-    shared_output_gate = None
-    if shared_output_gate_weight is not None:
-        # This functional API has a manual backward; do not retain an inner
-        # autograd graph (and Z) when called with trainable X or weights.
-        with torch.no_grad():
-            shared_output_gate = torch.sigmoid(
-                torch.nn.functional.linear(x, shared_output_gate_weight)
-            )
 
     if routed_precision_is_mxfp8:
         if split_weights:
@@ -932,30 +1041,78 @@ def forward(
             routed_down_weights_fp8,
             routed_down_weights_sc,
         )
-        fwd_args = (
-            x_shared,
-            workspace.x_buffer_ptrs,
-            workspace.combine_buffer,
-            workspace.combine_buffer_ptrs,
-            *fwd_weights,
-            schedule.peer_rank,
-            schedule.peer_token_idx,
-            schedule.num_tokens,
-            schedule.tokens_per_expert,
-            workspace.topk,
-            swiglu_limit,
-            config.fwd_num_comm_sms,
-            config.macrobatch_size,
-            config.minibatch_size,
-            *routed_storage_tables,
-            *routed_scale_storage_tables,
+        routed_tables = (*routed_storage_tables, *routed_scale_storage_tables)
+    else:
+        if split_weights:
+            routed_gate_data = routed_gate_weights.data
+            routed_up_data = routed_up_weights.data
+            routed_down_data = routed_down_weights.data
+            routed_storage_tables = (
+                routed_gate_weights.storage_table,
+                routed_up_weights.storage_table,
+                routed_down_weights.storage_table,
+            )
+        else:
+            routed_gate_data = routed_gate_weights
+            routed_up_data = routed_up_weights
+            routed_down_data = routed_down_weights
+            routed_storage_tables = (None, None, None)
+        fwd_weights = (
+            shared_gate_weights,
+            routed_gate_data,
+            shared_up_weights,
+            routed_up_data,
+            shared_down_weights,
+            routed_down_data,
         )
+        routed_tables = routed_storage_tables
+
+    # One dispatch decision covers every launch of this call (see _eager_dispatch).
+    direct = _eager_dispatch((
+        x, router_weights, shared_output_gate_weight, schedule.top_experts, schedule.peer_rank,
+        schedule.peer_token_idx, schedule.num_tokens, schedule.tokens_per_expert, *fwd_weights, *routed_tables,
+    ))
+    if not direct:
+        _reject_func_transforms()
+    x_shared = _stage_forward_inputs(workspace, schedule, x, router_weights, direct)
+    _barrier(workspace, direct)
+
+    shared_output_gate = None
+    if shared_output_gate_weight is not None:
+        # This functional API has a manual backward; do not retain an inner
+        # autograd graph (and Z) when called with trainable X or weights.
+        # On the direct path the gate reads x_shared, like the shared expert:
+        # x if it is 256-byte aligned and its staged copy otherwise, so the
+        # cuBLAS result does not depend on x's alignment.
+        with torch.no_grad():
+            shared_output_gate = torch.sigmoid(
+                torch.nn.functional.linear(x_shared if direct else x, shared_output_gate_weight)
+            )
+
+    fwd_args = (
+        x_shared,
+        workspace.x_buffer_ptrs,
+        workspace.combine_buffer,
+        workspace.combine_buffer_ptrs,
+        *fwd_weights,
+        schedule.peer_rank,
+        schedule.peer_token_idx,
+        schedule.num_tokens,
+        schedule.tokens_per_expert,
+        workspace.topk,
+        swiglu_limit,
+        config.fwd_num_comm_sms,
+        config.macrobatch_size,
+        config.minibatch_size,
+        *routed_tables,
+    )
+    if routed_precision_is_mxfp8:
         if direct:
             fwd_outputs = _launch(
                 dispatch_mlp_swiglu_combine_fwd_mxfp8,
                 _C.dispatch_mlp_swiglu_combine_fwd_mxfp8,
                 fwd_args,
-                (workspace.combine_buffer, *fwd_weights, *routed_storage_tables, *routed_scale_storage_tables),
+                (workspace.combine_buffer, *fwd_weights, *routed_tables),
                 ("fwd_mxfp8", config, swiglu_limit, schedule.tokens_per_expert.shape),
             )
         else:
@@ -987,51 +1144,12 @@ def forward(
             shared_output_gate=shared_output_gate,
         )
     else:
-        if split_weights:
-            routed_gate_data = routed_gate_weights.data
-            routed_up_data = routed_up_weights.data
-            routed_down_data = routed_down_weights.data
-            routed_storage_tables = (
-                routed_gate_weights.storage_table,
-                routed_up_weights.storage_table,
-                routed_down_weights.storage_table,
-            )
-        else:
-            routed_gate_data = routed_gate_weights
-            routed_up_data = routed_up_weights
-            routed_down_data = routed_down_weights
-            routed_storage_tables = (None, None, None)
-        fwd_weights = (
-            shared_gate_weights,
-            routed_gate_data,
-            shared_up_weights,
-            routed_up_data,
-            shared_down_weights,
-            routed_down_data,
-        )
-        fwd_args = (
-            x_shared,
-            workspace.x_buffer_ptrs,
-            workspace.combine_buffer,
-            workspace.combine_buffer_ptrs,
-            *fwd_weights,
-            schedule.peer_rank,
-            schedule.peer_token_idx,
-            schedule.num_tokens,
-            schedule.tokens_per_expert,
-            workspace.topk,
-            swiglu_limit,
-            config.fwd_num_comm_sms,
-            config.macrobatch_size,
-            config.minibatch_size,
-            *routed_storage_tables,
-        )
         if direct:
             fwd_outputs = _launch(
                 dispatch_mlp_swiglu_combine_fwd_bf16,
                 _C.dispatch_mlp_swiglu_combine_fwd_bf16,
                 fwd_args,
-                (workspace.combine_buffer, *fwd_weights, *routed_storage_tables),
+                (workspace.combine_buffer, *fwd_weights, *routed_tables),
                 ("fwd_bf16", config, swiglu_limit, schedule.tokens_per_expert.shape),
             )
         else:
@@ -1125,7 +1243,20 @@ def recompute_forward_context(
     if isinstance(routed_gate_weights, tuple) and (len(routed_gate_weights) != 2 or len(routed_up_weights) != 2):
         raise ValueError("MXFP8 routed gate and up weights must be data/scale pairs")
 
-    workspace.x_buffer.copy_(x)
+    # The barrier and the recompute kernels always launch through the custom ops. Only the staging copy depends on
+    # the path: a plain Tensor.copy_ on the direct path, otherwise the staging op, which keeps the write ahead of the
+    # barrier under torch.compile (see _stage_in_full).
+    if isinstance(routed_gate_weights, tuple):
+        routed_weights = (*routed_gate_weights, *routed_up_weights)
+    else:
+        routed_weights = (routed_gate_weights, routed_up_weights)
+    direct = _eager_dispatch((
+        x, shared_gate_weights, shared_up_weights, *routed_weights, schedule.peer_rank, schedule.peer_token_idx,
+        schedule.num_tokens, schedule.tokens_per_expert,
+    ))
+    if not direct:
+        _reject_func_transforms()
+    _stage_in_full(direct, [x], [workspace.x_buffer])
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
 
@@ -1494,7 +1625,7 @@ def backward(
             raise ValueError("gated backward requires saved S/G from the original gated forward context")
         # Checked again here, before any launch: the fused gate kernels read the weight as BF16 [1, H] unchecked.
         # Their other operands are valid by construction: grad_output passed validate_inputs, S and G come from the
-        # gated forward, and d_z and d_x are fresh outputs of the kernels below.
+        # gated forward, and d_z and d_x are fresh outputs of the operations below.
         _validate_shared_output_gate_weight(shared_output_gate_weight, x)
         if shared_output_gate_main_grad is not None and (
             shared_output_gate_main_grad.dtype not in (torch.bfloat16, torch.float32)
@@ -1504,33 +1635,6 @@ def backward(
         ):
             raise ValueError("shared output gate main-grad must be contiguous BF16/FP32 [1, H] on the input device")
 
-    shared_grad_kwargs = {}
-    if gate is not None:
-        with torch.no_grad():
-            # One pass over the caller's full grad_output and S with native-style BF16 tensor boundaries:
-            # dS = dY * G uses FP32 opmath, dG sums BF16 products with an FP32 accumulator, and
-            # dZ = sigmoid_backward(dG, G) rounds like aten on BF16 (see _gate_fused).
-            d_shared, d_z = _gate_fused._launch_gate_bwd_pre(grad_output, shared_output, gate)
-        shared_grad_kwargs["shared_grad_output"] = d_shared
-
-    direct = _eager_dispatch(grad_output)
-    if _can_stand_in_for_buffer(grad_output) and _can_stand_in_for_buffer(x):
-        # Peers read d_y_buffer and x_buffer only at routed rows; the shared expert reads grad_output (or the gated
-        # d_shared) and x themselves.
-        if direct:
-            _C.copy_routed_rows(schedule.top_experts, [grad_output, x], [workspace.d_y_buffer, workspace.x_buffer],
-                                router_weights, workspace.router_weight_buffer)
-        else:
-            copy_routed_grad_inputs(schedule.top_experts, grad_output, workspace.d_y_buffer, x, workspace.x_buffer,
-                                    router_weights, workspace.router_weight_buffer)
-        shared_grad_kwargs.setdefault("shared_grad_output", grad_output)
-        x_shared = x
-    else:
-        workspace.d_y_buffer.copy_(grad_output)
-        workspace.x_buffer.copy_(x)
-        workspace.router_weight_buffer.copy_(router_weights)
-        x_shared = workspace.x_buffer
-    _barrier(workspace, direct)
     weight_args = _parse_backward_weight_arguments(
         routed_gate_weights,
         routed_up_weights,
@@ -1543,6 +1647,86 @@ def backward(
         gate_fp8_routed, gate_sc_routed = forward_context.gate_routed
         up_fp8_routed, up_sc_routed = forward_context.up_routed
         hidden_fp8_t_routed, hidden_sc_t_routed = forward_context.hidden_routed
+        routed_context = (
+            x_fp8_t_routed, x_sc_t_routed, gate_fp8_routed, gate_sc_routed,
+            up_fp8_routed, up_sc_routed, hidden_fp8_t_routed, hidden_sc_t_routed,
+        )
+        bwd_weights = (
+            shared_gate_weights,
+            weight_args.gate_column_data,
+            weight_args.gate_column_scale,
+            shared_up_weights,
+            weight_args.up_column_data,
+            weight_args.up_column_scale,
+            shared_down_weights,
+            weight_args.down_column_data,
+            weight_args.down_column_scale,
+            weight_args.gate_row_data,
+            weight_args.gate_row_scale,
+            weight_args.up_row_data,
+            weight_args.up_row_scale,
+        )
+        weight_tables = (*(weight_args.storage_tables or ()), *(weight_args.scale_storage_tables or ()))
+    else:
+        routed_context = (
+            forward_context.x_routed, forward_context.gate_routed,
+            forward_context.up_routed, forward_context.hidden_routed,
+        )
+        bwd_weights = (
+            shared_gate_weights,
+            weight_args.gate_data,
+            shared_up_weights,
+            weight_args.up_data,
+            shared_down_weights,
+            weight_args.down_data,
+        )
+        weight_tables = weight_args.storage_tables or ()
+
+    # One dispatch decision covers every C++ launch of this call (see _eager_dispatch).
+    operands = (
+        grad_output, x, router_weights, schedule.top_experts, schedule.peer_rank, schedule.peer_token_idx,
+        schedule.num_tokens, schedule.tokens_per_expert, *bwd_weights, *weight_tables, *(main_grads or ()),
+        *(main_grad_storage_tables or ()), *routed_context, forward_context.gate_shared, forward_context.up_shared,
+        forward_context.hidden_shared, shared_output, gate, shared_output_gate_weight, shared_output_gate_main_grad,
+    )
+    direct = _eager_dispatch(operands)
+    if main_grads is not None and not direct and not torch.compiler.is_dynamo_compiling():
+        # The accumulating backward has no custom op, so fail before launching anything (see the module comment).
+        _check_accumulation_operands(operands)
+    if not direct:
+        _reject_func_transforms()
+
+    shared_grad_kwargs = {}
+    # The direct path implies the conditions of the fused gate kernels: plain operands, no tracer and no transform.
+    fused_gate = gate is not None and (direct or _fused_gate_kernels(grad_output, shared_output, gate))
+    if gate is not None:
+        with torch.no_grad():
+            # Native-style BF16 tensor boundaries: dS = dY * G uses FP32 opmath, dG sums BF16 products with an FP32
+            # accumulator, and dZ = sigmoid_backward(dG, G) rounds like aten on BF16. The fused kernel makes one pass
+            # over the caller's full grad_output and S; it differs from the reference operations only in the FP32
+            # summation order of dG (see _gate_fused).
+            if fused_gate:
+                d_shared, d_z = _gate_fused._launch_gate_bwd_pre(grad_output, shared_output, gate)
+            else:
+                d_shared, d_z = _gate_bwd_pre_reference(grad_output, shared_output, gate)
+        shared_grad_kwargs["shared_grad_output"] = d_shared
+
+    if _can_stand_in_for_buffer(grad_output, direct) and _can_stand_in_for_buffer(x, direct):
+        # Peers read d_y_buffer and x_buffer only at routed rows; the shared expert reads grad_output (or the gated
+        # d_shared) and x themselves.
+        _C.copy_routed_rows(schedule.top_experts, [grad_output, x], [workspace.d_y_buffer, workspace.x_buffer],
+                            router_weights, workspace.router_weight_buffer)
+        shared_grad_kwargs.setdefault("shared_grad_output", grad_output)
+        x_shared = x
+    else:
+        # One staging call that takes grad_output first (see the module comment).
+        _stage_in_full(
+            direct, [grad_output, x, router_weights],
+            [workspace.d_y_buffer, workspace.x_buffer, workspace.router_weight_buffer],
+        )
+        x_shared = workspace.x_buffer
+    _barrier(workspace, direct)
+    if isinstance(weight_args, _MXFP8BackwardWeightArgs):
         mxfp8_bwd_args = (
             workspace.d_y_buffer,
             workspace.d_y_buffer_ptrs,
@@ -1592,21 +1776,6 @@ def backward(
         if main_grads is None:
             # Original MOK API: materialize and return six fresh weight gradients.
             if direct:
-                bwd_weights = (
-                    shared_gate_weights,
-                    weight_args.gate_column_data,
-                    weight_args.gate_column_scale,
-                    shared_up_weights,
-                    weight_args.up_column_data,
-                    weight_args.up_column_scale,
-                    shared_down_weights,
-                    weight_args.down_column_data,
-                    weight_args.down_column_scale,
-                    weight_args.gate_row_data,
-                    weight_args.gate_row_scale,
-                    weight_args.up_row_data,
-                    weight_args.up_row_scale,
-                )
                 bwd_outputs = _launch(
                     dispatch_mlp_swiglu_combine_bwd_mxfp8,
                     _C.dispatch_mlp_swiglu_combine_bwd_mxfp8,
@@ -1726,14 +1895,6 @@ def backward(
         if main_grads is None:
             # Original MOK API: materialize and return six fresh weight gradients.
             if direct:
-                bwd_weights = (
-                    shared_gate_weights,
-                    weight_args.gate_data,
-                    shared_up_weights,
-                    weight_args.up_data,
-                    shared_down_weights,
-                    weight_args.down_data,
-                )
                 bwd_outputs = _launch(
                     dispatch_mlp_swiglu_combine_bwd_bf16,
                     _C.dispatch_mlp_swiglu_combine_bwd_bf16,
@@ -1812,9 +1973,14 @@ def backward(
     d_w_output_gate = None
     if gate is not None:
         with torch.no_grad():
-            d_w_output_gate = _shared_output_gate_wgrad(d_z, x, shared_output_gate_main_grad)
+            # x_shared is x on the direct path if x is 256-byte aligned and its staged copy otherwise, so the cuBLAS
+            # result does not depend on x's alignment.
+            d_w_output_gate = _shared_output_gate_wgrad(d_z, x_shared, shared_output_gate_main_grad)
             # Deliberate BF16 merge of dZ @ Wg after the original MLP epilogue, in place on its fresh d_x.
-            d_x = _gate_fused._launch_gate_bwd_post_(d_x, d_z, shared_output_gate_weight)
+            if fused_gate and (direct or _fused_gate_kernels(d_x, shared_output_gate_weight)):
+                d_x = _gate_fused._launch_gate_bwd_post_(d_x, d_z, shared_output_gate_weight)
+            else:
+                d_x = d_x + d_z @ shared_output_gate_weight
     d_router_weights = workspace.d_router_weight_buffer.clone()  # TODO: we can remove this
     if zero_unrouted_router_grads:
         d_router_weights.masked_fill_(schedule.top_experts < 0, 0.0)

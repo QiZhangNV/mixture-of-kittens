@@ -10,8 +10,6 @@ from mok.ops import (
     all_gather_top_experts,
     barrier_all,
     bwd_epilogue,
-    copy_routed_grad_inputs,
-    copy_routed_inputs,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
@@ -21,6 +19,7 @@ from mok.ops import (
     recompute_forward_context_mxfp8,
     recompute_forward_context_bf16,
     schedule,
+    stage_into_buffers,
 )
 
 from .utils import (
@@ -2464,7 +2463,8 @@ def test_bwd_epilogue(context: tuple[int, int, torch.device]) -> None:
             raise AssertionError(f"{failure_name} should have failed")
 
 
-def test_copy_routed_inputs(context: tuple[int, int, torch.device]) -> None:
+def test_copy_routed_rows(context: tuple[int, int, torch.device]) -> None:
+    """The routed-row staging of the functional layer's eager direct path (C++ entry point, no custom op)."""
     rank, _, device = context
     generator = torch.Generator(device=device).manual_seed(4321 + rank)
     for num_local_tokens, hidden_dim, topk in ((512, 2048, 8), (768, 2304, 40)):
@@ -2482,39 +2482,75 @@ def test_copy_routed_inputs(context: tuple[int, int, torch.device]) -> None:
         d_y_buffer = torch.full_like(x, 5.0)
         router_weight_buffer = torch.full_like(router_weights, -1.0)
 
-        copy_routed_inputs(top_experts, x, x_buffer, router_weights, router_weight_buffer)
+        functional._C.copy_routed_rows(top_experts, [x], [x_buffer], router_weights, router_weight_buffer)
         assert torch.equal(x_buffer[routed], x[routed])
         assert bool((x_buffer[~routed] == 3.0).all())
         assert torch.equal(router_weight_buffer, router_weights)
 
         x_buffer.fill_(3.0)
         router_weight_buffer.fill_(-1.0)
-        copy_routed_grad_inputs(top_experts, grad_output, d_y_buffer, x, x_buffer,
-                                router_weights, router_weight_buffer)
+        functional._C.copy_routed_rows(top_experts, [grad_output, x], [d_y_buffer, x_buffer],
+                                       router_weights, router_weight_buffer)
         assert torch.equal(d_y_buffer[routed], grad_output[routed])
         assert bool((d_y_buffer[~routed] == 5.0).all())
         assert torch.equal(x_buffer[routed], x[routed])
         assert bool((x_buffer[~routed] == 3.0).all())
         assert torch.equal(router_weight_buffer, router_weights)
 
-    valid_kwargs = {
-        "top_experts": top_experts,
-        "x": x,
-        "x_buffer": x_buffer,
-        "router_weights": router_weights,
-        "router_weight_buffer": router_weight_buffer,
-    }
-    for failure_name, overrides, expected_exception in (
-        ("routes dtype", {"top_experts": top_experts.long()}, ValueError),
-        ("routes rank", {"top_experts": top_experts.flatten()}, ValueError),
-        ("buffer shape", {"x_buffer": x_buffer[:-1]}, ValueError),
-        ("buffer dtype", {"x_buffer": x_buffer.float()}, ValueError),
-        ("source shape", {"x": x[:, 8:].contiguous()}, ValueError),
-        ("weights shape", {"router_weights": router_weights[:, :1].contiguous()}, ValueError),
+    misaligned = torch.empty(x.numel() + 1, device=device, dtype=torch.bfloat16)[1:].view_as(x)
+    for failure_name, sources, destinations, weights in (
+        ("routes dtype", [x], [x_buffer], (router_weights, router_weight_buffer)),
+        ("buffer shape", [x], [x_buffer[:-1]], (router_weights, router_weight_buffer)),
+        ("buffer dtype", [x], [x_buffer.float()], (router_weights, router_weight_buffer)),
+        ("misaligned source", [misaligned], [x_buffer], (router_weights, router_weight_buffer)),
+        ("weights shape", [x], [x_buffer], (router_weights[:, :1].contiguous(), router_weight_buffer)),
     ):
+        routes = top_experts.long() if failure_name == "routes dtype" else top_experts
         try:
-            copy_routed_inputs(**(valid_kwargs | overrides))
-        except expected_exception:
+            functional._C.copy_routed_rows(routes, sources, destinations, *weights)
+        except RuntimeError:
             pass
         else:
             raise AssertionError(f"{failure_name} should have failed")
+
+
+def test_stage_into_buffers(context: tuple[int, int, torch.device]) -> None:
+    """The full-copy staging of every path but the direct one: one call copies several sources into their buffers, at
+    any alignment, and the schema declares every buffer mutated. A call with an invalid pair writes nothing."""
+    rank, _, device = context
+    generator = torch.Generator(device=device).manual_seed(1234 + rank)
+    x = torch.randn(512, 2048, generator=generator, device=device, dtype=torch.bfloat16)
+    grad_output = torch.randn(512, 2048, generator=generator, device=device, dtype=torch.bfloat16)
+    router_weights = torch.rand(512, 8, generator=generator, device=device)
+    buffers = [torch.zeros_like(grad_output), torch.zeros_like(x), torch.zeros_like(router_weights)]
+    for offset in (0, 1, 8):  # 0-, 2- and 16-byte offset views
+        sources = []
+        for tensor in (grad_output, x):
+            source = torch.empty(tensor.numel() + offset, device=device, dtype=tensor.dtype)[offset:].view_as(tensor)
+            source.copy_(tensor)
+            sources.append(source)
+        for buffer in buffers:
+            buffer.zero_()
+        assert stage_into_buffers([*sources, router_weights], buffers) is None
+        for buffer, expected in zip(buffers, (grad_output, x, router_weights), strict=True):
+            assert torch.equal(buffer, expected)
+    schema = torch.ops.mok.stage_into_buffers.default._schema
+    assert [argument.name for argument in schema.arguments if argument.alias_info is not None
+            and argument.alias_info.is_write] == ["buffers"]
+    for failure_name, sources, destinations in (
+        ("length", [x, x], [buffers[1]]),
+        ("shape", [x, x[:-1]], [buffers[1], buffers[0]]),
+        ("dtype", [x, x.float()], [buffers[1], buffers[0]]),
+        ("device", [x, x.cpu()], [buffers[1], buffers[0]]),
+        ("strided buffer", [x, x.t()], [buffers[1], torch.zeros_like(x).t()]),
+    ):
+        for buffer in buffers:
+            buffer.zero_()
+        try:
+            stage_into_buffers(sources, destinations)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{failure_name} should have failed")
+        # The pairs are checked before anything is copied.
+        assert not any(buffer.any() for buffer in buffers), failure_name

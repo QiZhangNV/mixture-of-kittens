@@ -147,9 +147,12 @@ PyTorch operations, and the shared-output multiplication is fused into the
 MOK forward epilogue. The gate backward runs two fused Triton kernels
 (`mok/_gate_fused.py`). They keep every BF16 rounding step of the PyTorch
 operations they replace; only the FP32 summation order of the gate gradient
-differs. Because these kernels are launched directly, `torch.compile` is the
-only supported tracer of a gated backward: `FakeTensorMode` or `make_fx` on
-their own do not intercept the launches.
+differs. The kernels run on plain tensors in eager mode and under
+`torch.compile`, which traces them. When `grad_output` or the saved shared
+output or gate is a tensor subclass, or under `make_fx`, `FakeTensorMode` or
+another dispatch mode, the gate backward runs those PyTorch operations
+instead; a tensor-subclass gate weight sends only the merge into `d_x` to
+them.
 
 Example with BF16 routed and shared weights:
 
@@ -196,9 +199,46 @@ then unspecified: zero, or a gradient that an earlier call wrote there.
 ### Eager launches and cached validation
 
 For plain tensors in eager mode, the functional layer launches its kernels
-directly instead of through the `mok.ops` custom ops. Under `torch.compile`,
-under a dispatch mode and for tensor subclasses, it calls the custom ops. The
-caller's activations and routes are checked on every call. Weights, main
+directly instead of through the `mok.ops` custom ops. A call makes all of its
+kernel launches through the custom ops instead when any of its tensor
+arguments is a tensor subclass (activations, routes, router weights, schedule,
+forward context, weights and scales, descriptor tables, main grads, or the
+gate weight and its main grad), and under `torch.compile`, a dispatch mode
+such as `FakeTensorMode` or `make_fx`, or pre-dispatch tracing
+(`make_fx(pre_dispatch=True)`, `torch.export`); under a `torch.func`
+transform, it raises instead. Only direct launches read data pointers: a
+direct launch reads an `x` or `grad_output` that is 256-byte aligned in place
+and copies only its routed rows into the workspace buffers, and copies a
+misaligned one in full; the gate and its weight gradient then read the same
+copy as the shared expert, so the results do not depend on the alignment of
+the inputs. Every other call copies `x`, the router weights and `grad_output`
+in full into the workspace buffers, through one call of the
+`mok.ops.stage_into_buffers` custom op per direction, so a traced graph does
+not depend on the alignment of its inputs and keeps these copies ahead of the
+kernels whose peers read the buffers.
+
+What each mode supports:
+
+| Mode | `build_schedule`, `forward`, `backward` | `backward` with `main_grads` |
+| --- | --- | --- |
+| Eager, plain tensors (CUDA graph capture included) | Direct launches | Direct launches |
+| Eager, a tensor-subclass argument | Custom ops | `TypeError` |
+| `torch.compile` | Custom ops (see the known limitations below) | Not traceable: `fullgraph=True` fails, otherwise a graph break |
+| `make_fx` (fake, symbolic or real; pre-dispatch or not), `FakeTensorMode` | Custom ops, traced | `RuntimeError` |
+| `torch.func` transforms | Unsupported: `RuntimeError` | Unsupported: `RuntimeError` |
+| `torch.jit.trace` | Unsupported: the direct launches are not recorded | Unsupported |
+| Other dispatch modes, plain tensors | Custom ops | Accumulating wrappers |
+
+`recompute_forward_context` launches its kernels through the custom ops in
+every mode. In eager mode with plain tensors it stages `x` with a plain copy;
+otherwise it stages through `stage_into_buffers`.
+
+`backward` with `main_grads` accumulates the weight gradients through eager
+wrappers that are not custom ops and hand every operand to the C++ kernels,
+so it raises before launching anything when it cannot run them safely. Pass
+`main_grads=None` to get fresh weight gradients through the custom ops.
+
+The caller's activations and routes are checked on every call. Weights, main
 grads and descriptor tables are checked when they are first used, and the
 functional layer then remembers them by tensor identity. Updating their
 values in place, as an optimizer step does, needs nothing else. If you change
@@ -208,6 +248,37 @@ a tensor of another shape or dtype to its `.data`, call
 `get_workspace` validates a repeated set of arguments once and
 `build_schedule` validates its config once per device and shape;
 `clear_workspace_cache()` clears these caches as well.
+
+#### Known limitations
+
+These hold with and without the direct launches:
+
+- **Order of the MoK ops under `torch.compile`.** The custom ops order each
+  barrier relative to the work around it only through data dependencies, and
+  a barrier depends on nothing but the barrier counter: the staging op and
+  the megakernels do not depend on the barrier before them. Inductor keeps the
+  program order of the MoK ops in the graphs that the tests compile, but a
+  pass that reorders independent nodes, such as its peak-memory reordering
+  with large unrelated work in the same graph, can move a barrier past the
+  staging op or a megakernel.
+- **Compiled `torch.autograd.Function`.** Calling `forward` and `backward`
+  with `main_grads=None` from an autograd function that `torch.compile`
+  compiles hangs, even with one layer and one microbatch: AOTAutograd's
+  partitioner moves the backward's barriers, which do not depend on the
+  incoming gradient, into the compiled forward graph. There they run on a
+  copy of the barrier state, which peers never signal. (The backward's
+  staging op takes the incoming gradient, so it stays in the backward graph.)
+  With `main_grads`, as MCore's MoE layer passes them, Dynamo cannot trace
+  the accumulating backward and breaks the graph there instead, and the call
+  runs correctly; `fullgraph=True` fails. A compiled function that calls
+  `forward` and `backward` directly, in one graph, is not affected.
+- **`torch.func` transforms and `torch.jit.trace`** are unsupported. Under a
+  transform (`functionalize`, `vmap`, `grad`, `vjp`, `jvp`, ...),
+  `build_schedule`, `forward`, `recompute_forward_context` and `backward`
+  raise a `RuntimeError` before they launch anything: the custom ops implement
+  no transform, and some transforms would otherwise return zero derivatives
+  for MoK's part without an error. `torch.jit.trace` does not record the
+  direct launches.
 
 ### Example (MXFP8 forward and backward using the functional layer)
 
