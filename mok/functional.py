@@ -12,6 +12,8 @@ from . import _C
 from . import _gate_fused
 from .ops import (
     _check_accumulation_operands,
+    _bwd_bf16_accum_entrypoint,
+    _bwd_mxfp8_accum_entrypoint,
     all_gather_top_experts,
     barrier_all,
     bwd_epilogue,
@@ -371,47 +373,6 @@ def _barrier(workspace: MoKWorkspace, direct: bool) -> None:
     elif workspace.ep_size > 1:
         _C.barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                        workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-
-
-def _bwd_mxfp8_accum_entrypoint(
-    *args: Any,
-    main_grads: tuple[torch.Tensor, ...],
-    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
-    scale_storage_tables: tuple[torch.Tensor, ...] | None = None,
-    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
-    shared_grad_output: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, ...]:
-    """The C++ launch of ops.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum, without its argument checks."""
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, shared_grad_output=shared_grad_output
-        )
-    else:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
-            *main_grad_storage_tables, shared_grad_output=shared_grad_output
-        )
-    return outputs[:12]
-
-
-def _bwd_bf16_accum_entrypoint(
-    *args: Any,
-    main_grads: tuple[torch.Tensor, ...],
-    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
-    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
-    shared_grad_output: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, ...]:
-    """The C++ launch of ops.dispatch_mlp_swiglu_combine_bwd_bf16_accum, without its argument checks."""
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, shared_grad_output=shared_grad_output
-        )
-    else:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
-            shared_grad_output=shared_grad_output,
-        )
-    return outputs[:9]
 
 
 def validate_workspace_args(

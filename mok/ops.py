@@ -1405,6 +1405,66 @@ def _check_accumulation_operands(operands: Any) -> None:
                 )
 
 
+def _validate_main_grads(main_grads: tuple[torch.Tensor, ...]) -> None:
+    if len(main_grads) != 6:
+        raise ValueError("main_grads must contain six tensors")
+    main_grad_dtype = main_grads[0].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
+    for name, main_grad in zip(
+        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
+        main_grads,
+        strict=True,
+    ):
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
+        if not main_grad.is_contiguous():
+            raise ValueError(f"main_grad_{name} must be contiguous")
+
+
+def _bwd_mxfp8_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    scale_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Unchecked MXFP8 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, shared_grad_output=shared_grad_output
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
+            *main_grad_storage_tables, shared_grad_output=shared_grad_output
+        )
+    return outputs[:12]
+
+
+def _bwd_bf16_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Unchecked BF16 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, shared_grad_output=shared_grad_output
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
+            shared_grad_output=shared_grad_output,
+        )
+    return outputs[:9]
+
+
 def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     *args: Any,
     main_grads: tuple[
@@ -1451,25 +1511,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     _check_accumulation_operands(
         (*args, main_grads, weight_storage_tables, scale_storage_tables, main_grad_storage_tables, shared_grad_output)
     )
-    if len(main_grads) != 6:
-        raise ValueError("main_grads must contain six tensors")
-    main_grad_dtype = main_grads[0].dtype
-    if main_grad_dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError("main_grads must have dtype float32 or bfloat16")
-    for name, main_grad in zip(
-        (
-            "shared_gate", "routed_gate", "shared_up",
-            "routed_up", "shared_down", "routed_down",
-        ),
-        main_grads,
-        strict=True,
-    ):
-        if not main_grad.is_cuda:
-            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
-        if main_grad.dtype != main_grad_dtype:
-            raise TypeError("all main_grads must have the same dtype")
-        if not main_grad.is_contiguous():
-            raise ValueError(f"main_grad_{name} must be contiguous")
+    _validate_main_grads(main_grads)
     split_tables = weight_storage_tables is not None
     if (
         split_tables != (scale_storage_tables is not None)
@@ -1480,25 +1522,20 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         )
     if shared_grad_output is not None:
         _validate_shared_grad_output(shared_grad_output, args[0])
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, shared_grad_output=shared_grad_output
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 5
+        or len(scale_storage_tables) != 5
+        or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError(
+            "MXFP8 split storage tables must contain five weight, five scale, and three main-grad tables"
         )
-    else:
-        if (
-            len(weight_storage_tables) != 5
-            or len(scale_storage_tables) != 5
-            or len(main_grad_storage_tables) != 3
-        ):
-            raise ValueError(
-                "MXFP8 split storage tables must contain five weight, five scale, "
-                "and three main-grad tables"
-            )
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
-            *main_grad_storage_tables, shared_grad_output=shared_grad_output
-        )
-    return outputs[:12]
+    return _bwd_mxfp8_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, scale_storage_tables=scale_storage_tables,
+        main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+    )
 
 
 def _validate_shared_grad_output(shared_grad_output: torch.Tensor, d_y_buffer: torch.Tensor) -> None:
@@ -1766,42 +1803,22 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
     _check_accumulation_operands(
         (*args, main_grads, weight_storage_tables, main_grad_storage_tables, shared_grad_output)
     )
-    if len(main_grads) != 6:
-        raise ValueError("main_grads must contain six tensors")
-    main_grad_dtype = main_grads[0].dtype
-    if main_grad_dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError("main_grads must have dtype float32 or bfloat16")
-    for name, main_grad in zip(
-        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
-        main_grads,
-        strict=True,
-    ):
-        if not main_grad.is_cuda:
-            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
-        if main_grad.dtype != main_grad_dtype:
-            raise TypeError("all main_grads must have the same dtype")
-        if not main_grad.is_contiguous():
-            raise ValueError(f"main_grad_{name} must be contiguous")
+    _validate_main_grads(main_grads)
     if (weight_storage_tables is None) != (main_grad_storage_tables is None):
         raise ValueError(
             "split weight and main-grad storage tables must be provided together"
         )
     if shared_grad_output is not None:
         _validate_shared_grad_output(shared_grad_output, args[0])
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, shared_grad_output=shared_grad_output
-        )
-    else:
-        if len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3:
-            raise ValueError(
-                "BF16 split storage tables must contain three weight and three main-grad tables"
-            )
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
-            shared_grad_output=shared_grad_output,
-        )
-    return outputs[:9]
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError("BF16 split storage tables must contain three weight and three main-grad tables")
+    return _bwd_bf16_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+    )
 
 
 @torch.library.custom_op("mok::fwd_epilogue", mutates_args=())

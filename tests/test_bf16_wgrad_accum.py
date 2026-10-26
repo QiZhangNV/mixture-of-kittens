@@ -16,10 +16,10 @@ from .utils import (
 
 @pytest.mark.parametrize("leave_one_expert_empty", [False, True])
 @pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 @pytest.mark.parametrize(
-    "routed_weight_storage",
-    ["separate_legacy", "single_grouped_legacy", "single_grouped_native"],
+    "precision,routed_weight_storage",
+    [("bf16", "separate_legacy"), ("bf16", "single_grouped_legacy"),
+     ("mxfp8", "separate_legacy"), ("mxfp8", "single_grouped_legacy"), ("mxfp8", "single_grouped_native")],
 )
 def test_wgrad_accumulates_directly_into_main_grad(
     context: tuple[int, int, torch.device],
@@ -76,61 +76,26 @@ def test_wgrad_accumulates_directly_into_main_grad(
         w_routed_down,
         d_output,
     ) = inputs
+    routed_fc1 = torch.cat((w_routed_gate, w_routed_up), dim=1) if single_grouped else None
+    routed_gate = routed_fc1 if single_grouped else w_routed_gate
+    routed_up = routed_fc1 if single_grouped else w_routed_up
     if precision == "mxfp8":
-        if single_grouped:
-            routed_fc1 = torch.cat((w_routed_gate, w_routed_up), dim=1)
-            routed_fc1_quantized = mxfp8_quantize(routed_fc1, True, True)
-            routed_down_quantized = mxfp8_quantize(w_routed_down, True, True)
-            forward_routed_gate = routed_fc1_quantized[:2]
-            forward_routed_up = forward_routed_gate
-            forward_routed_down = routed_down_quantized[:2]
+        gate = mxfp8_quantize(routed_gate, True, True)
+        up = gate if single_grouped else mxfp8_quantize(routed_up, True, True)
+        down = mxfp8_quantize(w_routed_down, True, True)
+        forward_routed = (gate[:2], up[:2], down[:2])
+
+        def columnwise(weight):
             if native_columnwise:
-                native_fc1_columnwise = (
-                    routed_fc1_quantized[2]
-                    .transpose(-2, -1)
-                    .contiguous()
-                )
-                backward_routed_gate = (
-                    routed_fc1_quantized[0],
-                    routed_fc1_quantized[1],
-                    native_fc1_columnwise,
-                    routed_fc1_quantized[3],
-                    True,
-                )
-            else:
-                backward_routed_gate = routed_fc1_quantized
-            backward_routed_up = backward_routed_gate
-            if native_columnwise:
-                backward_routed_down = (
-                    routed_down_quantized[2].transpose(-2, -1).contiguous(),
-                    routed_down_quantized[3],
-                    True,
-                )
-            else:
-                backward_routed_down = routed_down_quantized[2:]
-        else:
-            routed_gate_quantized = mxfp8_quantize(w_routed_gate, True, True)
-            routed_up_quantized = mxfp8_quantize(w_routed_up, True, True)
-            routed_down_quantized = mxfp8_quantize(w_routed_down, True, True)
-            forward_routed_gate = routed_gate_quantized[:2]
-            forward_routed_up = routed_up_quantized[:2]
-            forward_routed_down = routed_down_quantized[:2]
-            backward_routed_gate = routed_gate_quantized
-            backward_routed_up = routed_up_quantized
-            backward_routed_down = routed_down_quantized[2:]
+                return weight[2].transpose(-2, -1).contiguous(), weight[3], True
+            return weight[2:]
+
+        backward_gate = (*gate[:2], *columnwise(gate))
+        backward_up = backward_gate if single_grouped else (*up[:2], *columnwise(up))
+        backward_routed = (backward_gate, backward_up, columnwise(down))
         tolerance = MXFP8_TOLERANCE
     else:
-        if single_grouped:
-            routed_fc1 = torch.cat((w_routed_gate, w_routed_up), dim=1)
-            forward_routed_gate = routed_fc1
-            forward_routed_up = routed_fc1
-        else:
-            forward_routed_gate = w_routed_gate
-            forward_routed_up = w_routed_up
-        forward_routed_down = w_routed_down
-        backward_routed_gate = forward_routed_gate
-        backward_routed_up = forward_routed_up
-        backward_routed_down = w_routed_down
+        forward_routed = backward_routed = (routed_gate, routed_up, w_routed_down)
         tolerance = BF16_TOLERANCE
     if leave_one_expert_empty:
         topk_experts[:, 0] = (
@@ -143,24 +108,14 @@ def test_wgrad_accumulates_directly_into_main_grad(
         num_local_experts=num_local_experts,
     )
 
-    if single_grouped:
-        routed_fc1_main_grad = torch.full_like(routed_fc1, 0.25, dtype=main_grad_dtype)
-        main_grads = (
-            torch.full_like(w_shared_gate, 0.25, dtype=main_grad_dtype),
-            routed_fc1_main_grad,
-            torch.full_like(w_shared_up, 0.25, dtype=main_grad_dtype),
-            routed_fc1_main_grad,
-            torch.full_like(w_shared_down, 0.25, dtype=main_grad_dtype),
-            torch.full_like(w_routed_down, 0.25, dtype=main_grad_dtype),
-        )
-    else:
-        main_grads = tuple(
-            torch.full_like(weight, 0.25, dtype=main_grad_dtype)
-            for weight in (
-                w_shared_gate, w_routed_gate, w_shared_up,
-                w_routed_up, w_shared_down, w_routed_down,
-            )
-        )
+    routed_gate_grad = torch.full_like(routed_gate, 0.25, dtype=main_grad_dtype)
+    routed_up_grad = routed_gate_grad if single_grouped else torch.full_like(routed_up, 0.25, dtype=main_grad_dtype)
+    main_grads = (
+        torch.full_like(w_shared_gate, 0.25, dtype=main_grad_dtype), routed_gate_grad,
+        torch.full_like(w_shared_up, 0.25, dtype=main_grad_dtype), routed_up_grad,
+        torch.full_like(w_shared_down, 0.25, dtype=main_grad_dtype),
+        torch.full_like(w_routed_down, 0.25, dtype=main_grad_dtype),
+    )
     # MCore calls the fused backward once per microbatch and expects every call
     # to add into the same main_grad buffers. Exercise that lifecycle,
     # rather than validating only one add into a pre-filled tensor.
@@ -180,9 +135,7 @@ def test_wgrad_accumulates_directly_into_main_grad(
             w_shared_gate,
             w_shared_up,
             w_shared_down,
-            forward_routed_gate,
-            forward_routed_up,
-            forward_routed_down,
+            *forward_routed,
         )
         d_x, d_router_weights, *weight_gradients = functional.backward(
             config,
@@ -195,9 +148,7 @@ def test_wgrad_accumulates_directly_into_main_grad(
             w_shared_gate,
             w_shared_up,
             w_shared_down,
-            backward_routed_gate,
-            backward_routed_up,
-            backward_routed_down,
+            *backward_routed,
             main_grads=main_grads,
         )
         assert len(weight_gradients) == 7 and weight_gradients[-1] is None

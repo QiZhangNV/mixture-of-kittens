@@ -4,6 +4,8 @@ import contextlib
 import dataclasses
 import gc
 import re
+from collections import Counter
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -116,25 +118,61 @@ def _problem(
     )
 
 
-def _step(problem, **backward_kwargs):
-    """build_schedule + forward + backward, as MCore's autograd bridge calls them."""
-    p = problem
-    schedule = functional.build_schedule(
-        p["workspace"], p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
+def _schedule(p, top_experts=None):
+    return functional.build_schedule(
+        p["workspace"], p["config"], p["top_experts"] if top_experts is None else top_experts,
+        num_local_experts=p["num_local_experts"],
     )
-    output, forward_context = functional.forward(
-        p["config"], p["workspace"], schedule, p["x"], p["router_weights"], *p["shared"],
-        *p["forward_routed"], **p["gate_kwargs"],
+
+
+def _forward(p, schedule, x=None, router_weights=None, **gate_kwargs):
+    return functional.forward(
+        p["config"], p["workspace"], schedule, p["x"] if x is None else x,
+        p["router_weights"] if router_weights is None else router_weights,
+        *p["shared"], *p["forward_routed"], **(p["gate_kwargs"] | gate_kwargs),
     )
-    gate_kwargs = dict(p["gate_kwargs"])
+
+
+def _backward(p, schedule, forward_context, d_output=None, x=None, router_weights=None, **kwargs):
+    options = dict(p["gate_kwargs"], main_grads=p["main_grads"])
     if p["gate_main_grad"] is not None:
-        gate_kwargs["shared_output_gate_main_grad"] = p["gate_main_grad"]
-    gradients = functional.backward(
-        p["config"], p["workspace"], schedule, forward_context, p["d_output"], p["x"],
-        p["router_weights"], *p["shared"], *p["backward_routed"], main_grads=p["main_grads"],
-        **gate_kwargs, **backward_kwargs,
+        options["shared_output_gate_main_grad"] = p["gate_main_grad"]
+    return functional.backward(
+        p["config"], p["workspace"], schedule, forward_context,
+        p["d_output"] if d_output is None else d_output, p["x"] if x is None else x,
+        p["router_weights"] if router_weights is None else router_weights,
+        *p["shared"], *p["backward_routed"], **(options | kwargs),
     )
-    return output, gradients
+
+
+def _step(p, **backward_kwargs):
+    schedule = _schedule(p)
+    output, forward_context = _forward(p, schedule)
+    return output, _backward(p, schedule, forward_context, **backward_kwargs)
+
+
+def _assert_equal(expected, actual):
+    """Compare nested tensor results, including the absent gate gradient of ungated calls."""
+    expected_leaves, expected_spec = pytree.tree_flatten(expected)
+    actual_leaves, actual_spec = pytree.tree_flatten(actual)
+    assert actual_spec == expected_spec
+    for index, (reference, result) in enumerate(zip(expected_leaves, actual_leaves, strict=True)):
+        if reference is None:
+            assert result is None
+        else:
+            assert torch.equal(reference, result), f"result {index} differs"
+
+
+def _run_twice(p):
+    """Compare both microbatches independently; snapshots keep accumulated gradients from aliasing later writes."""
+    for grad in (*(p["main_grads"] or ()), p["gate_main_grad"]):
+        if grad is not None:
+            _unwrap(grad).zero_()
+    results = []
+    for _ in range(2):
+        results.append(pytree.tree_map_only(torch.Tensor, lambda t: _unwrap(t).clone(), _step(p)))
+    torch.cuda.synchronize()
+    return results
 
 
 def _count_calls(monkeypatch, names):
@@ -154,29 +192,20 @@ def _count_calls(monkeypatch, names):
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 def test_eager_dispatch_matches_custom_ops(context, monkeypatch, precision, gated):
     problem = _problem(context, precision, gated=gated)
-    main_grads = [g for g in (*problem["main_grads"], problem["gate_main_grad"]) if g is not None]
 
     def run(direct):
-        for main_grad in main_grads:
-            main_grad.zero_()
         functional._VALIDATED_LAUNCHES.clear()
         with monkeypatch.context() as patch:
             if not direct:
                 patch.setattr(functional, "_eager_dispatch", lambda tensors: False)
             counts = _count_calls(patch, CUSTOM_OPS + ACCUMULATING_WRAPPERS)
-            results = []
-            # Two microbatches accumulate into the same main grads, as in MCore.
-            for _ in range(2):
-                output, (d_x, d_router_weights, *_) = _step(problem)
-                results += [output, d_x, d_router_weights]
-        torch.cuda.synchronize()
-        return results + [main_grad.clone() for main_grad in main_grads], counts
+            results = _run_twice(problem)
+        return results, counts
 
     expected, op_counts = run(direct=False)
     actual, direct_counts = run(direct=True)
 
-    for index, (reference, result) in enumerate(zip(expected, actual, strict=True)):
-        assert torch.equal(reference, result), f"result {index} differs between dispatch paths"
+    _assert_equal(expected, actual)
     # Every launch went through a custom op (or wrapper) before; now only the first megakernel
     # launch of each kind with these weights does, for its argument checks.
     accumulate = f"dispatch_mlp_swiglu_combine_bwd_{precision}_accum"
@@ -237,82 +266,61 @@ def test_validated_launches_drop_entries_with_their_tensors():
 
 def test_get_workspace_lookup_skips_revalidation(context, monkeypatch):
     _, _, device = context
-    calls = []
-    validate = functional.validate_workspace_args
-
-    def counting_validate(*args, **kwargs):
-        calls.append(kwargs["num_local_tokens"])
-        return validate(*args, **kwargs)
-
-    monkeypatch.setattr(functional, "validate_workspace_args", counting_validate)
+    validate = Mock(wraps=functional.validate_workspace_args)
+    monkeypatch.setattr(functional, "validate_workspace_args", validate)
     config = functional.MoKConfig(minibatch_size=256, macrobatch_size=512)
     kwargs = dict(device=device, num_local_tokens=1024, hidden_size=256, topk=2)
     first = functional.get_workspace(config, dist.group.WORLD, **kwargs)
-    validated = len(calls)  # get_workspace, plus create_workspace if it built the workspace
+    validated = validate.call_count  # get_workspace, plus create_workspace if it built the workspace
     assert validated in (1, 2)
     assert functional.get_workspace(config, dist.group.WORLD, **kwargs) is first
     equal_config = functional.MoKConfig(minibatch_size=256, macrobatch_size=512)
     assert functional.get_workspace(equal_config, dist.group.WORLD, **kwargs) is first
-    assert len(calls) == validated
+    assert validate.call_count == validated
     # Invalid arguments are never remembered: each call validates and raises again.
     for _ in range(2):
         with pytest.raises(ValueError, match="num_local_tokens"):
             functional.get_workspace(config, dist.group.WORLD, **{**kwargs, "num_local_tokens": 100})
-    assert calls[validated:] == [100, 100]
+    assert [call.kwargs["num_local_tokens"] for call in validate.call_args_list[validated:]] == [100, 100]
 
 
 def _isolate_workspace_caches(monkeypatch):
-    """Empty workspace caches for one test, and a create_workspace that returns stand-in objects.
-
-    The stand-ins allocate no symmetric memory (which must not outlive its process group) and never reach the
-    barriers of clear_workspace_cache: monkeypatch restores the real caches afterwards.
-    """
+    """Stand-ins avoid symmetric memory that could outlive a destroyed process group."""
     monkeypatch.setattr(functional, "_WORKSPACE_CACHE", {})
     monkeypatch.setattr(functional, "_WORKSPACE_LOOKUP", {})
-    created = []
-
-    def create_stand_in(*args, **kwargs):
-        created.append(object())
-        return created[-1]
-
-    monkeypatch.setattr(functional, "create_workspace", create_stand_in)
-    return created
+    create = Mock(return_value=object())
+    monkeypatch.setattr(functional, "create_workspace", create)
+    return create
 
 
 def test_get_workspace_lookup_rejects_destroyed_group(context, monkeypatch):
     """A lookup hit is returned only while its process group exists: after the group is destroyed, every call
     validates the arguments again and raises, as get_workspace did before it had the lookup."""
     _, world_size, device = context
-    created = _isolate_workspace_caches(monkeypatch)
-    calls = []
-    validate = functional.validate_workspace_args
-
-    def counting_validate(*args, **kwargs):
-        calls.append(kwargs["num_local_tokens"])
-        return validate(*args, **kwargs)
-
-    monkeypatch.setattr(functional, "validate_workspace_args", counting_validate)
+    create = _isolate_workspace_caches(monkeypatch)
+    validate = Mock(wraps=functional.validate_workspace_args)
+    monkeypatch.setattr(functional, "validate_workspace_args", validate)
     config = functional.MoKConfig(minibatch_size=256, macrobatch_size=512)
     kwargs = dict(device=device, num_local_tokens=1024, hidden_size=256, topk=2)
     group = dist.new_group(list(range(world_size)))
     workspace = functional.get_workspace(config, group, **kwargs)
     assert functional.get_workspace(config, group, **kwargs) is workspace
-    assert len(calls) == 1  # the second call was a lookup hit
+    assert validate.call_count == 1  # the second call was a lookup hit
     dist.destroy_process_group(group)
     for _ in range(2):
         with pytest.raises((RuntimeError, ValueError)):
             functional.get_workspace(config, group, **kwargs)
-    assert len(calls) == 3
+    assert validate.call_count == 3
     # The stale entry is dropped, so the lookup no longer keeps the destroyed group alive.
     assert not any(group in key for key in functional._WORKSPACE_LOOKUP)
-    assert created == [workspace]
+    create.assert_called_once()
 
 
 def test_get_workspace_lookup_rejects_uninitialized_distributed(context, monkeypatch):
     """Once torch.distributed reports itself uninitialized (as after destroy_process_group()), a lookup hit is not
     returned: get_workspace validates and raises. Re-initialized, the arguments validate and hit the cache again."""
     _, _, device = context
-    created = _isolate_workspace_caches(monkeypatch)
+    create = _isolate_workspace_caches(monkeypatch)
     config = functional.MoKConfig(minibatch_size=256, macrobatch_size=512)
     kwargs = dict(device=device, num_local_tokens=1024, hidden_size=256, topk=2)
     world = dist.group.WORLD
@@ -323,7 +331,7 @@ def test_get_workspace_lookup_rejects_uninitialized_distributed(context, monkeyp
         with pytest.raises(RuntimeError, match="must be initialized"):
             functional.get_workspace(config, world, **kwargs)
     assert functional.get_workspace(config, world, **kwargs) is workspace
-    assert created == [workspace]
+    create.assert_called_once()
 
 
 @pytest.mark.parametrize("bad_weight", ["fp32", "short", "column", "strided"])
@@ -341,23 +349,16 @@ def test_gate_weight_checked_by_forward_and_backward(context, bad_weight):
         "column": lambda: weight.reshape(hidden, 1),
         "strided": lambda: torch.stack((weight, weight), dim=-1).reshape(1, 2 * hidden)[:, ::2],
     }[bad_weight]()
-    schedule = functional.build_schedule(
-        p["workspace"], p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
-    forward_args = (p["config"], p["workspace"], schedule, p["x"], p["router_weights"], *p["shared"],
-                    *p["forward_routed"])
+    schedule = _schedule(p)
     with pytest.raises(ValueError, match="shared_output_gate_weight must be"):
-        functional.forward(*forward_args, shared_output_gate_weight=bad)
-    _, forward_context = functional.forward(*forward_args, shared_output_gate_weight=weight)
-    backward_args = (p["config"], p["workspace"], schedule, forward_context, p["d_output"], p["x"],
-                     p["router_weights"], *p["shared"], *p["backward_routed"])
-    backward_kwargs = dict(main_grads=p["main_grads"], shared_output_gate_main_grad=p["gate_main_grad"])
+        _forward(p, schedule, shared_output_gate_weight=bad)
+    _, forward_context = _forward(p, schedule)
     with pytest.raises(ValueError, match="shared_output_gate_weight must be"):
-        functional.backward(*backward_args, shared_output_gate_weight=bad, **backward_kwargs)
+        _backward(p, schedule, forward_context, shared_output_gate_weight=bad)
     torch.cuda.synchronize()
     # Nothing was launched: every main grad is still zero, and the same context still runs its backward.
     assert not any(main_grad.any() for main_grad in (*p["main_grads"], p["gate_main_grad"]))
-    functional.backward(*backward_args, shared_output_gate_weight=weight, **backward_kwargs)
+    _backward(p, schedule, forward_context)
     torch.cuda.synchronize()
     assert p["main_grads"][0].any() and p["gate_main_grad"].any()
 
@@ -395,9 +396,7 @@ def _mok_targets(names):
 
 
 def _expected_targets(precision, *, backward=True):
-    """The custom-op path of build_schedule, forward and a backward without main_grads. The inputs are staged by full
-    copies into the workspace buffers, one staging call per direction (x and router weights; then grad_output, x and
-    router weights), because no data pointer is read off the direct path."""
+    """Expected custom-op order, including one full staging operation per direction."""
     forward = [
         "mok.all_gather_top_experts.default",
         "mok.barrier_all.default",
@@ -435,12 +434,7 @@ class _Subclass(torch.Tensor):
 
 
 class _WrapperTensor(torch.Tensor):
-    """A __torch_dispatch__ wrapper subclass, like DTensor or a quantized-tensor subclass.
-
-    It owns no storage, so data_ptr() is 0: a kernel launched on it directly reads address 0, an illegal memory
-    access. Every operation runs on the plain tensor it wraps. With rewrap=True the results are wrapped again, so the
-    subclass spreads to the forward context.
-    """
+    """Storage-less dispatch wrapper; rewrap=True propagates it into the forward context."""
 
     @staticmethod
     def __new__(cls, inner, rewrap=False):
@@ -472,10 +466,7 @@ def _unwrap(value):
 
 
 def test_eager_dispatch_takes_plain_operands_outside_tracing():
-    """The direct path needs every operand to be a plain tensor or parameter (None stands for an absent optional one)
-    and no tracer or transform: under torch.compile, a dispatch mode, pre-dispatch tracing or a torch.func transform,
-    whose wrapper tensors have the exact type torch.Tensor, a call always gets the custom ops. The fused gate kernels
-    follow the same rule, except that torch.compile traces them."""
+    """Check operand types and tracing modes; only Triton may launch under Dynamo."""
     from torch.fx.experimental.proxy_tensor import make_fx
 
     class _ParameterSubclass(torch.nn.Parameter):
@@ -539,6 +530,9 @@ class _LaunchRecorder:
 def _record_subclass_launches(monkeypatch):
     launches = []
     monkeypatch.setattr(functional, "_C", _LaunchRecorder(functional._C, launches))
+    recorder = _LaunchRecorder(functional, launches)
+    for name in ("_bwd_bf16_accum_entrypoint", "_bwd_mxfp8_accum_entrypoint"):
+        monkeypatch.setattr(functional, name, getattr(recorder, name))
     monkeypatch.setattr(functional, "_gate_fused", _LaunchRecorder(functional._gate_fused, launches))
     return launches
 
@@ -587,73 +581,53 @@ def _use_subclass(problem, operand, monkeypatch, wrap):
      "gate_weight", "gate_main_grad"],
 )
 def test_subclass_operand_takes_custom_ops(context, monkeypatch, operand):
-    """One tensor subclass among a call's operands sends every C++ launch of that call through the custom ops, on
-    every call: a launch with a subclass operand is never remembered for direct launches, and no kernel that
-    functional launches directly (C++ entry point or fused gate kernel) ever receives the subclass. The results equal
-    the direct path's bitwise. The gate operands here are plain except the gate weight, whose merge then runs as the
-    reference torch operations, which round like the fused merge."""
+    """A subclass forces custom ops on cold and warm calls, with bitwise-equivalent results."""
     problem = _problem(context, "mxfp8", gated=True, accumulate=False)
     problem["gate_main_grad"] = torch.zeros_like(problem["gate_kwargs"]["shared_output_gate_weight"],
                                                  dtype=torch.float32)
 
     def run():
-        problem["gate_main_grad"].zero_()
         functional._VALIDATED_LAUNCHES.clear()
         with monkeypatch.context() as patch:
             counts = _count_calls(patch, CUSTOM_OPS + ACCUMULATING_WRAPPERS + ("_launch",))
             launches = _record_subclass_launches(patch)
-            results = []
-            for _ in range(2):
-                output, gradients = _step(problem)
-                results += [output, *gradients]
-        torch.cuda.synchronize()
-        return results + [problem["gate_main_grad"].clone()], counts, launches
+            results = _run_twice(problem)
+        return results, counts, launches
 
     expected, _, _ = run()
     _use_subclass(problem, operand, monkeypatch, lambda tensor: tensor.as_subclass(_Subclass))
     actual, counts, subclass_launches = run()
 
-    for index, (reference, result) in enumerate(zip(expected, actual, strict=True)):
-        assert torch.equal(reference, result), f"result {index} differs from the direct path"
+    _assert_equal(expected, actual)
     assert subclass_launches == []
-    # Two microbatches. build_schedule launches directly unless the routes themselves are the subclass; forward
-    # does unless one of its operands is.
+    # Reuse the traced-path expectation for each affected phase, for two microbatches.
     backward_only = operand in ("forward_context", "gate_main_grad")
-    expected_counts = {
-        "barrier_all": 2 * (2 + (0 if backward_only else 2) + (1 if operand == "top_experts" else 0)),
-        "stage_into_buffers": 2 * (1 + (0 if backward_only else 1)),
-        "dispatch_mlp_swiglu_combine_bwd_mxfp8": 2,
-        "bwd_epilogue": 2,
-    }
     if backward_only:
-        # Direct forward: its megakernel launch goes through the custom op once, for the first-use checks.
-        expected_counts |= {"_launch": 2, "dispatch_mlp_swiglu_combine_fwd_mxfp8": 1}
+        affected = _expected_targets("mxfp8")[8:]
+    elif operand == "top_experts":
+        affected = _expected_targets("mxfp8")
     else:
-        expected_counts |= {"dispatch_mlp_swiglu_combine_fwd_mxfp8": 2, "fwd_epilogue": 2}
-    if operand == "top_experts":
-        expected_counts |= {"all_gather_top_experts": 2, "schedule": 2}
+        affected = _expected_targets("mxfp8")[3:]
+    expected_counts = Counter(name.split(".")[1] for name in affected * 2)
+    if backward_only:
+        expected_counts.update({"_launch": 2, "dispatch_mlp_swiglu_combine_fwd_mxfp8": 1})
     assert {name: count for name, count in counts.items() if count} == expected_counts
 
 
 def _reference_gate(monkeypatch):
-    """All launches through the custom ops and the gate backward as the reference torch operations: what a call with
-    a subclass gate operand, or under a dispatch mode, computes for plain tensors."""
+    """Force custom ops and reference gate arithmetic for a plain-tensor numerical oracle."""
     monkeypatch.setattr(functional, "_eager_dispatch", lambda tensors: False)
     monkeypatch.setattr(functional, "_fused_gate_kernels", lambda *tensors: False)
 
 
-@pytest.mark.parametrize("accumulate", [False, True])
 @pytest.mark.parametrize(
-    "operand",
-    ["routed_weight", "shared_weight", "router_weights", "gate_weight", "main_grad", "d_output", "x_rewrapped"],
+    "operand,accumulate",
+    [(operand, accumulate) for operand in
+     ("routed_weight", "shared_weight", "router_weights", "gate_weight", "main_grad", "d_output", "x_rewrapped")
+     for accumulate in (False, True) if accumulate or operand != "main_grad"],
 )
 def test_wrapper_subclass_operand(context, monkeypatch, operand, accumulate):
-    """A __torch_dispatch__ wrapper subclass (no storage, data_ptr() 0) never reaches a kernel that functional launches
-    directly, on any call. Without main_grads, forward and backward run through the custom ops and the reference gate
-    operations, and give the results of plain tensors bitwise. With main_grads, which has no custom op, backward raises
-    a TypeError before it launches anything."""
-    if operand == "main_grad" and not accumulate:
-        pytest.skip("main grads exist only with accumulation")
+    """Storage-less wrappers use custom ops; accumulating backward rejects them before any launch."""
     problem = _problem(context, "mxfp8", gated=True, accumulate=accumulate)
     workspace = problem["workspace"]
     # The reference gate operations sum the gate gradient in another order than the fused kernel, so a call whose
@@ -661,54 +635,32 @@ def test_wrapper_subclass_operand(context, monkeypatch, operand, accumulate):
     reference_gate = operand in ("d_output", "x_rewrapped")
 
     def run(record=False):
-        for main_grad in (*(problem["main_grads"] or ()), problem["gate_main_grad"]):
-            if main_grad is not None:
-                _unwrap(main_grad).zero_()
-        results = []
         with monkeypatch.context() as patch:
             launches = _record_subclass_launches(patch) if record else []
             if reference_gate and not record:
                 _reference_gate(patch)
-            for _ in range(2):  # the second call is the one a warm validation cache would launch directly
-                output, gradients = _step(problem)
-                results += [_unwrap(output), *map(_unwrap, gradients)]
-        torch.cuda.synchronize()
+            results = _run_twice(problem)
         assert launches == []
         return results
 
     if not accumulate:
         expected = run()
-        if operand == "x_rewrapped":
-            _use_subclass(problem, "x", monkeypatch, lambda tensor: _WrapperTensor(tensor, rewrap=True))
-        else:
-            _use_subclass(problem, operand, monkeypatch, _WrapperTensor)
-        actual = run(record=True)
-        for index, (reference, result) in enumerate(zip(expected, actual, strict=True)):
-            assert type(result) is not _WrapperTensor
-            assert torch.equal(reference, result), f"result {index} differs from plain tensors"
-        return
-
     if operand == "x_rewrapped":
         _use_subclass(problem, "x", monkeypatch, lambda tensor: _WrapperTensor(tensor, rewrap=True))
     else:
         _use_subclass(problem, operand, monkeypatch, _WrapperTensor)
+    if not accumulate:
+        _assert_equal(expected, run(record=True))
+        return
+
     p = problem
-    schedule = functional.build_schedule(
-        p["workspace"], p["config"], _unwrap(p["top_experts"]), num_local_experts=p["num_local_experts"]
-    )
-    _, forward_context = functional.forward(
-        p["config"], workspace, schedule, p["x"], p["router_weights"], *p["shared"], *p["forward_routed"],
-        **p["gate_kwargs"],
-    )
+    schedule = _schedule(p, top_experts=_unwrap(p["top_experts"]))
+    _, forward_context = _forward(p, schedule)
     workspace.d_y_buffer.fill_(float("nan"))
     torch.cuda.synchronize()
     barrier_target = workspace.barrier_target.clone()
     with pytest.raises(TypeError, match="main_grads"):
-        functional.backward(
-            p["config"], workspace, schedule, forward_context, p["d_output"], p["x"], p["router_weights"],
-            *p["shared"], *p["backward_routed"], main_grads=p["main_grads"],
-            shared_output_gate_main_grad=p["gate_main_grad"], **p["gate_kwargs"],
-        )
+        _backward(p, schedule, forward_context)
     torch.cuda.synchronize()
     # Nothing was launched: no barrier, no staging, no accumulation.
     assert torch.equal(workspace.barrier_target, barrier_target)
@@ -741,8 +693,7 @@ def _at_offset(tensor, offset_bytes):
 
 
 def _misaligned_inputs(p, offset):
-    """x, router weights and grad_output at ``offset`` bytes past 512-byte alignment (router weights at whole FP32
-    elements)."""
+    """Offset x, router weights and grad_output; router weights stay aligned to whole FP32 elements."""
     return (
         _at_offset(p["x"], offset),
         _at_offset(p["router_weights"], offset - offset % 4),
@@ -754,28 +705,19 @@ def _misaligned_inputs(p, offset):
     "precision,num_local_tokens,hidden_dim", [("bf16", 512, 256), ("mxfp8", 512, 256), ("mxfp8", 8192, 1024)]
 )
 def test_eager_stages_misaligned_inputs_in_full(context, monkeypatch, precision, num_local_tokens, hidden_dim):
-    """In eager mode, an x or grad_output that is not 256-byte aligned does not stand in for its workspace buffer: the
-    direct path stages it by a full copy, and every result equals the aligned run's bitwise. That includes the gate
-    and its weight gradient, which cuBLAS computes from the staged copy, as the shared expert does: at 8192 x 1024, a
-    gate computed from x at a 2-byte offset differs in the last bit for some tokens, which changes the output and
-    every gradient."""
+    """Misaligned inputs stage in full and match aligned results, including gate and weight gradients.
+
+    The 8192 x 1024 case catches cuBLAS alignment-dependent rounding in the gate at a 2-byte offset.
+    """
     p = _problem(
         context, precision, gated=True, accumulate=False, single_grouped=precision == "mxfp8",
         num_local_tokens=num_local_tokens, hidden_dim=hidden_dim,
     )
-    schedule = functional.build_schedule(
-        p["workspace"], p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
+    schedule = _schedule(p)
 
     def step(x, router_weights, d_output):
-        output, forward_context = functional.forward(
-            p["config"], p["workspace"], schedule, x, router_weights, *p["shared"], *p["forward_routed"],
-            **p["gate_kwargs"],
-        )
-        gradients = functional.backward(
-            p["config"], p["workspace"], schedule, forward_context, d_output, x, router_weights, *p["shared"],
-            *p["backward_routed"], **p["gate_kwargs"],
-        )
+        output, forward_context = _forward(p, schedule, x=x, router_weights=router_weights)
+        gradients = _backward(p, schedule, forward_context, d_output=d_output, x=x, router_weights=router_weights)
         return (forward_context.shared_output_gate, output, *gradients)
 
     names = ("gate", "output", "d_x", "d_router_weights", *(f"weight gradient {i}" for i in range(6)),
@@ -801,28 +743,17 @@ def test_eager_stages_misaligned_inputs_in_full(context, monkeypatch, precision,
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 def test_inductor_stages_inputs_ahead_of_peers(context, precision, gated):
-    """Under torch.compile with the default backend (AOTAutograd and Inductor), forward and backward stage x, router
-    weights and grad_output into the workspace buffers before the barrier after which peers read them, at any
-    alignment: of the compiled function's inputs, and of contiguous views that the compiled function takes at an
-    offset. The buffers are poisoned before every compiled call, and the results equal eager ones bitwise."""
+    """Compiled staging must precede peer reads for both offset inputs and views taken inside the graph."""
     from torch._inductor.utils import run_and_get_code
 
     # BF16 with separate gate and up weights: the fake kernel of the BF16 backward does not describe the
     # combined-FC1 weight gradient, which Inductor checks.
     p = _problem(context, precision, gated=gated, accumulate=False, single_grouped=precision == "mxfp8")
-    schedule = functional.build_schedule(
-        p["workspace"], p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
+    schedule = _schedule(p)
 
     def step(x, router_weights, d_output):
-        output, forward_context = functional.forward(
-            p["config"], p["workspace"], schedule, x, router_weights, *p["shared"], *p["forward_routed"],
-            **p["gate_kwargs"],
-        )
-        gradients = functional.backward(
-            p["config"], p["workspace"], schedule, forward_context, d_output, x, router_weights, *p["shared"],
-            *p["backward_routed"], **p["gate_kwargs"],
-        )
+        output, forward_context = _forward(p, schedule, x=x, router_weights=router_weights)
+        gradients = _backward(p, schedule, forward_context, d_output=d_output, x=x, router_weights=router_weights)
         return (output, *gradients[:8]) + ((gradients[8],) if gated else ())
 
     def step_on_views(x_storage, router_weights, d_output_storage, offset):
@@ -870,7 +801,7 @@ def test_inductor_stages_inputs_ahead_of_peers(context, precision, gated):
         torch._dynamo.reset()
     assert not failures, failures
     # The generated code keeps the program order of the MoK ops: each staging write precedes its barrier.
-    calls = re.findall(r"torch\.ops\.mok\.(\w+)\.default\(", "\n".join(codes))
+    calls = _mok_calls(codes)
     assert calls == [name.split(".")[1] for name in _expected_targets(precision)[3:]], calls
 
 
@@ -881,9 +812,7 @@ def _mok_calls(codes):
 
 @contextlib.contextmanager
 def _inductor_code(check=None):
-    """Collects the code that Inductor generates inside the block. Inductor hands each graph's code over before the
-    graph first runs, also on a cache hit, so ``check(code)`` can stop a graph by raising. Unlike run_and_get_code, it
-    does not reset Dynamo, which would also drop the Triton kernels that a lazily compiled backward graph refers to."""
+    """Intercept generated code before execution; unlike run_and_get_code this preserves Dynamo state."""
     from unittest import mock
 
     from torch._inductor.graph import GraphLowering
@@ -914,27 +843,19 @@ _CONTEXT_FIELDS = ("x_routed", "gate_shared", "gate_routed", "up_shared", "up_ro
     [("bf16", False, False), ("bf16", True, True), ("mxfp8", True, False), ("mxfp8", True, True)],
 )
 def test_inductor_compiles_autograd_function(context, precision, single_grouped, gated):
-    """MCore calls forward and backward from a torch.autograd.Function. Compiled with the default backend (one layer,
-    one microbatch, one compiled region), the forward graph and the backward graph would each run their own MoK ops in
-    program order, and with the workspace buffers poisoned before the forward and again before the backward, the
-    output and gradients would equal eager ones bitwise. The backward's staging op takes the incoming gradient, so the
-    partitioner keeps it in the backward graph; the backward's barriers do not depend on it. Each graph is checked
-    before it first runs, because a graph that runs a barrier out of place, or on a copy of the barrier buffer, which
-    peers never signal, would wait forever."""
+    """Check forward/backward partitioning with poisoned buffers and bitwise numerical comparison.
+
+    Inspect generated code before running: misplaced barriers can wait forever on unshared copies.
+    """
     p = _problem(context, precision, gated=gated, accumulate=False, single_grouped=single_grouped)
     workspace = p["workspace"]
-    schedule = functional.build_schedule(
-        workspace, p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
+    schedule = _schedule(p)
     paired = precision == "mxfp8"
 
     class MoE(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, router_weights):
-            output, forward_context = functional.forward(
-                p["config"], workspace, schedule, x, router_weights, *p["shared"], *p["forward_routed"],
-                **p["gate_kwargs"],
-            )
+            output, forward_context = _forward(p, schedule, x=x, router_weights=router_weights)
             saved = []
             for name in _CONTEXT_FIELDS:
                 value = getattr(forward_context, name)
@@ -953,9 +874,9 @@ def test_inductor_compiles_autograd_function(context, precision, single_grouped,
                     values.append((saved.pop(0), saved.pop(0)))
                 else:
                     values.append(saved.pop(0))
-            gradients = functional.backward(
-                p["config"], workspace, schedule, functional.MoKForwardContext(*values, *saved),
-                d_output.contiguous(), x, router_weights, *p["shared"], *p["backward_routed"], **p["gate_kwargs"],
+            gradients = _backward(
+                p, schedule, functional.MoKForwardContext(*values, *saved),
+                d_output=d_output.contiguous(), x=x, router_weights=router_weights,
             )
             return gradients[0], gradients[1]
 
@@ -1014,15 +935,10 @@ def test_inductor_compiles_autograd_function(context, precision, single_grouped,
 )
 @pytest.mark.parametrize("gated", [False, True])
 def test_inductor_keeps_mok_order_under_memory_pressure(context, gated):
-    """Inductor reorders independent operations when that lowers its estimated peak memory (reorder_for_peak_memory,
-    on by default). In this graph, whose first product is used last and whose MoK inputs depend on another product,
-    every MoK op would have to stay in program order. The workspace buffers are poisoned before each call, and the
-    results would equal eager ones bitwise."""
+    """Peak-memory reordering must preserve staging/barrier/kernel order despite unrelated matrix products."""
     rank, _, device = context
     p = _problem(context, "mxfp8", gated=gated, accumulate=False)
-    schedule = functional.build_schedule(
-        p["workspace"], p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
+    schedule = _schedule(p)
     generator = torch.Generator(device=device).manual_seed(11 + rank)
     c = torch.randn(4096, 4096, generator=generator, device=device)
     d = torch.randn(4096, 4096, generator=generator, device=device)
@@ -1034,14 +950,8 @@ def test_inductor_keeps_mok_order_under_memory_pressure(context, gated):
         zero = 0.0 * torch.mm(a, b).sum()  # x and grad_output depend on it, and equal x_in and d_in
         x = (x_in.float() + zero).to(torch.bfloat16)
         d_output = (d_in.float() + zero).to(torch.bfloat16)
-        output, forward_context = functional.forward(
-            p["config"], p["workspace"], schedule, x, router_weights, *p["shared"], *p["forward_routed"],
-            **p["gate_kwargs"],
-        )
-        gradients = functional.backward(
-            p["config"], p["workspace"], schedule, forward_context, d_output, x, router_weights, *p["shared"],
-            *p["backward_routed"], **p["gate_kwargs"],
-        )
+        output, forward_context = _forward(p, schedule, x=x, router_weights=router_weights)
+        gradients = _backward(p, schedule, forward_context, d_output=d_output, x=x, router_weights=router_weights)
         return (output, *gradients[:8], *(gradients[8:] if gated else ())), big.sum(0)
 
     inputs = (p["x"], p["router_weights"], p["d_output"], a, b, c, d)
@@ -1076,26 +986,15 @@ def test_inductor_keeps_mok_order_under_memory_pressure(context, gated):
 @pytest.mark.parametrize("pre_dispatch", [False, True])
 @pytest.mark.parametrize("tracing_mode", ["fake", "symbolic", "real"])
 def test_make_fx_traces_forward_and_backward(context, monkeypatch, tracing_mode, pre_dispatch, gated):
-    """Standalone make_fx traces build_schedule, forward and backward (gated or not, without main_grads) to the
-    custom ops, with the gate backward as the reference torch operations. No data pointer is read, so fake tracing
-    launches nothing, and the graph does not depend on the alignment of the traced inputs. A real-mode graph replays
-    to the eager results bitwise."""
+    """Fake tracing must launch nothing; real-mode graph replay must match the reference gate path bitwise."""
     from torch.fx.experimental.proxy_tensor import make_fx
 
     p = _problem(context, "mxfp8", gated=gated, accumulate=False)
 
     def step(x, top_experts, router_weights, d_output):
-        schedule = functional.build_schedule(
-            p["workspace"], p["config"], top_experts, num_local_experts=p["num_local_experts"]
-        )
-        output, forward_context = functional.forward(
-            p["config"], p["workspace"], schedule, x, router_weights, *p["shared"], *p["forward_routed"],
-            **p["gate_kwargs"],
-        )
-        gradients = functional.backward(
-            p["config"], p["workspace"], schedule, forward_context, d_output, x, router_weights, *p["shared"],
-            *p["backward_routed"], **p["gate_kwargs"],
-        )
+        schedule = _schedule(p, top_experts=top_experts)
+        output, forward_context = _forward(p, schedule, x=x, router_weights=router_weights)
+        gradients = _backward(p, schedule, forward_context, d_output=d_output, x=x, router_weights=router_weights)
         return output, *gradients[:8], *(gradients[8:] if gated else ())
 
     inputs = (p["x"], p["top_experts"], p["router_weights"], p["d_output"])
@@ -1122,14 +1021,12 @@ def test_make_fx_traces_forward_and_backward(context, monkeypatch, tracing_mode,
     _poison(workspace)
     actual = graph(*inputs)
     torch.cuda.synchronize()
-    for index, (reference, result) in enumerate(zip(expected, actual, strict=True)):
-        assert torch.equal(reference, result), f"result {index} differs from eager"
+    _assert_equal(expected, actual)
 
 
 @pytest.mark.parametrize("gated", [False, True])
 def test_fake_tensor_mode_runs_forward_and_backward(context, gated):
-    """FakeTensorMode on its own runs build_schedule, forward and backward (gated or not) to outputs with the right
-    metadata, without launching anything: the workspace buffers keep their contents."""
+    """Standalone FakeTensorMode returns correct metadata without touching workspace buffers."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     p = _problem(context, "mxfp8", gated=gated, accumulate=False)
@@ -1140,16 +1037,11 @@ def test_fake_tensor_mode_runs_forward_and_backward(context, gated):
     barrier_target = workspace.barrier_target.clone()
     with FakeTensorMode(allow_non_fake_inputs=True) as mode:
         fake = {name: mode.from_tensor(p[name]) for name in ("x", "top_experts", "router_weights", "d_output")}
-        schedule = functional.build_schedule(
-            workspace, p["config"], fake["top_experts"], num_local_experts=p["num_local_experts"]
-        )
-        output, forward_context = functional.forward(
-            p["config"], workspace, schedule, fake["x"], fake["router_weights"], *p["shared"],
-            *p["forward_routed"], **p["gate_kwargs"],
-        )
-        gradients = functional.backward(
-            p["config"], workspace, schedule, forward_context, fake["d_output"], fake["x"], fake["router_weights"],
-            *p["shared"], *p["backward_routed"], **p["gate_kwargs"],
+        schedule = _schedule(p, top_experts=fake["top_experts"])
+        output, forward_context = _forward(p, schedule, x=fake["x"], router_weights=fake["router_weights"])
+        gradients = _backward(
+            p, schedule, forward_context, d_output=fake["d_output"],
+            x=fake["x"], router_weights=fake["router_weights"],
         )
     torch.cuda.synchronize()
     assert all(type(tensor) is torch._subclasses.fake_tensor.FakeTensor for tensor in (output, *gradients[:8]))
@@ -1170,20 +1062,11 @@ def test_main_grads_cannot_be_traced(context, tracer):
 
     p = _problem(context, "mxfp8", gated=True, accumulate=True)
     workspace = p["workspace"]
-    schedule = functional.build_schedule(
-        workspace, p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
-    _, forward_context = functional.forward(
-        p["config"], workspace, schedule, p["x"], p["router_weights"], *p["shared"], *p["forward_routed"],
-        **p["gate_kwargs"],
-    )
+    schedule = _schedule(p)
+    _, forward_context = _forward(p, schedule)
 
     def backward(d_output):
-        return functional.backward(
-            p["config"], workspace, schedule, forward_context, d_output, p["x"], p["router_weights"], *p["shared"],
-            *p["backward_routed"], main_grads=p["main_grads"], shared_output_gate_main_grad=p["gate_main_grad"],
-            **p["gate_kwargs"],
-        )
+        return _backward(p, schedule, forward_context, d_output=d_output)
 
     torch.cuda.synchronize()
     barrier_target = workspace.barrier_target.clone()
@@ -1205,44 +1088,35 @@ def test_main_grads_cannot_be_traced(context, tracer):
 @pytest.mark.parametrize(
     "transform,target",
     [("functionalize", "backward"), ("vmap", "backward"), ("grad", "backward"), ("vjp", "backward"),
-     ("jvp", "backward"), ("jvp", "forward"), ("grad", "forward_gate_weight"), ("vmap", "backward_gate_weight")],
+     ("jvp", "backward"), ("jvp", "forward"), ("grad", "forward_gate_weight"), ("vmap", "backward_gate_weight"),
+     ("functionalize", "forward_unused"), ("functionalize", "backward_unused"),
+     ("functionalize", "forward_gate_weight"), ("functionalize", "backward_gate_weight"),
+     ("functionalize", "backward_gate_weight_main_grads")],
 )
-def test_func_transforms_raise_before_launching_on_wrapped_tensors(context, transform, target):
-    """torch.func transforms are unsupported. Their wrapper tensors have the exact type torch.Tensor and hold no data
-    of their own, and the custom ops implement no transform, so under a transform forward and backward (gated here)
-    raise a RuntimeError before they launch anything: they neither launch a kernel on a null pointer nor return zero
-    derivatives for MoK's part, as jvp, or grad with respect to the gate weight, would through the custom ops. The
-    next plain step runs normally."""
-    p = _problem(context, "mxfp8", gated=True, accumulate=False)
-    expected = _step(p)
-    workspace = p["workspace"]
-    schedule = functional.build_schedule(
-        workspace, p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
-    weight = p["gate_kwargs"]["shared_output_gate_weight"]
-    _, forward_context = functional.forward(
-        p["config"], workspace, schedule, p["x"], p["router_weights"], *p["shared"], *p["forward_routed"],
-        shared_output_gate_weight=weight,
-    )
+def test_func_transforms_raise_before_launching(context, transform, target):
+    """Reject transforms even with plain-looking wrapper tensors or only an unrelated dummy input transformed."""
+    accumulate = target.endswith("main_grads")
+    gated = not target.endswith("unused")
+    p = _problem(context, "mxfp8", gated=gated, accumulate=accumulate)
+    # Warm the validation cache; snapshot outputs because accumulation mutates the returned main grads.
+    expected = pytree.tree_map_only(torch.Tensor, lambda t: t.clone(), _step(p))
+    schedule = _schedule(p)
+    _, forward_context = _forward(p, schedule)
 
-    def forward(x=p["x"], w=weight):
-        return functional.forward(
-            p["config"], workspace, schedule, x, p["router_weights"], *p["shared"], *p["forward_routed"],
-            shared_output_gate_weight=w,
-        )[0]
+    def call(argument):
+        kwargs = {"shared_output_gate_weight": argument} if "gate_weight" in target else {}
+        if target.startswith("forward"):
+            return _forward(p, schedule, x=argument if target == "forward" else None, **kwargs)[0]
+        return _backward(p, schedule, forward_context,
+                         d_output=argument if target == "backward" else None, **kwargs)[0]
 
-    def backward(d_output=p["d_output"], w=weight):
-        return functional.backward(
-            p["config"], workspace, schedule, forward_context, d_output, p["x"], p["router_weights"],
-            *p["shared"], *p["backward_routed"], shared_output_gate_weight=w,
-        )[0]
-
-    function, argument = {
-        "forward": (lambda x: forward(x=x), p["x"]),
-        "backward": (lambda d_output: backward(d_output=d_output), p["d_output"]),
-        "forward_gate_weight": (lambda w: forward(w=w), weight),
-        "backward_gate_weight": (lambda w: backward(w=w), weight),
-    }[target]
+    if target.endswith("unused"):
+        function = lambda dummy: call(None).float().sum() + dummy
+        argument = torch.zeros((), device=p["x"].device)
+    else:
+        function = call
+        argument = (p["gate_kwargs"]["shared_output_gate_weight"] if "gate_weight" in target
+                    else p["x"] if target == "forward" else p["d_output"])
     transformed = {
         "functionalize": lambda: torch.func.functionalize(function)(argument),
         "vmap": lambda: torch.func.vmap(function)(argument.unsqueeze(0)),
@@ -1252,83 +1126,15 @@ def test_func_transforms_raise_before_launching_on_wrapped_tensors(context, tran
     }[transform]
     torch.cuda.synchronize()
     dist.barrier()
-    barrier_target = workspace.barrier_target.clone()
-    with pytest.raises(RuntimeError, match="torch.func transforms"):
+    barrier_target = p["workspace"].barrier_target.clone()
+    with pytest.raises(RuntimeError, match="main_grads" if accumulate else "torch.func transforms"):
         transformed()
         torch.cuda.synchronize()
     torch.cuda.synchronize()
-    # Nothing was launched: not even a barrier.
-    assert torch.equal(workspace.barrier_target, barrier_target)
-    actual = _step(p)
-    torch.cuda.synchronize()
-    for index, (reference, result) in enumerate(zip((expected[0], *expected[1]), (actual[0], *actual[1]), strict=True)):
-        assert torch.equal(reference, result), f"result {index} differs after the transform"
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["forward_unused", "backward_unused", "forward_gate_weight", "backward_gate_weight",
-     "backward_gate_weight_main_grads"],
-)
-def test_functionalize_never_launches_directly(context, case):
-    """Inside torch.func.functionalize no dispatch mode is active and every tensor keeps the exact type torch.Tensor,
-    but a C++ entry point launched there would allocate its outputs as functional tensors and write through them, an
-    illegal memory access, even when no MoK operand is transformed (the *_unused cases transform only a dummy input)
-    or when only the gate weight is. Such a call raises a RuntimeError before anything is launched (with main_grads,
-    the accumulating backward's own check raises first), and the next plain step is unaffected."""
-    accumulate = case.endswith("main_grads")
-    gated = "gate_weight" in case
-    p = _problem(context, "mxfp8", gated=gated, accumulate=accumulate)
-    # A plain step first, which also fills the validated-launch cache with these tensors.
-    output, gradients = _step(p)
-    expected = (output, gradients[0], gradients[1])
-    workspace = p["workspace"]
-    schedule = functional.build_schedule(
-        workspace, p["config"], p["top_experts"], num_local_experts=p["num_local_experts"]
-    )
-    _, forward_context = functional.forward(
-        p["config"], workspace, schedule, p["x"], p["router_weights"], *p["shared"], *p["forward_routed"],
-        **p["gate_kwargs"],
-    )
-
-    def forward(weight):
-        kwargs = {"shared_output_gate_weight": weight} if gated else {}
-        return functional.forward(
-            p["config"], workspace, schedule, p["x"], p["router_weights"], *p["shared"], *p["forward_routed"],
-            **kwargs,
-        )[0]
-
-    def backward(weight):
-        kwargs = {"shared_output_gate_weight": weight} if gated else {}
-        if accumulate:
-            kwargs["shared_output_gate_main_grad"] = p["gate_main_grad"]
-        return functional.backward(
-            p["config"], workspace, schedule, forward_context, p["d_output"], p["x"], p["router_weights"],
-            *p["shared"], *p["backward_routed"], main_grads=p["main_grads"], **kwargs,
-        )[0]
-
-    function = forward if case.startswith("forward") else backward
-    if case.endswith("unused"):
-        transformed = lambda dummy: function(None).float().sum() + dummy  # noqa: E731
-        argument = torch.zeros((), device=p["x"].device)
-    else:
-        transformed, argument = function, p["gate_kwargs"]["shared_output_gate_weight"]
-    torch.cuda.synchronize()
-    dist.barrier()
-    barrier_target = workspace.barrier_target.clone()
-    with pytest.raises(RuntimeError) as error:
-        torch.func.functionalize(transformed)(argument)
-        torch.cuda.synchronize()
-    assert "illegal memory access" not in str(error.value)
-    assert ("main_grads" in str(error.value)) == accumulate
-    torch.cuda.synchronize()
-    # Nothing was launched: not even a barrier.
-    assert torch.equal(workspace.barrier_target, barrier_target)
+    assert torch.equal(p["workspace"].barrier_target, barrier_target)
     if accumulate:
         for main_grad in (*p["main_grads"], p["gate_main_grad"]):
             main_grad.zero_()
-    output, gradients = _step(p)
+    actual = _step(p)
     torch.cuda.synchronize()
-    for name, reference, result in zip(("output", "d_x", "d_router_weights"), expected,
-                                       (output, gradients[0], gradients[1]), strict=True):
-        assert torch.equal(reference, result), f"{name} differs after the transform"
+    _assert_equal(expected, actual)
