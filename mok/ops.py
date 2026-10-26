@@ -3,9 +3,10 @@ from typing import Any
 import torch
 
 from . import _C
+from ._eager_fast_path import eager_fast_path_custom_op
 
 
-@torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
+@eager_fast_path_custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
 def all_gather_top_experts(
     top_experts: torch.Tensor,
     all_gather_top_experts_buffer: torch.Tensor,
@@ -63,7 +64,7 @@ def all_gather_top_experts(
         _C.all_gather_top_experts(top_experts, all_gather_top_experts_buffer, all_gather_top_experts_buffer_multicast_ptr, rank, chunk_bytes)
 
 
-@torch.library.custom_op("mok::barrier_all", mutates_args=("barrier_buffer", "target"))
+@eager_fast_path_custom_op("mok::barrier_all", mutates_args=("barrier_buffer", "target"))
 def barrier_all(
     barrier_buffer: torch.Tensor,
     barrier_buffer_ptrs: list[int],
@@ -108,7 +109,7 @@ def barrier_all(
         _C.barrier_all(barrier_buffer, barrier_buffer_ptrs, barrier_buffer_multicast_ptr, target)
 
 
-@torch.library.custom_op("mok::schedule", mutates_args=())
+@eager_fast_path_custom_op("mok::schedule", mutates_args=())
 def schedule(
     topk_all: torch.Tensor,
     num_local_experts: int,
@@ -158,7 +159,7 @@ def schedule(
     return _C.schedule(topk_all, num_local_experts, schedule_capacity, rank)
 
 
-@torch.library.custom_op(
+@eager_fast_path_custom_op(
     "mok::mxfp8_quantize", mutates_args=(),
     schema="(Tensor x_bf16, bool return_normal, bool return_transposed) -> (Tensor?, Tensor?, Tensor?, Tensor?)",
 )
@@ -289,7 +290,7 @@ def make_routed_d_weight_storage_table(
     return _make_routed_storage_table(expert_tensors, precision="wgrad")
 
 
-@torch.library.custom_op("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8", mutates_args=("combine_buffer",))
+@eager_fast_path_custom_op("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8", mutates_args=("combine_buffer",))
 def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -557,7 +558,7 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     )
 
 
-@torch.library.custom_op("mok::dispatch_mlp_swiglu_combine_fwd_bf16", mutates_args=("combine_buffer",))
+@eager_fast_path_custom_op("mok::dispatch_mlp_swiglu_combine_fwd_bf16", mutates_args=("combine_buffer",))
 def dispatch_mlp_swiglu_combine_fwd_bf16(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -755,7 +756,7 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     )
 
 
-@torch.library.custom_op("mok::recompute_forward_context_mxfp8", mutates_args=())
+@eager_fast_path_custom_op("mok::recompute_forward_context_mxfp8", mutates_args=())
 def recompute_forward_context_mxfp8(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -900,7 +901,7 @@ def recompute_forward_context_mxfp8(
     )
 
 
-@torch.library.custom_op("mok::recompute_forward_context_bf16", mutates_args=())
+@eager_fast_path_custom_op("mok::recompute_forward_context_bf16", mutates_args=())
 def recompute_forward_context_bf16(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -1017,7 +1018,7 @@ def recompute_forward_context_bf16(
     )
 
 
-@torch.library.custom_op(
+@eager_fast_path_custom_op(
     "mok::dispatch_mlp_swiglu_combine_bwd_mxfp8",
     mutates_args=("d_x_routed_buffer", "d_router_weight_buffer",
                   "x_fp8_t_routed", "x_sc_t_routed",
@@ -1470,7 +1471,7 @@ def _validate_shared_grad_output(shared_grad_output: torch.Tensor, d_y_buffer: t
         raise ValueError("shared_grad_output must be contiguous CUDA BF16 with d_y_buffer's shape/device")
 
 
-@torch.library.custom_op(
+@eager_fast_path_custom_op(
     "mok::dispatch_mlp_swiglu_combine_bwd_bf16",
     mutates_args=("d_x_routed_buffer", "d_router_weight_buffer", "x_routed", "gate_routed", "up_routed", "hidden_routed"),
 )
@@ -1757,7 +1758,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
     return outputs[:9]
 
 
-@torch.library.custom_op("mok::fwd_epilogue", mutates_args=())
+@eager_fast_path_custom_op("mok::fwd_epilogue", mutates_args=())
 def fwd_epilogue(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
@@ -1817,7 +1818,7 @@ def fwd_epilogue(
     )
 
 
-@torch.library.custom_op("mok::bwd_epilogue", mutates_args=())
+@eager_fast_path_custom_op("mok::bwd_epilogue", mutates_args=())
 def bwd_epilogue(
     d_x_shared: torch.Tensor,
     d_x_routed_buffer: torch.Tensor,
