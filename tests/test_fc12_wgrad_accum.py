@@ -34,19 +34,33 @@ def test_canonical_fc12_wgrad_accum(context: tuple[int, int, torch.device]) -> N
      routed_gate, routed_up, routed_fc2, grad_output) = inputs
     shared_fc1 = torch.cat((shared_gate, shared_up), dim=0)
     routed_fc1 = torch.cat((routed_gate, routed_up), dim=1)
+    shared_gate_view = shared_fc1[:intermediate_dim]
+    shared_up_view = shared_fc1[intermediate_dim:]
+    assert shared_gate_view.is_contiguous() and shared_up_view.is_contiguous()
     schedule = functional.build_schedule(workspace, config, top_experts, num_local_experts=num_local_experts)
     main_grads = tuple(
         torch.full_like(weight, 0.25, dtype=torch.bfloat16)
         for weight in (shared_fc1, routed_fc1, shared_fc2, routed_fc2)
     )
     # Shared weights use contiguous gate/up views. Routed gate/up share the whole FC1 tensor and use kernel offsets.
-    weights = (*shared_fc1.chunk(2, dim=0), shared_fc2, routed_fc1, routed_fc1, routed_fc2)
+    weights = (shared_gate_view, shared_up_view, shared_fc2, routed_fc1, routed_fc1, routed_fc2)
     shared_gate_grad, shared_up_grad = main_grads[0].chunk(2, dim=0)
-    grad_args = (shared_gate_grad, main_grads[1], shared_up_grad, main_grads[1], main_grads[2], main_grads[3])
+    abi_main_grads = (shared_gate_grad, main_grads[1], shared_up_grad, main_grads[1], main_grads[2], main_grads[3])
+    assert all(gradient.is_contiguous() for gradient in abi_main_grads)
     output, forward_context = functional.forward(config, workspace, schedule, x, router_weights, *weights)
-    d_x, d_router_weights, *_ = functional.backward(
-        config, workspace, schedule, forward_context, grad_output, x, router_weights, *weights, main_grads=grad_args,
+    backward_outputs = functional.backward(
+        config, workspace, schedule, forward_context, grad_output, x, router_weights, *weights, main_grads=abi_main_grads,
     )
+
+    assert len(backward_outputs) == 9 and backward_outputs[-1] is None
+    d_x, d_router_weights = backward_outputs[:2]
+    for actual, expected_alias in zip(
+        backward_outputs[2:8],
+        (abi_main_grads[1], abi_main_grads[3], abi_main_grads[5],
+         abi_main_grads[0], abi_main_grads[2], abi_main_grads[4]),
+        strict=True,
+    ):
+        assert actual is expected_alias
 
     # Match the optimizer operation that exposed the end-to-end regression; each packed allocation appears once.
     noop = torch.zeros(1, dtype=torch.int32, device=device)
