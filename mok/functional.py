@@ -1,4 +1,5 @@
 import math
+import struct
 from dataclasses import dataclass
 from typing import Any
 
@@ -574,12 +575,20 @@ def _shared_output_gate_wgrad(
 def _situ_kwargs(beta, swiglu_limit):
     if beta is None:
         return {}
+    error = "situ_beta must contain two positive finite FP32 numbers"
     if (not isinstance(beta, tuple) or len(beta) != 2
-            or any(type(b) not in (int, float) or not math.isfinite(b) or b <= 0 for b in beta)):
-        raise ValueError("situ_beta must contain two positive finite numbers")
+            or any(type(b) not in (int, float) for b in beta)):
+        raise ValueError(error)
+    # Validate the kernel's FP32 values before they can alias the (0, 0) legacy sentinel.
+    try:
+        beta = struct.unpack("ff", struct.pack("ff", *beta))
+    except (OverflowError, struct.error) as exc:
+        raise ValueError(error) from exc
+    if any(not math.isfinite(b) or b <= 0 for b in beta):
+        raise ValueError(error)
     if swiglu_limit is not None:
         raise ValueError("SiTU cannot be combined with swiglu_limit")
-    return dict(situ_beta1=float(beta[0]), situ_beta2=float(beta[1]))
+    return dict(situ_beta1=beta[0], situ_beta2=beta[1])
 
 
 def forward(
@@ -1160,11 +1169,11 @@ def backward(
     routed_down_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     swiglu_limit: float | None = None,
     main_grads: tuple[
+        torch.Tensor | None,
         torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
     ]
     | None = None,
@@ -1215,6 +1224,8 @@ def backward(
                              shared gate, routed gate, shared up, routed up,
                              shared down, routed down. If provided, wgrad is
                              accumulated in-place instead of returned freshly.
+                             Shared slots must be all tensors or all None,
+                             matching the shared weights.
         main_grad_storage_tables:
                              None for contiguous single-grouped main grads;
                              for non-single weights, descriptor tables ordered
@@ -1228,6 +1239,7 @@ def backward(
         ``main_grads is None``; otherwise they alias the supplied accumulation
         buffers. For split weights, routed entries are representative tensors
         while the storage tables address every expert buffer.
+        Without shared experts, the three shared-weight gradient entries are None.
 
         d_x:                   bfloat16 [num_local_tokens, hidden_size]
         d_router_weights:      float32 [num_local_tokens, topk]

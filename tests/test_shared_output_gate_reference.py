@@ -210,6 +210,12 @@ def test_situ_fused_shared(context, precision, gated):
     state = _mok_schedule(context, inputs, macrobatch_size=512)  # Force routed replay.
     gate_kw = dict(shared_output_gate_weight=weight) if gated else {}
     beta = (2.0, 8.0)  # Non-default values detect a dropped activation parameter.
+    assert functional._situ_kwargs(None, None) == {}
+    for invalid_beta in ((1e-50, 1e-50), (1e-50, 8.0), (2.0, 1e-50),
+                         (1e50, 8.0), (2.0, 1e50)):
+        with pytest.raises(ValueError, match="positive finite FP32"):
+            functional.forward(*state, x, probs, *weights[:3], *fwd_weights,
+                               **gate_kw, situ_beta=invalid_beta)
 
     def activation(a, u):
         a, u = a.float(), u.float()
