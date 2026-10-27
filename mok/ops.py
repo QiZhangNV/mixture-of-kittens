@@ -1367,6 +1367,104 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     )
 
 
+_PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
+_TRACING_DISPATCH_MODES = (
+    torch._C._TorchDispatchModeKey.FAKE,
+    torch._C._TorchDispatchModeKey.PROXY,
+    torch._C._TorchDispatchModeKey.FUNCTIONAL,
+)
+
+
+def _check_accumulation_operands(operands: Any) -> None:
+    """Rejects the calls that the accumulating backward wrappers below cannot run correctly.
+
+    The wrappers are not custom ops: they hand every operand to the C++ entry point, which reads raw data pointers.
+    make_fx, FakeTensorMode, FunctionalTensorMode, pre-dispatch tracing and torch.func transforms would neither record
+    nor transform that launch, and a tensor subclass would make the kernels read memory that is not its data (a
+    wrapper subclass reports a null data pointer). ``operands`` holds tensors, None, other arguments (lists hold
+    pointers), and tuples of them.
+    """
+    if (
+        any(torch._C._get_dispatch_mode(key) is not None for key in _TRACING_DISPATCH_MODES)
+        or torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
+        or torch._C._are_functorch_transforms_active()
+    ):
+        raise RuntimeError(
+            "the accumulating MoK backward (main_grads) has no custom op, so make_fx, FakeTensorMode, "
+            "FunctionalTensorMode, pre-dispatch tracing and torch.func transforms cannot trace it; "
+            "pass main_grads=None to get fresh weight gradients through the custom ops"
+        )
+    for operand in operands:
+        for value in operand if isinstance(operand, tuple) else (operand,):
+            if isinstance(value, torch.Tensor) and type(value) not in _PLAIN_TENSOR_TYPES:
+                raise TypeError(
+                    "the accumulating MoK backward (main_grads) has no custom op and launches its kernels on the "
+                    "operands' raw data pointers, so every tensor operand must be a plain torch.Tensor or "
+                    f"nn.Parameter, not {type(value).__name__}; pass main_grads=None to get fresh weight gradients "
+                    "through the custom ops"
+                )
+
+
+def _validate_main_grads(main_grads: tuple[torch.Tensor, ...]) -> None:
+    if len(main_grads) != 6:
+        raise ValueError("main_grads must contain six tensors")
+    main_grad_dtype = main_grads[0].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
+    for name, main_grad in zip(
+        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
+        main_grads,
+        strict=True,
+    ):
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
+        if not main_grad.is_contiguous():
+            raise ValueError(f"main_grad_{name} must be contiguous")
+
+
+def _bwd_mxfp8_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    scale_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Unchecked MXFP8 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, shared_grad_output=shared_grad_output
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
+            *main_grad_storage_tables, shared_grad_output=shared_grad_output
+        )
+    return outputs[:12]
+
+
+def _bwd_bf16_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Unchecked BF16 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, shared_grad_output=shared_grad_output
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
+            shared_grad_output=shared_grad_output,
+        )
+    return outputs[:9]
+
+
 def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     *args: Any,
     main_grads: tuple[
@@ -1406,28 +1504,14 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     non-weight-gradient outputs; the six weight gradients are side effects.
 
     This eager wrapper is separate from the original custom op because custom
-    op outputs may not alias mutated inputs.
+    op outputs may not alias mutated inputs. Not being a custom op, it accepts
+    only plain tensors and cannot be traced (see _check_accumulation_operands).
     ``shared_grad_output`` follows the fresh op's BF16 shared-only contract.
     """
-    if len(main_grads) != 6:
-        raise ValueError("main_grads must contain six tensors")
-    main_grad_dtype = main_grads[0].dtype
-    if main_grad_dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError("main_grads must have dtype float32 or bfloat16")
-    for name, main_grad in zip(
-        (
-            "shared_gate", "routed_gate", "shared_up",
-            "routed_up", "shared_down", "routed_down",
-        ),
-        main_grads,
-        strict=True,
-    ):
-        if not main_grad.is_cuda:
-            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
-        if main_grad.dtype != main_grad_dtype:
-            raise TypeError("all main_grads must have the same dtype")
-        if not main_grad.is_contiguous():
-            raise ValueError(f"main_grad_{name} must be contiguous")
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, scale_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
+    _validate_main_grads(main_grads)
     split_tables = weight_storage_tables is not None
     if (
         split_tables != (scale_storage_tables is not None)
@@ -1438,25 +1522,20 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         )
     if shared_grad_output is not None:
         _validate_shared_grad_output(shared_grad_output, args[0])
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, shared_grad_output=shared_grad_output
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 5
+        or len(scale_storage_tables) != 5
+        or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError(
+            "MXFP8 split storage tables must contain five weight, five scale, and three main-grad tables"
         )
-    else:
-        if (
-            len(weight_storage_tables) != 5
-            or len(scale_storage_tables) != 5
-            or len(main_grad_storage_tables) != 3
-        ):
-            raise ValueError(
-                "MXFP8 split storage tables must contain five weight, five scale, "
-                "and three main-grad tables"
-            )
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
-            *main_grad_storage_tables, shared_grad_output=shared_grad_output
-        )
-    return outputs[:12]
+    return _bwd_mxfp8_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, scale_storage_tables=scale_storage_tables,
+        main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+    )
 
 
 def _validate_shared_grad_output(shared_grad_output: torch.Tensor, d_y_buffer: torch.Tensor) -> None:
@@ -1716,45 +1795,30 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
 
     This eager wrapper is intentionally separate from the original custom op:
     PyTorch custom-op outputs may not alias mutated inputs, while the C++ entry
-    point returns the supplied buffers for convenient internal bookkeeping.
+    point returns the supplied buffers for convenient internal bookkeeping. Not
+    being a custom op, it accepts only plain tensors and cannot be traced (see
+    _check_accumulation_operands).
     ``shared_grad_output`` follows the fresh op's shared-only gradient contract.
     """
-    if len(main_grads) != 6:
-        raise ValueError("main_grads must contain six tensors")
-    main_grad_dtype = main_grads[0].dtype
-    if main_grad_dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError("main_grads must have dtype float32 or bfloat16")
-    for name, main_grad in zip(
-        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
-        main_grads,
-        strict=True,
-    ):
-        if not main_grad.is_cuda:
-            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
-        if main_grad.dtype != main_grad_dtype:
-            raise TypeError("all main_grads must have the same dtype")
-        if not main_grad.is_contiguous():
-            raise ValueError(f"main_grad_{name} must be contiguous")
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
+    _validate_main_grads(main_grads)
     if (weight_storage_tables is None) != (main_grad_storage_tables is None):
         raise ValueError(
             "split weight and main-grad storage tables must be provided together"
         )
     if shared_grad_output is not None:
         _validate_shared_grad_output(shared_grad_output, args[0])
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, shared_grad_output=shared_grad_output
-        )
-    else:
-        if len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3:
-            raise ValueError(
-                "BF16 split storage tables must contain three weight and three main-grad tables"
-            )
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
-            shared_grad_output=shared_grad_output,
-        )
-    return outputs[:9]
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError("BF16 split storage tables must contain three weight and three main-grad tables")
+    return _bwd_bf16_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+    )
 
 
 @torch.library.custom_op("mok::fwd_epilogue", mutates_args=())
@@ -1861,3 +1925,38 @@ def bwd_epilogue(
 
 
     return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer, top_experts)
+
+
+@torch.library.custom_op("mok::stage_into_buffers", mutates_args=("buffers",))
+def stage_into_buffers(sources: list[torch.Tensor], buffers: list[torch.Tensor]) -> None:
+    """Copies each source in full into its workspace buffer, which peers read through raw data pointers.
+
+    The functional layer stages its inputs through this op whenever it does not launch its kernels directly, with
+    one call per direction: x and router weights in forward, grad_output (first), x and router weights in backward,
+    and x in recompute_forward_context. The op declares its writes, so a compiled graph writes the buffers in place
+    where the op runs, ahead of the barrier after which peers read them in program order (the functional module
+    comment lists when Inductor reorders them). Tensor.copy_ into a workspace buffer would instead become an input
+    mutation that AOTAutograd applies at the end of the compiled graph, after the kernels that read the buffer.
+    Because the backward call takes the incoming gradient, AOTAutograd's partitioner keeps all of its copies in the
+    backward graph of a compiled autograd.Function; a copy that does not depend on the gradient could otherwise move
+    into the forward graph. The copies have no alignment requirement.
+
+    Inputs:
+        sources: tensors, each with its buffer's shape, dtype and device
+        buffers: contiguous tensors, updated in place
+
+    Outputs:
+        None
+    """
+    if len(sources) != len(buffers):
+        raise ValueError("sources and buffers must have the same length")
+    for source, buffer in zip(sources, buffers):
+        if (
+            source.shape != buffer.shape
+            or source.dtype != buffer.dtype
+            or source.device != buffer.device
+            or not buffer.is_contiguous()
+        ):
+            raise ValueError("each source must have the shape, dtype and device of its contiguous buffer")
+    for source, buffer in zip(sources, buffers):
+        buffer.copy_(source)
