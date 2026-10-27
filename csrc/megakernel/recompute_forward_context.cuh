@@ -4,8 +4,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
     const int cta_rank = cluster_ctarank();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
     const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
-    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
+    const int shared_gate_up_tasks = shared_row_blocks * config::mlp_col_blocks(g.w_shared_gate.rows());
+    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * config::mlp_col_blocks(g.w_routed_gate.rows());
     const int shared_swiglu_tiles = (g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
     const int minibatch_routed_swiglu_tiles = (g.minibatch_size / config::SWIGLU_Mb) * (g.hidden_fp8_routed.cols() / config::SWIGLU_Nb);
     const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
@@ -213,6 +213,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
     }
 }
 
+// TODO(MCore integration): support combined FC1 payloads and descriptor-backed split routed
+// weights before enabling specialized forward-context recomputation from MCore.
 static __host__ __forceinline__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                            at::Tensor>
@@ -250,8 +252,8 @@ recompute_forward_context_mxfp8(
     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / config::MLP_Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / config::MLP_Nb);
+    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(w_shared_gate.size(0)));
+    const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(w_routed_gate.size(1)));
 
     activation_bf16_pgl x_routed_send_buffer_data;
     for (int i = 0; i < NUM_DEVICES; ++i)
@@ -299,11 +301,15 @@ recompute_forward_context_mxfp8(
         .hidden_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_t_routed),
         .x_routed_send_buffer = x_routed_send_buffer_data,
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_gate),
-        .w_routed_gate_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_gate_sc),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim),
+        .w_routed_gate_sc = make_routed_scale_view(
+            w_routed_gate_sc, intermediate_dim / config::QUANT_Mb),
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up = kittens::py::tensor_to_gl<weight_fp8_gl>(w_routed_up),
-        .w_routed_up_sc = kittens::py::tensor_to_gl<sc_gl>(w_routed_up_sc),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim),
+        .w_routed_up_sc = make_routed_scale_view(
+            w_routed_up_sc, intermediate_dim / config::QUANT_Mb),
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),
         .num_tokens = kittens::py::tensor_to_gl<index_gl>(num_tokens),
@@ -357,8 +363,8 @@ recompute_forward_context_bf16(
     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
+    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(intermediate_dim));
+    const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(intermediate_dim));
 
     activation_bf16_pgl x_routed_send_buffer_data;
     for (int i = 0; i < NUM_DEVICES; ++i)
@@ -396,10 +402,12 @@ recompute_forward_context_bf16(
         .hidden_sc_t_routed = {},
         .x_routed_send_buffer = x_routed_send_buffer_data,
         .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
-        .w_routed_gate = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_gate),
+        .w_routed_gate = make_routed_weight_view(
+            w_routed_gate, intermediate_dim, hidden_dim),
         .w_routed_gate_sc = {},
         .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
-        .w_routed_up = kittens::py::tensor_to_gl<routed_weight_gl>(w_routed_up),
+        .w_routed_up = make_routed_weight_view(
+            w_routed_up, intermediate_dim, hidden_dim),
         .w_routed_up_sc = {},
         .schedule_peer_rank = kittens::py::tensor_to_gl<index_gl>(schedule_peer_rank),
         .schedule_peer_token_idx = kittens::py::tensor_to_gl<index_gl>(schedule_peer_token_idx),

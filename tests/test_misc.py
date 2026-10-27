@@ -12,6 +12,7 @@ from mok import functional, ops
 from .utils import (
     check_correctness,
     run_reference_bf16,
+    ungated_backward_gradients,
 )
 
 
@@ -204,7 +205,7 @@ def _run_e2e_case(
                 w_routed_up,
                 w_routed_down,
             )
-            actual = (output, *gradients)
+            actual = (output, *ungated_backward_gradients(gradients))
             tolerance = BF16_TOLERANCE
             gradient_min_cosine = BF16_GRADIENT_MIN_COSINE
         elif precision == "mxfp8":
@@ -284,7 +285,7 @@ def _run_e2e_case(
                     w_routed_down_t_sc,
                 ),
             )
-            actual = (output, *gradients)
+            actual = (output, *ungated_backward_gradients(gradients))
             tolerance = MXFP8_TOLERANCE
             gradient_min_cosine = MXFP8_GRADIENT_MIN_COSINE
         else:
@@ -998,6 +999,7 @@ def test_fake_tensor_metadata(
             mxfp8_forward[-2],
             workspace.combine_buffer,
             router_weights,
+            top_experts,
         )
         _assert_metadata(
             (output,),
@@ -1095,6 +1097,7 @@ def test_fake_tensor_metadata(
         d_x = ops.bwd_epilogue(
             mxfp8_backward[0],
             workspace.d_x_routed_buffer,
+            top_experts,
         )
         _assert_metadata(
             (d_x,),
@@ -1247,6 +1250,7 @@ def test_custom_op_mutation_schemas() -> None:
         },
         "fwd_epilogue": set(),
         "bwd_epilogue": set(),
+        "stage_into_buffers": {"buffers"},
     }
     actual = {}
     for name in expected:
@@ -1397,7 +1401,7 @@ def test_compile_fullgraph(
                         routed_up,
                         routed_down,
                     )
-                    return output, *gradients
+                    return output, *ungated_backward_gradients(gradients)
 
                 (
                     routed_gate_fp8,
@@ -1458,7 +1462,7 @@ def test_compile_fullgraph(
                         routed_down_t_sc,
                     ),
                 )
-                return output, *gradients
+                return output, *ungated_backward_gradients(gradients)
 
             torch._dynamo.reset()
             compiled = torch.compile(
@@ -1499,14 +1503,19 @@ def test_compile_fullgraph(
             for node in captured_graphs[0].graph.nodes
             if node.op == "call_function" and "mok" in str(node.target)
         ]
+        # The data pointers are unknown while compiling, so the inputs are staged by full copies into the workspace
+        # buffers, through one call per direction of the custom op that keeps the writes ahead of the barrier: x and
+        # router weights in forward; grad_output, x and router weights in backward.
         expected_targets = [
             "mok.all_gather_top_experts.default",
             "mok.barrier_all.default",
             "mok.schedule.default",
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.dispatch_mlp_swiglu_combine_fwd_{precision}.default",
             "mok.barrier_all.default",
             "mok.fwd_epilogue.default",
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.dispatch_mlp_swiglu_combine_bwd_{precision}.default",
             "mok.barrier_all.default",
@@ -1519,6 +1528,9 @@ def test_compile_fullgraph(
                 *expected_targets[3:],
             ]
         assert custom_op_targets == expected_targets
+        assert not any(
+            node.op == "call_method" and node.target == "copy_" for node in captured_graphs[0].graph.nodes
+        )
 
 
 def test_compile_fullgraph_recomputed_forward_context(
@@ -1588,6 +1600,7 @@ def test_compile_fullgraph_recomputed_forward_context(
                     (num_local_experts,),
                     torch.int32,
                 ),
+                top_experts=tensor((num_local_tokens, topk), torch.int32),
             )
             x = tensor((num_local_tokens, hidden_size), torch.bfloat16)
             router_weights = tensor(
@@ -1669,7 +1682,7 @@ def test_compile_fullgraph_recomputed_forward_context(
                     routed_gate_forward,
                     routed_up_forward,
                 )
-                return functional.backward(
+                gradients = functional.backward(
                     config,
                     workspace,
                     schedule,
@@ -1684,6 +1697,7 @@ def test_compile_fullgraph_recomputed_forward_context(
                     routed_up_backward,
                     routed_down_backward,
                 )
+                return ungated_backward_gradients(gradients)
 
             torch._dynamo.reset()
             compiled = torch.compile(
@@ -1716,15 +1730,21 @@ def test_compile_fullgraph_recomputed_forward_context(
             for node in captured_graphs[0].graph.nodes
             if node.op == "call_function" and "mok" in str(node.target)
         ]
+        # recompute_forward_context stages x; backward stages grad_output, x and router weights.
         assert custom_op_targets == [
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.recompute_forward_context_{precision}.default",
             "mok.barrier_all.default",
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.dispatch_mlp_swiglu_combine_bwd_{precision}.default",
             "mok.barrier_all.default",
             "mok.bwd_epilogue.default",
         ]
+        assert not any(
+            node.op == "call_method" and node.target == "copy_" for node in captured_graphs[0].graph.nodes
+        )
 
 
 def test_compiled_barrier_updates_state(
@@ -1776,9 +1796,15 @@ def test_compiled_barrier_updates_state(
 
 def test_supported_shape_alignment(
     context: tuple[int, int, torch.device],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, device = context
     pointers = [1, 2, 3, 4]
+
+    def reject_native_launch(*args, **kwargs):
+        raise AssertionError("Shape validation must not launch kernels with dummy pointers")
+
+    monkeypatch.setattr(ops._C, "dispatch_mlp_swiglu_combine_fwd_bf16", reject_native_launch)
 
     def run_shape(
         hidden_size: int,
@@ -1823,6 +1849,9 @@ def test_supported_shape_alignment(
         (2560, 2560),
         (1024, 1024),
         (1280, 1280),
+        (640, 640),
+        (1664, 1664),
+        (1920, 1920),
     ):
         with pytest.raises(ValueError, match="num_comm_sms"):
             run_shape(
@@ -1831,9 +1860,8 @@ def test_supported_shape_alignment(
                 num_comm_sms=1,
             )
     for hidden_size, intermediate_size in (
-        (640, 640),
-        (1664, 1664),
-        (1920, 1920),
+        (320, 256),
+        (256, 320),
         (128, 256),
         (0, 256),
         (256, 0),
@@ -1948,8 +1976,9 @@ def test_epilogues_support_more_than_max_grid_y_tokens(
         dtype=torch.float32,
     )
 
-    output = ops.fwd_epilogue(shared, routed, topk_weights)
+    top_experts = torch.zeros(num_local_tokens, 1, dtype=torch.int32, device=device)
+    output = ops.fwd_epilogue(shared, routed, topk_weights, top_experts)
     assert torch.all(output == 1.5)
 
-    d_x = ops.bwd_epilogue(shared, routed)
+    d_x = ops.bwd_epilogue(shared, routed, top_experts)
     assert torch.all(d_x == 3.0)

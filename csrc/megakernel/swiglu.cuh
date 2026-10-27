@@ -9,6 +9,11 @@ static __device__ __forceinline__ float2 swiglu_bwd_pair(
 ) {
     uint32_t clamp_grad_mask;
     if constexpr (IS_CLAMPED) {
+        // Keep MOK's inclusive clamp subgradient: 1 at gate == limit and
+        // up == +/-limit, and 0 strictly outside the respective bounds.
+        // This is an operator contract, not the installed PyTorch default:
+        // scalar torch.clamp in PyTorch 2.14 uses 0 at equality instead.
+        // tests/utils.py::run_swiglu_reference encodes this contract explicitly.
         clamp_grad_mask = static_cast<uint32_t>(gate.x <= limit)
                           | static_cast<uint32_t>(gate.y <= limit) << 1
                           | static_cast<uint32_t>(up.x >= -limit && up.x <= limit) << 2
@@ -66,7 +71,7 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
     auto (&up_smem)[config::SWIGLU_FWD_PIPE_DEPTH]   = *reinterpret_cast<input_bf16_tile (*)[config::SWIGLU_FWD_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&gate_smem) + sizeof(gate_smem));
     auto &hidden_smem                                = *reinterpret_cast<output_bf16_tile *>(reinterpret_cast<uint64_t>(&up_smem) + sizeof(up_smem));
 
-    const int intermediate_dim_col_blocks = hidden_gmem.cols() / config::MLP_Nb;
+    const int intermediate_dim_col_blocks = config::mlp_col_blocks(hidden_gmem.cols());
     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::SWIGLU_Mb);
 
@@ -261,7 +266,7 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
         : reinterpret_cast<uint64_t>(&up_smem) + sizeof(up_smem);
     auto &router_smem    = *reinterpret_cast<float (*)[config::SWIGLU_BWD_PIPE_DEPTH][config::SWIGLU_Mb]>(router_smem_addr);
 
-    const int intermediate_dim_col_blocks = gate_gmem.cols() / config::MLP_Nb;
+    const int intermediate_dim_col_blocks = config::mlp_col_blocks(gate_gmem.cols());
     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::SWIGLU_Mb);
 
