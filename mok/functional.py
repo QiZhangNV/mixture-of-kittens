@@ -415,8 +415,14 @@ def validate_workspace_args(
     device = torch.device("cuda", device_index)
     if device_index != torch.cuda.current_device():
         raise ValueError("MoK workspace device must be the current CUDA device")
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        raise NotImplementedError("MoK currently requires an SM100 or SM103 GPU")
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        raise NotImplementedError("MoK currently requires an SM100, SM103 or SM107 GPU")
+    if capability not in _C.compiled_architectures:
+        raise NotImplementedError(
+            f"MoK was not built for SM{capability[0]}{capability[1]}; "
+            "rebuild with MOK_ARCH=ALL or the matching single-GPU architecture"
+        )
     device_properties = torch.cuda.get_device_properties(device)
     if type(num_local_tokens) is not int or num_local_tokens < 512:
         raise ValueError("num_local_tokens must be an integer at least 512")
