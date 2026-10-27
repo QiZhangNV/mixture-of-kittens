@@ -4,6 +4,18 @@
 #include "utils.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    pybind11::list compiled_architectures;
+#ifdef MOK_BUILD_SM100
+    compiled_architectures.append(pybind11::make_tuple(10, 0));
+#endif
+#ifdef MOK_BUILD_SM103
+    compiled_architectures.append(pybind11::make_tuple(10, 3));
+#endif
+#ifdef MOK_BUILD_SM107
+    compiled_architectures.append(pybind11::make_tuple(10, 7));
+#endif
+    m.attr("compiled_architectures") = pybind11::tuple(compiled_architectures);
+
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));
