@@ -1,3 +1,5 @@
+from functools import wraps
+from inspect import signature
 from typing import Any, get_args
 
 import torch
@@ -5,20 +7,51 @@ import torch
 from . import _C
 
 
+def _tensor_outputs(fn):
+    """Use distinct zero-element tensors for absent outputs in the dispatcher ABI."""
+    first_argument = next(iter(signature(fn).parameters))
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        outputs = fn(*args, **kwargs)
+        prototype = args[0] if args else kwargs[first_argument]
+        return tuple(prototype.new_empty((0,)) if value is None else value for value in outputs)
+
+    return wrapped
+
+
 def _optional_output_op(name: str, *, mutates_args):
-    """Retain inferred input aliases; PyTorch cannot infer optional tuple outputs."""
+    """Keep public None outputs while mutable custom ops expose only Tensor returns to Inductor."""
+
     def register(fn):
         result_type = fn.__annotations__["return"]
         result_items = get_args(result_type)
+        optional = tuple(type(None) in get_args(item) for item in result_items)
+        shared_index = tuple(signature(fn).parameters).index("w_shared_gate")
         fn.__annotations__["return"] = tuple[tuple(torch.Tensor for _ in result_items)]
         try:
             schema = torch.library.infer_schema(fn, mutates_args=mutates_args)
         finally:
             fn.__annotations__["return"] = result_type
-        result_schema = ", ".join("Tensor?" if type(None) in get_args(item) else "Tensor" for item in result_items)
-        schema = schema.rsplit(" -> ", 1)[0] + " -> (" + result_schema + ")"
-        return torch.library.custom_op(name, mutates_args=mutates_args, schema=schema)(fn)
+        op = torch.library.custom_op(name, mutates_args=mutates_args, schema=schema)(_tensor_outputs(fn))
+
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            outputs = op(*args, **kwargs)
+            shared = args[shared_index] if len(args) > shared_index else kwargs["w_shared_gate"]
+            if shared is None:
+                return tuple(None if absent else value for absent, value in zip(optional, outputs, strict=True))
+            return outputs
+
+        return wrapped
+
     return register
+
+
+def _check_shared_mode(*tensors: torch.Tensor | None) -> None:
+    present = [tensor is not None for tensor in tensors]
+    if any(present) != all(present):
+        raise ValueError("shared tensors must be all present or all absent")
 
 
 @torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
@@ -305,12 +338,6 @@ def make_routed_d_weight_storage_table(
     return _make_routed_storage_table(expert_tensors, precision="wgrad")
 
 
-def _check_shared_mode(*tensors: torch.Tensor | None) -> None:
-    present = [tensor is not None for tensor in tensors]
-    if any(present) != all(present):
-        raise ValueError("shared tensors must be all present or all absent")
-
-
 @_optional_output_op("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8", mutates_args=("combine_buffer",))
 def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     x: torch.Tensor,
@@ -405,8 +432,8 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -433,8 +460,8 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     if w_shared_gate is not None and w_shared_gate.ndim != 2:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     split_storage = w_routed_gate_storage_table is not None
     if (
         split_storage != (w_routed_up_storage_table is not None)
@@ -664,13 +691,13 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     split_storage = w_routed_gate_storage_table is not None
     if (
         split_storage != (w_routed_up_storage_table is not None)
@@ -867,8 +894,8 @@ def recompute_forward_context_mxfp8(
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -887,8 +914,8 @@ def recompute_forward_context_mxfp8(
     if w_shared_gate is not None and w_shared_gate.ndim != 2:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
@@ -1008,13 +1035,13 @@ def recompute_forward_context_bf16(
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
@@ -1230,8 +1257,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -1272,8 +1299,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
@@ -1429,6 +1456,117 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     )
 
 
+_PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
+_TRACING_DISPATCH_MODES = (
+    torch._C._TorchDispatchModeKey.FAKE,
+    torch._C._TorchDispatchModeKey.PROXY,
+    torch._C._TorchDispatchModeKey.FUNCTIONAL,
+)
+
+
+def _check_accumulation_operands(operands: Any) -> None:
+    """Rejects the calls that the accumulating backward wrappers below cannot run correctly.
+
+    The wrappers are not custom ops: they hand every operand to the C++ entry point, which reads raw data pointers.
+    make_fx, FakeTensorMode, FunctionalTensorMode, pre-dispatch tracing and torch.func transforms would neither record
+    nor transform that launch, and a tensor subclass would make the kernels read memory that is not its data (a
+    wrapper subclass reports a null data pointer). ``operands`` holds tensors, None, other arguments (lists hold
+    pointers), and tuples of them.
+    """
+    if (
+        any(torch._C._get_dispatch_mode(key) is not None for key in _TRACING_DISPATCH_MODES)
+        or torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
+        or torch._C._are_functorch_transforms_active()
+    ):
+        raise RuntimeError(
+            "the accumulating MoK backward (main_grads) has no custom op, so make_fx, FakeTensorMode, "
+            "FunctionalTensorMode, pre-dispatch tracing and torch.func transforms cannot trace it; "
+            "pass main_grads=None to get fresh weight gradients through the custom ops"
+        )
+    for operand in operands:
+        for value in operand if isinstance(operand, tuple) else (operand,):
+            if isinstance(value, torch.Tensor) and type(value) not in _PLAIN_TENSOR_TYPES:
+                raise TypeError(
+                    "the accumulating MoK backward (main_grads) has no custom op and launches its kernels on the "
+                    "operands' raw data pointers, so every tensor operand must be a plain torch.Tensor or "
+                    f"nn.Parameter, not {type(value).__name__}; pass main_grads=None to get fresh weight gradients "
+                    "through the custom ops"
+                )
+
+
+def _validate_main_grads(main_grads: tuple[torch.Tensor | None, ...], shared_present: bool) -> None:
+    if len(main_grads) != 6:
+        raise ValueError("main_grads must contain six tensors")
+    _check_shared_mode(*main_grads[::2])
+    if (main_grads[0] is not None) != shared_present:
+        raise ValueError("shared main-grad presence must match shared weights")
+    main_grad_dtype = main_grads[1].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
+    for name, main_grad in zip(
+        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
+        main_grads,
+        strict=True,
+    ):
+        if main_grad is None and name.startswith("shared_") and not shared_present:
+            continue
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
+        if not main_grad.is_contiguous():
+            raise ValueError(f"main_grad_{name} must be contiguous")
+
+
+def _bwd_mxfp8_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor | None, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    scale_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+) -> tuple[torch.Tensor | None, ...]:
+    """Unchecked MXFP8 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
+            *main_grad_storage_tables, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    return outputs[:12]
+
+
+def _bwd_bf16_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor | None, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+) -> tuple[torch.Tensor | None, ...]:
+    """Unchecked BF16 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
+            shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    return outputs[:9]
+
+
 def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     *args: Any,
     main_grads: tuple[
@@ -1461,42 +1599,24 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
     shared_grad_output: torch.Tensor | None = None,
     situ_beta1: float = 0.0,
     situ_beta2: float = 0.0,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor | None, ...]:
     """Runs MXFP8 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
     ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_mxfp8`.
     ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
     up, shared down, routed down. The returned tuple contains only the twelve
     non-weight-gradient outputs; the six weight gradients are side effects.
+    Without shared experts, shared intermediate outputs and main-grad slots are None.
 
     This eager wrapper is separate from the original custom op because custom
-    op outputs may not alias mutated inputs.
+    op outputs may not alias mutated inputs. Not being a custom op, it accepts
+    only plain tensors and cannot be traced (see _check_accumulation_operands).
     ``shared_grad_output`` follows the fresh op's BF16 shared-only contract.
     """
-    if len(main_grads) != 6:
-        raise ValueError("main_grads must contain six tensors")
-    _check_shared_mode(*main_grads[::2])
-    if (main_grads[0] is not None) != (args[8] is not None):
-        raise ValueError("shared main-grad presence must match shared weights")
-    main_grad_dtype = main_grads[1].dtype
-    if main_grad_dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError("main_grads must have dtype float32 or bfloat16")
-    for name, main_grad in zip(
-        (
-            "shared_gate", "routed_gate", "shared_up",
-            "routed_up", "shared_down", "routed_down",
-        ),
-        main_grads,
-        strict=True,
-    ):
-        if main_grad is None and name.startswith("shared_") and args[8] is None:
-            continue
-        if not main_grad.is_cuda:
-            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
-        if main_grad.dtype != main_grad_dtype:
-            raise TypeError("all main_grads must have the same dtype")
-        if not main_grad.is_contiguous():
-            raise ValueError(f"main_grad_{name} must be contiguous")
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, scale_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
+    _validate_main_grads(main_grads, args[8] is not None)
     split_tables = weight_storage_tables is not None
     if (
         split_tables != (scale_storage_tables is not None)
@@ -1507,27 +1627,21 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
         )
     if shared_grad_output is not None:
         _validate_shared_grad_output(shared_grad_output, args[0])
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, shared_grad_output=shared_grad_output,
-            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 5
+        or len(scale_storage_tables) != 5
+        or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError(
+            "MXFP8 split storage tables must contain five weight, five scale, and three main-grad tables"
         )
-    else:
-        if (
-            len(weight_storage_tables) != 5
-            or len(scale_storage_tables) != 5
-            or len(main_grad_storage_tables) != 3
-        ):
-            raise ValueError(
-                "MXFP8 split storage tables must contain five weight, five scale, "
-                "and three main-grad tables"
-            )
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
-            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
-            *main_grad_storage_tables, shared_grad_output=shared_grad_output,
-            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
-        )
-    return outputs[:12]
+    return _bwd_mxfp8_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, scale_storage_tables=scale_storage_tables,
+        main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+    )
 
 
 def _validate_shared_grad_output(shared_grad_output: torch.Tensor, d_y_buffer: torch.Tensor) -> None:
@@ -1661,13 +1775,13 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
@@ -1787,62 +1901,42 @@ def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
     shared_grad_output: torch.Tensor | None = None,
     situ_beta1: float = 0.0,
     situ_beta2: float = 0.0,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor | None, ...]:
     """Runs BF16 backward and accumulates wgrad directly into FP32 or BF16 buffers.
 
     ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_bf16`.
     ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
     up, shared down, routed down. The returned tuple contains only the nine
     non-weight-gradient outputs; the six weight gradients are side effects.
+    Without shared experts, shared intermediate outputs and main-grad slots are None.
 
     This eager wrapper is intentionally separate from the original custom op:
     PyTorch custom-op outputs may not alias mutated inputs, while the C++ entry
-    point returns the supplied buffers for convenient internal bookkeeping.
+    point returns the supplied buffers for convenient internal bookkeeping. Not
+    being a custom op, it accepts only plain tensors and cannot be traced (see
+    _check_accumulation_operands).
     ``shared_grad_output`` follows the fresh op's shared-only gradient contract.
     """
-    if len(main_grads) != 6:
-        raise ValueError("main_grads must contain six tensors")
-    _check_shared_mode(*main_grads[::2])
-    if (main_grads[0] is not None) != (args[8] is not None):
-        raise ValueError("shared main-grad presence must match shared weights")
-    main_grad_dtype = main_grads[1].dtype
-    if main_grad_dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError("main_grads must have dtype float32 or bfloat16")
-    for name, main_grad in zip(
-        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
-        main_grads,
-        strict=True,
-    ):
-        if main_grad is None and name.startswith("shared_") and args[8] is None:
-            continue
-        if not main_grad.is_cuda:
-            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
-        if main_grad.dtype != main_grad_dtype:
-            raise TypeError("all main_grads must have the same dtype")
-        if not main_grad.is_contiguous():
-            raise ValueError(f"main_grad_{name} must be contiguous")
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
+    _validate_main_grads(main_grads, args[8] is not None)
     if (weight_storage_tables is None) != (main_grad_storage_tables is None):
         raise ValueError(
             "split weight and main-grad storage tables must be provided together"
         )
     if shared_grad_output is not None:
         _validate_shared_grad_output(shared_grad_output, args[0])
-    if weight_storage_tables is None:
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, shared_grad_output=shared_grad_output,
-            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
-        )
-    else:
-        if len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3:
-            raise ValueError(
-                "BF16 split storage tables must contain three weight and three main-grad tables"
-            )
-        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
-            shared_grad_output=shared_grad_output,
-            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
-        )
-    return outputs[:9]
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError("BF16 split storage tables must contain three weight and three main-grad tables")
+    return _bwd_bf16_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+    )
 
 
 @torch.library.custom_op("mok::fwd_epilogue", mutates_args=())
@@ -1873,8 +1967,8 @@ def fwd_epilogue(
         raise ValueError("y_shared shape must match routed output")
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if (topk_weights.device != combine_buffer.device
             or top_experts.device != combine_buffer.device
             or (y_shared is not None and y_shared.device != combine_buffer.device)):
@@ -1932,8 +2026,8 @@ def bwd_epilogue(
         raise ValueError("d_x_shared shape must match routed input gradient")
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if (top_experts.device != d_x_routed_buffer.device
             or (d_x_shared is not None and d_x_shared.device != d_x_routed_buffer.device)):
         raise ValueError("all tensors must be on the same CUDA device")
@@ -1955,3 +2049,38 @@ def bwd_epilogue(
 
 
     return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer, top_experts)
+
+
+@torch.library.custom_op("mok::stage_into_buffers", mutates_args=("buffers",))
+def stage_into_buffers(sources: list[torch.Tensor], buffers: list[torch.Tensor]) -> None:
+    """Copies each source in full into its workspace buffer, which peers read through raw data pointers.
+
+    The functional layer stages its inputs through this op whenever it does not launch its kernels directly, with
+    one call per direction: x and router weights in forward, grad_output (first), x and router weights in backward,
+    and x in recompute_forward_context. The op declares its writes, so a compiled graph writes the buffers in place
+    where the op runs, ahead of the barrier after which peers read them in program order (the functional module
+    comment lists when Inductor reorders them). Tensor.copy_ into a workspace buffer would instead become an input
+    mutation that AOTAutograd applies at the end of the compiled graph, after the kernels that read the buffer.
+    Because the backward call takes the incoming gradient, AOTAutograd's partitioner keeps all of its copies in the
+    backward graph of a compiled autograd.Function; a copy that does not depend on the gradient could otherwise move
+    into the forward graph. The copies have no alignment requirement.
+
+    Inputs:
+        sources: tensors, each with its buffer's shape, dtype and device
+        buffers: contiguous tensors, updated in place
+
+    Outputs:
+        None
+    """
+    if len(sources) != len(buffers):
+        raise ValueError("sources and buffers must have the same length")
+    for source, buffer in zip(sources, buffers):
+        if (
+            source.shape != buffer.shape
+            or source.dtype != buffer.dtype
+            or source.device != buffer.device
+            or not buffer.is_contiguous()
+        ):
+            raise ValueError("each source must have the shape, dtype and device of its contiguous buffer")
+    for source, buffer in zip(sources, buffers):
+        buffer.copy_(source)

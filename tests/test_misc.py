@@ -1250,6 +1250,7 @@ def test_custom_op_mutation_schemas() -> None:
         },
         "fwd_epilogue": set(),
         "bwd_epilogue": set(),
+        "stage_into_buffers": {"buffers"},
     }
     actual = {}
     for name in expected:
@@ -1502,14 +1503,19 @@ def test_compile_fullgraph(
             for node in captured_graphs[0].graph.nodes
             if node.op == "call_function" and "mok" in str(node.target)
         ]
+        # The data pointers are unknown while compiling, so the inputs are staged by full copies into the workspace
+        # buffers, through one call per direction of the custom op that keeps the writes ahead of the barrier: x and
+        # router weights in forward; grad_output, x and router weights in backward.
         expected_targets = [
             "mok.all_gather_top_experts.default",
             "mok.barrier_all.default",
             "mok.schedule.default",
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.dispatch_mlp_swiglu_combine_fwd_{precision}.default",
             "mok.barrier_all.default",
             "mok.fwd_epilogue.default",
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.dispatch_mlp_swiglu_combine_bwd_{precision}.default",
             "mok.barrier_all.default",
@@ -1522,6 +1528,9 @@ def test_compile_fullgraph(
                 *expected_targets[3:],
             ]
         assert custom_op_targets == expected_targets
+        assert not any(
+            node.op == "call_method" and node.target == "copy_" for node in captured_graphs[0].graph.nodes
+        )
 
 
 def test_compile_fullgraph_recomputed_forward_context(
@@ -1721,15 +1730,21 @@ def test_compile_fullgraph_recomputed_forward_context(
             for node in captured_graphs[0].graph.nodes
             if node.op == "call_function" and "mok" in str(node.target)
         ]
+        # recompute_forward_context stages x; backward stages grad_output, x and router weights.
         assert custom_op_targets == [
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.recompute_forward_context_{precision}.default",
             "mok.barrier_all.default",
+            "mok.stage_into_buffers.default",
             "mok.barrier_all.default",
             f"mok.dispatch_mlp_swiglu_combine_bwd_{precision}.default",
             "mok.barrier_all.default",
             "mok.bwd_epilogue.default",
         ]
+        assert not any(
+            node.op == "call_method" and node.target == "copy_" for node in captured_graphs[0].graph.nodes
+        )
 
 
 def test_compiled_barrier_updates_state(
@@ -1781,9 +1796,15 @@ def test_compiled_barrier_updates_state(
 
 def test_supported_shape_alignment(
     context: tuple[int, int, torch.device],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, device = context
     pointers = [1, 2, 3, 4]
+
+    def reject_native_launch(*args, **kwargs):
+        raise AssertionError("Shape validation must not launch kernels with dummy pointers")
+
+    monkeypatch.setattr(ops._C, "dispatch_mlp_swiglu_combine_fwd_bf16", reject_native_launch)
 
     def run_shape(
         hidden_size: int,
@@ -1828,6 +1849,9 @@ def test_supported_shape_alignment(
         (2560, 2560),
         (1024, 1024),
         (1280, 1280),
+        (640, 640),
+        (1664, 1664),
+        (1920, 1920),
     ):
         with pytest.raises(ValueError, match="num_comm_sms"):
             run_shape(
@@ -1836,9 +1860,8 @@ def test_supported_shape_alignment(
                 num_comm_sms=1,
             )
     for hidden_size, intermediate_size in (
-        (640, 640),
-        (1664, 1664),
-        (1920, 1920),
+        (320, 256),
+        (256, 320),
         (128, 256),
         (0, 256),
         (256, 0),

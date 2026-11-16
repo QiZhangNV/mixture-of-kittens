@@ -65,6 +65,7 @@ def _mxfp8_quantize_fake(
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -104,7 +105,8 @@ def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     torch.Tensor | None, torch.Tensor,  # y_shared, y_routed
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    # FC2 carries logical I even for packed FC1; Python tensor identity is not stable in tracing.
+    intermediate_size = w_routed_down.shape[-1]
     return (
         x.new_empty((hidden_size, macrobatch_size), dtype=torch.float8_e4m3fn),
         x.new_empty((hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
@@ -123,6 +125,7 @@ def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_fwd_bf16")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -156,7 +159,7 @@ def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
     torch.Tensor | None, torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    intermediate_size = w_routed_down.shape[-1]
     return (
         x.new_empty((macrobatch_size, hidden_size)),
         x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
@@ -171,6 +174,7 @@ def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
 
 
 @torch.library.register_fake("mok::recompute_forward_context_mxfp8")
+@_ops._tensor_outputs
 def _recompute_forward_context_mxfp8_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -198,7 +202,7 @@ def _recompute_forward_context_mxfp8_fake(
     torch.Tensor | None, torch.Tensor, torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    intermediate_size = w_routed_gate.shape[-2]
     return (
         x.new_empty((hidden_size, macrobatch_size), dtype=torch.float8_e4m3fn),
         x.new_empty((hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
@@ -215,6 +219,7 @@ def _recompute_forward_context_mxfp8_fake(
 
 
 @torch.library.register_fake("mok::recompute_forward_context_bf16")
+@_ops._tensor_outputs
 def _recompute_forward_context_bf16_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -240,7 +245,7 @@ def _recompute_forward_context_bf16_fake(
     torch.Tensor | None, torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    intermediate_size = w_routed_gate.shape[-2]
     return (
         x.new_empty((macrobatch_size, hidden_size)),
         x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
@@ -253,6 +258,7 @@ def _recompute_forward_context_bf16_fake(
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_bwd_mxfp8")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
     d_y_buffer: torch.Tensor,
     d_y_buffer_ptrs: list[int],
@@ -313,7 +319,7 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
 ]:
     num_local_tokens, hidden_size = x.shape
     num_local_experts = w_routed_gate.shape[0]
-    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    intermediate_size = gate_fp8_routed.shape[-1]
     return (
         d_y_buffer.new_empty((num_local_tokens, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, hidden_size)),
@@ -337,6 +343,7 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_bwd_bf16")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
     d_y_buffer: torch.Tensor,
     d_y_buffer_ptrs: list[int],
@@ -385,7 +392,7 @@ def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
 ]:
     num_local_tokens, hidden_size = x.shape
     num_local_experts = w_routed_gate.shape[0]
-    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    intermediate_size = gate_routed.shape[-1]
     return (
         d_y_buffer.new_empty((num_local_tokens, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, hidden_size)),
@@ -423,3 +430,8 @@ def _bwd_epilogue_fake(
     top_experts: torch.Tensor,
 ) -> torch.Tensor:  # d_x
     return d_x_routed_buffer.new_empty((top_experts.shape[0], d_x_routed_buffer.shape[1]))
+
+
+@torch.library.register_fake("mok::stage_into_buffers")
+def _stage_into_buffers_fake(sources: list[torch.Tensor], buffers: list[torch.Tensor]) -> None:
+    return None
