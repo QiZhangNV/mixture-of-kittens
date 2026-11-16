@@ -189,7 +189,7 @@ static __device__ __forceinline__ void load_candidate(candidate<C::MAX_TOPK> &c,
     c.slots = 1 + __popc(c.routed);
 }
 
-template <bool WEIGHTED, bool GATED, typename C = gather_config>
+template <bool WEIGHTED, bool GATED, bool HAS_SHARED = true, typename C = gather_config>
 static __global__ void __launch_bounds__(C::NUM_THREADS)
 gather_combine_kernel(const __grid_constant__ globals g) {
     extern __shared__ int __shm[];
@@ -226,20 +226,28 @@ gather_combine_kernel(const __grid_constant__ globals g) {
             const int item_col = __shfl_sync(0xffffffff, cand.col, i);
             uint32_t item_routed = __shfl_sync(0xffffffff, cand.routed, i);
             int slot = __shfl_sync(0xffffffff, first_slot, i);
-            const bf16 *src = g.shared + static_cast<size_t>(item_token) * g.hidden + item_col;
             const size_t route_row = static_cast<size_t>(item_token) * g.topk;
-            while (true) {
+            // Retain the first slot even without shared: all-unrouted tokens still advance the batch.
+            if constexpr (HAS_SHARED) {
+                const bf16 *src = g.shared + static_cast<size_t>(item_token) * g.hidden + item_col;
                 #pragma unroll
                 for (int v = 0; v < C::VECS_PER_LANE; ++v) {
                     const int offset = v * WARP_THREADS * rows::config::VEC + lane * rows::config::VEC;
                     if (item_col + offset < g.hidden)
                         cp_async_16(ring + slot * C::SEGMENT + offset, src + offset);
                 }
-                if (item_routed == 0) break;
+            }
+            while (item_routed != 0) {
                 const int k = __ffs(item_routed) - 1;
                 item_routed &= item_routed - 1;
-                src = g.routed + (route_row + k) * g.hidden + item_col;
+                const bf16 *src = g.routed + (route_row + k) * g.hidden + item_col;
                 ++slot;
+                #pragma unroll
+                for (int v = 0; v < C::VECS_PER_LANE; ++v) {
+                    const int offset = v * WARP_THREADS * rows::config::VEC + lane * rows::config::VEC;
+                    if (item_col + offset < g.hidden)
+                        cp_async_16(ring + slot * C::SEGMENT + offset, src + offset);
+                }
             }
         }
         asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -273,8 +281,9 @@ gather_combine_kernel(const __grid_constant__ globals g) {
                 const int offset = v * WARP_THREADS * rows::config::VEC + lane * rows::config::VEC;
                 if (item_col + offset < g.hidden) {
                     const bf16 *column = ring + item_first * C::SEGMENT + offset;
-                    float acc[rows::config::VEC];
-                    init_acc<GATED>(acc, *reinterpret_cast<const uint4 *>(column), item_gate);
+                    float acc[rows::config::VEC] = {};
+                    if constexpr (HAS_SHARED)
+                        init_acc<GATED>(acc, *reinterpret_cast<const uint4 *>(column), item_gate);
                     for (int r = 1; r < item_slots; ++r) {
                         const float w = WEIGHTED ? ring_weights[item_first + r] : 1.0f;
                         add_routed<WEIGHTED>(acc, *reinterpret_cast<const uint4 *>(column + r * C::SEGMENT), w);
@@ -288,7 +297,7 @@ gather_combine_kernel(const __grid_constant__ globals g) {
 }
 
 // Fallback for topk > gather_config::MAX_TOPK: one warp per (token, 1024-column segment), rows through registers.
-template <bool WEIGHTED, bool GATED>
+template <bool WEIGHTED, bool GATED, bool HAS_SHARED = true>
 static __global__ void __launch_bounds__(rows::config::NUM_THREADS) combine_rows_kernel(const __grid_constant__ globals g) {
     constexpr int VECS = rows::config::VECS_PER_LANE;
     rows::task t;
@@ -301,8 +310,8 @@ static __global__ void __launch_bounds__(rows::config::NUM_THREADS) combine_rows
     float weight = 0.0f;
     if constexpr (WEIGHTED) weight = lane < g.topk ? __ldg(g.weights + route_row + lane) : 0.0f;
 
-    float acc[VECS][rows::config::VEC];
-    {
+    float acc[VECS][rows::config::VEC] = {};
+    if constexpr (HAS_SHARED) {
         uint4 shared[VECS];
         rows::load_row(shared, g.shared + static_cast<size_t>(t.token) * g.hidden, t, g.hidden);
         const float gate = GATED ? __bfloat162float(g.gate[t.token]) : 1.0f;
@@ -365,7 +374,7 @@ static __host__ void check_routes(const at::Tensor &t, const char *name, const i
 }
 
 // Launches the cp.async gather kernel as one resident wave of persistent warps; false if it cannot run this shape.
-template <bool WEIGHTED, bool GATED, typename C = gather_config>
+template <bool WEIGHTED, bool GATED, bool HAS_SHARED = true, typename C = gather_config>
 static __host__ bool launch_gather(globals g, cudaStream_t stream) {
     const cudaDeviceProp *props = at::cuda::getCurrentDeviceProperties();
     const int64_t items = static_cast<int64_t>(g.num_tokens) * ((g.hidden + C::SEGMENT - 1) / C::SEGMENT);
@@ -376,7 +385,7 @@ static __host__ bool launch_gather(globals g, cudaStream_t stream) {
     static thread_local int configured_device = -1;
     static thread_local int blocks_per_sm[C::MAX_RING + 1];
     const int device = at::cuda::current_device();
-    auto kernel = gather_combine_kernel<WEIGHTED, GATED, C>;
+    auto kernel = gather_combine_kernel<WEIGHTED, GATED, HAS_SHARED, C>;
     if (configured_device != device) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             std::min(C::dynamic_shared_memory(C::MAX_RING),
@@ -398,15 +407,15 @@ static __host__ bool launch_gather(globals g, cudaStream_t stream) {
     return true;
 }
 
-template <bool WEIGHTED, bool GATED>
+template <bool WEIGHTED, bool GATED, bool HAS_SHARED = true>
 static __host__ void launch(const globals &g) {
     if (g.num_tokens == 0 || g.hidden == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
-    if (launch_gather<WEIGHTED, GATED>(g, stream)) return;
+    if (launch_gather<WEIGHTED, GATED, HAS_SHARED>(g, stream)) return;
     const int segments = (g.hidden + rows::config::SEGMENT - 1) / rows::config::SEGMENT;
     const int64_t tasks = static_cast<int64_t>(g.num_tokens) * segments;
     const int blocks = static_cast<int>((tasks + rows::config::NUM_WARPS - 1) / rows::config::NUM_WARPS);
-    combine_rows_kernel<WEIGHTED, GATED><<<blocks, rows::config::NUM_THREADS, 0, stream>>>(g);
+    combine_rows_kernel<WEIGHTED, GATED, HAS_SHARED><<<blocks, rows::config::NUM_THREADS, 0, stream>>>(g);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -415,34 +424,36 @@ static __host__ void launch(const globals &g) {
 namespace fwd_epilogue {
 
 static __host__ at::Tensor fwd_epilogue_entrypoint(
-    const at::Tensor &y_shared,
+    const std::optional<at::Tensor> &y_shared,
     const at::Tensor &combine_buffer,
     const at::Tensor &topk_weights,
     const at::Tensor &top_experts,
     const std::optional<at::Tensor> &shared_output_gate = std::nullopt
 ) {
-    TORCH_CHECK(y_shared.dim() == 2 && topk_weights.dim() == 2, "MoK: fwd_epilogue expects 2-D inputs");
-    const int64_t num_tokens = y_shared.size(0);
-    const int64_t hidden = y_shared.size(1);
+    TORCH_CHECK((!y_shared.has_value() || y_shared->dim() == 2) && topk_weights.dim() == 2 && combine_buffer.dim() == 2, "MoK: fwd_epilogue expects 2-D inputs");
+    const int64_t num_tokens = topk_weights.size(0);
+    const int64_t hidden = combine_buffer.size(1);
     const int64_t topk = topk_weights.size(1);
     TORCH_CHECK(hidden % rows::config::VEC == 0, "MoK: hidden size must be a multiple of 8");
-    combine::check_activation(y_shared, "y_shared", num_tokens, hidden, y_shared.device());
-    combine::check_activation(combine_buffer, "combine_buffer", num_tokens * topk, hidden, y_shared.device());
-    combine::check_routes(topk_weights, "topk_weights", num_tokens, topk, at::kFloat, y_shared.device());
-    combine::check_routes(top_experts, "top_experts", num_tokens, topk, at::kInt, y_shared.device());
+    if (y_shared.has_value())
+        combine::check_activation(*y_shared, "y_shared", num_tokens, hidden, combine_buffer.device());
+    combine::check_activation(combine_buffer, "combine_buffer", num_tokens * topk, hidden, combine_buffer.device());
+    combine::check_routes(topk_weights, "topk_weights", num_tokens, topk, at::kFloat, combine_buffer.device());
+    combine::check_routes(top_experts, "top_experts", num_tokens, topk, at::kInt, combine_buffer.device());
     if (shared_output_gate.has_value()) {
+        TORCH_CHECK(y_shared.has_value(), "MoK: shared output gate requires shared output");
         TORCH_CHECK(shared_output_gate->is_cuda() &&
                     shared_output_gate->scalar_type() == at::kBFloat16 &&
                     shared_output_gate->is_contiguous() &&
-                    shared_output_gate->device() == y_shared.device() &&
+                    shared_output_gate->device() == combine_buffer.device() &&
                     shared_output_gate->dim() == 2 &&
-                    shared_output_gate->size(0) == y_shared.size(0) &&
+                    shared_output_gate->size(0) == num_tokens &&
                     shared_output_gate->size(1) == 1,
                     "MoK: shared_output_gate must be contiguous CUDA BF16 [T, 1] on y_shared's device");
     }
-    at::Tensor output = at::empty_like(y_shared);
+    at::Tensor output = at::empty({num_tokens, hidden}, combine_buffer.options());
     combine::globals g {
-        .shared = reinterpret_cast<const bf16 *>(y_shared.data_ptr<at::BFloat16>()),
+        .shared = y_shared.has_value() ? reinterpret_cast<const bf16 *>(y_shared->data_ptr<at::BFloat16>()) : nullptr,
         .routed = reinterpret_cast<const bf16 *>(combine_buffer.data_ptr<at::BFloat16>()),
         .weights = topk_weights.data_ptr<float>(),
         .top_experts = top_experts.data_ptr<int>(),
@@ -455,8 +466,10 @@ static __host__ at::Tensor fwd_epilogue_entrypoint(
     if (shared_output_gate.has_value()) {
         g.gate = reinterpret_cast<const bf16 *>(shared_output_gate->data_ptr<at::BFloat16>());
         combine::launch<true, true>(g);
-    } else {
+    } else if (y_shared.has_value()) {
         combine::launch<true, false>(g);
+    } else {
+        combine::launch<true, false, false>(g);
     }
     return output;
 }
@@ -466,22 +479,23 @@ static __host__ at::Tensor fwd_epilogue_entrypoint(
 namespace bwd_epilogue {
 
 static __host__ at::Tensor bwd_epilogue_entrypoint(
-    const at::Tensor &d_x_shared,
+    const std::optional<at::Tensor> &d_x_shared,
     const at::Tensor &d_x_routed_buffer,
     const at::Tensor &top_experts
 ) {
-    TORCH_CHECK(d_x_shared.dim() == 2 && d_x_routed_buffer.dim() == 2 && d_x_shared.size(0) > 0,
+    TORCH_CHECK((!d_x_shared.has_value() || d_x_shared->dim() == 2) && d_x_routed_buffer.dim() == 2 && top_experts.dim() == 2 && top_experts.size(0) > 0,
                 "MoK: bwd_epilogue expects 2-D inputs");
-    const int64_t num_tokens = d_x_shared.size(0);
-    const int64_t hidden = d_x_shared.size(1);
+    const int64_t num_tokens = top_experts.size(0);
+    const int64_t hidden = d_x_routed_buffer.size(1);
     const int64_t topk = d_x_routed_buffer.size(0) / num_tokens;
     TORCH_CHECK(hidden % rows::config::VEC == 0, "MoK: hidden size must be a multiple of 8");
-    combine::check_activation(d_x_shared, "d_x_shared", num_tokens, hidden, d_x_shared.device());
-    combine::check_activation(d_x_routed_buffer, "d_x_routed_buffer", num_tokens * topk, hidden, d_x_shared.device());
-    combine::check_routes(top_experts, "top_experts", num_tokens, topk, at::kInt, d_x_shared.device());
-    at::Tensor d_x = at::empty_like(d_x_shared);
+    if (d_x_shared.has_value())
+        combine::check_activation(*d_x_shared, "d_x_shared", num_tokens, hidden, d_x_routed_buffer.device());
+    combine::check_activation(d_x_routed_buffer, "d_x_routed_buffer", num_tokens * topk, hidden, d_x_routed_buffer.device());
+    combine::check_routes(top_experts, "top_experts", num_tokens, topk, at::kInt, d_x_routed_buffer.device());
+    at::Tensor d_x = at::empty({num_tokens, hidden}, d_x_routed_buffer.options());
     combine::globals g {
-        .shared = reinterpret_cast<const bf16 *>(d_x_shared.data_ptr<at::BFloat16>()),
+        .shared = d_x_shared.has_value() ? reinterpret_cast<const bf16 *>(d_x_shared->data_ptr<at::BFloat16>()) : nullptr,
         .routed = reinterpret_cast<const bf16 *>(d_x_routed_buffer.data_ptr<at::BFloat16>()),
         .weights = nullptr,
         .top_experts = top_experts.data_ptr<int>(),
@@ -491,7 +505,8 @@ static __host__ at::Tensor bwd_epilogue_entrypoint(
         .hidden = static_cast<int>(hidden),
         .topk = static_cast<int>(topk),
     };
-    combine::launch<false, false>(g);
+    if (d_x_shared.has_value()) combine::launch<false, false>(g);
+    else combine::launch<false, false, false>(g);
     return d_x;
 }
 

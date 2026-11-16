@@ -1,4 +1,5 @@
 import math
+import struct
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -53,15 +54,16 @@ class MoKSchedule:
 @dataclass(frozen=True, slots=True)
 class MoKForwardContext:
     x_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    gate_shared: torch.Tensor
+    gate_shared: torch.Tensor | None
     gate_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    up_shared: torch.Tensor
+    up_shared: torch.Tensor | None
     up_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    hidden_shared: torch.Tensor
+    hidden_shared: torch.Tensor | None
     hidden_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     # Per-forward tensors, never workspace/ring-buffer views. Ungated keeps neither.
     shared_output: torch.Tensor | None = None
     shared_output_gate: torch.Tensor | None = None
+    situ_beta: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -887,15 +889,34 @@ def _shared_output_gate_wgrad(
     return main_grad
 
 
+def _situ_kwargs(beta, swiglu_limit):
+    if beta is None:
+        return {}
+    error = "situ_beta must contain two positive finite FP32 numbers"
+    if (not isinstance(beta, tuple) or len(beta) != 2
+            or any(type(b) not in (int, float) for b in beta)):
+        raise ValueError(error)
+    # Validate the kernel's FP32 values before they can alias the (0, 0) legacy sentinel.
+    try:
+        beta = struct.unpack("ff", struct.pack("ff", *beta))
+    except (OverflowError, struct.error) as exc:
+        raise ValueError(error) from exc
+    if any(not math.isfinite(b) or b <= 0 for b in beta):
+        raise ValueError(error)
+    if swiglu_limit is not None:
+        raise ValueError("SiTU cannot be combined with swiglu_limit")
+    return dict(situ_beta1=beta[0], situ_beta2=beta[1])
+
+
 def forward(
     config: MoKConfig,
     workspace: MoKWorkspace,
     schedule: MoKSchedule,
     x: torch.Tensor,
     router_weights: torch.Tensor,
-    shared_gate_weights: torch.Tensor,
-    shared_up_weights: torch.Tensor,
-    shared_down_weights: torch.Tensor,
+    shared_gate_weights: torch.Tensor | None,
+    shared_up_weights: torch.Tensor | None,
+    shared_down_weights: torch.Tensor | None,
     routed_gate_weights: torch.Tensor
     | tuple[torch.Tensor, torch.Tensor]
     | SplitRoutedWeight,
@@ -908,11 +929,16 @@ def forward(
     swiglu_limit: float | None = None,
     *,
     shared_output_gate_weight: torch.Tensor | None = None,
+    situ_beta: tuple[float, float] | None = None,
 ) -> tuple[
     torch.Tensor,
     MoKForwardContext,
 ]:
     """Runs the MoE forward pass.
+
+    All shared weights may be None for routed-only execution.
+    ``situ_beta=(beta1, beta2)`` selects SiTU-GLU independently of shared fusion;
+    None preserves SwiGLU. Backward uses the betas saved in the context.
 
     Routed weights use one of three representations:
       * ``torch.Tensor``: contiguous single-grouped BF16 payload.
@@ -940,6 +966,9 @@ def forward(
         forward_context: MoKForwardContext
     """
     validate_inputs(config, workspace, schedule, x, router_weights)
+    activation_kwargs = _situ_kwargs(situ_beta, swiglu_limit)
+    if shared_output_gate_weight is not None and shared_gate_weights is None:
+        raise ValueError("shared output gate requires shared expert weights")
     if shared_output_gate_weight is not None:
         _validate_shared_output_gate_weight(shared_output_gate_weight, x)
 
@@ -1074,10 +1103,11 @@ def forward(
                 _C.dispatch_mlp_swiglu_combine_fwd_mxfp8,
                 fwd_args,
                 (workspace.combine_buffer, *fwd_weights, *routed_tables),
-                ("fwd_mxfp8", config, swiglu_limit, schedule.tokens_per_expert.shape),
+                ("fwd_mxfp8", config, swiglu_limit, schedule.tokens_per_expert.shape, situ_beta),
+                **activation_kwargs,
             )
         else:
-            fwd_outputs = dispatch_mlp_swiglu_combine_fwd_mxfp8(*fwd_args)
+            fwd_outputs = dispatch_mlp_swiglu_combine_fwd_mxfp8(*fwd_args, **activation_kwargs)
         (
             x_fp8_t_routed,
             x_sc_t_routed,
@@ -1103,6 +1133,7 @@ def forward(
             hidden_routed=(hidden_fp8_t_routed, hidden_sc_t_routed),
             shared_output=y_shared if shared_output_gate is not None else None,
             shared_output_gate=shared_output_gate,
+            situ_beta=situ_beta,
         )
     else:
         if direct:
@@ -1111,10 +1142,11 @@ def forward(
                 _C.dispatch_mlp_swiglu_combine_fwd_bf16,
                 fwd_args,
                 (workspace.combine_buffer, *fwd_weights, *routed_tables),
-                ("fwd_bf16", config, swiglu_limit, schedule.tokens_per_expert.shape),
+                ("fwd_bf16", config, swiglu_limit, schedule.tokens_per_expert.shape, situ_beta),
+                **activation_kwargs,
             )
         else:
-            fwd_outputs = dispatch_mlp_swiglu_combine_fwd_bf16(*fwd_args)
+            fwd_outputs = dispatch_mlp_swiglu_combine_fwd_bf16(*fwd_args, **activation_kwargs)
         (
             x_routed,
             gate_shared,
@@ -1136,6 +1168,7 @@ def forward(
             hidden_routed=hidden_routed,
             shared_output=y_shared if shared_output_gate is not None else None,
             shared_output_gate=shared_output_gate,
+            situ_beta=situ_beta,
         )
 
     _barrier(workspace, direct)
@@ -1165,11 +1198,13 @@ def recompute_forward_context(
     workspace: MoKWorkspace,
     schedule: MoKSchedule,
     x: torch.Tensor,
-    shared_gate_weights: torch.Tensor,
-    shared_up_weights: torch.Tensor,
+    shared_gate_weights: torch.Tensor | None,
+    shared_up_weights: torch.Tensor | None,
     routed_gate_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     swiglu_limit: float | None = None,
+    *,
+    situ_beta: tuple[float, float] | None = None,
 ) -> MoKForwardContext:
     """Recomputes the intermediates needed by the MoK backward pass.
 
@@ -1177,6 +1212,7 @@ def recompute_forward_context(
     recompute custom ops do not yet accept per-expert descriptor tables.
     This API remains ungated: it lacks the shared down and output-gate weights
     needed to recreate S/G for gated backward.
+    For SiTU, supply the same ``situ_beta`` as the discarded forward.
 
     Inputs:
         config:              MoKConfig
@@ -1193,6 +1229,7 @@ def recompute_forward_context(
         forward_context: MoKForwardContext
     """
     validate_inputs(config, workspace, schedule, x)
+    activation_kwargs = _situ_kwargs(situ_beta, swiglu_limit)
     # Fail explicitly instead of passing a descriptor-backed object to the
     # contiguous BF16 custom op.
     if isinstance(routed_gate_weights, SplitRoutedWeight) or isinstance(
@@ -1235,6 +1272,7 @@ def recompute_forward_context(
             schedule.num_tokens, schedule.tokens_per_expert,
             workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
             config.macrobatch_size, config.minibatch_size,
+            **activation_kwargs,
         )
         x_routed = (x_fp8_t_routed, x_sc_t_routed)
         gate_routed = (gate_fp8_routed, gate_sc_routed)
@@ -1250,6 +1288,7 @@ def recompute_forward_context(
             schedule.num_tokens, schedule.tokens_per_expert,
             workspace.topk, swiglu_limit, config.fwd_num_comm_sms,
             config.macrobatch_size, config.minibatch_size,
+            **activation_kwargs,
         )
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
@@ -1262,6 +1301,7 @@ def recompute_forward_context(
         up_routed=up_routed,
         hidden_shared=hidden_shared,
         hidden_routed=hidden_routed,
+        situ_beta=situ_beta,
     )
 
 
@@ -1477,19 +1517,19 @@ def backward(
     grad_output: torch.Tensor,
     x: torch.Tensor,
     router_weights: torch.Tensor,
-    shared_gate_weights: torch.Tensor,
-    shared_up_weights: torch.Tensor,
-    shared_down_weights: torch.Tensor,
+    shared_gate_weights: torch.Tensor | None,
+    shared_up_weights: torch.Tensor | None,
+    shared_down_weights: torch.Tensor | None,
     routed_gate_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     routed_down_weights: torch.Tensor | tuple[torch.Tensor, ...] | SplitRoutedWeight,
     swiglu_limit: float | None = None,
     main_grads: tuple[
+        torch.Tensor | None,
         torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
     ]
     | None = None,
@@ -1509,9 +1549,9 @@ def backward(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
     torch.Tensor | None,
 ]:
     """Runs the MoE backward pass.
@@ -1556,7 +1596,8 @@ def backward(
     Outputs:
         The six returned weight-gradient entries are fresh gradients when
         ``main_grads is None``; otherwise they alias the supplied accumulation
-        buffers. For split weights, routed entries are representative tensors
+        buffers. Without shared experts, shared gradient slots are None.
+        For split weights, routed entries are representative tensors
         while the storage tables address every expert buffer.
 
         d_x:                   bfloat16 [num_local_tokens, hidden_size]
@@ -1573,6 +1614,8 @@ def backward(
     validate_inputs(config, workspace, schedule, x, router_weights, grad_output)
     if not isinstance(forward_context, MoKForwardContext):
         raise TypeError("forward_context must be a MoKForwardContext")
+    if (forward_context.gate_shared is None) != (shared_gate_weights is None):
+        raise ValueError("shared weight presence must match the forward context")
 
     gate = forward_context.shared_output_gate
     shared_output = forward_context.shared_output
@@ -1657,7 +1700,7 @@ def backward(
     if not direct:
         _reject_func_transforms()
 
-    shared_grad_kwargs = {}
+    shared_grad_kwargs = _situ_kwargs(forward_context.situ_beta, swiglu_limit)
     # The direct path implies the conditions of the fused gate kernels: plain operands, no tracer and no transform.
     fused_gate = gate is not None and (direct or _fused_gate_kernels(grad_output, shared_output, gate))
     if gate is not None:
@@ -1743,7 +1786,7 @@ def backward(
                     mxfp8_bwd_args,
                     (workspace.d_y_buffer, *bwd_weights),
                     ("bwd_mxfp8", config, swiglu_limit, schedule.tokens_per_expert.shape,
-                     weight_args.native_columnwise),
+                     weight_args.native_columnwise, forward_context.situ_beta),
                     **shared_grad_kwargs,
                 )
             else:
@@ -1786,7 +1829,7 @@ def backward(
                     (*main_grads, *(weight_args.storage_tables or ()), *(weight_args.scale_storage_tables or ()),
                      *(main_grad_storage_tables or ())),
                     ("bwd_mxfp8_accum", len(main_grads), weight_args.storage_tables is None,
-                     main_grad_storage_tables is None),
+                     main_grad_storage_tables is None, shared_gate_weights is None, forward_context.situ_beta),
                     **accum_kwargs,
                 )
             else:
@@ -1861,7 +1904,7 @@ def backward(
                     _C.dispatch_mlp_swiglu_combine_bwd_bf16,
                     bwd_args,
                     (workspace.d_y_buffer, *bwd_weights),
-                    ("bwd_bf16", config, swiglu_limit, schedule.tokens_per_expert.shape),
+                    ("bwd_bf16", config, swiglu_limit, schedule.tokens_per_expert.shape, forward_context.situ_beta),
                     **shared_grad_kwargs,
                 )
             else:
@@ -1899,7 +1942,7 @@ def backward(
                     bwd_args,
                     (*main_grads, *(weight_args.storage_tables or ()), *(main_grad_storage_tables or ())),
                     ("bwd_bf16_accum", len(main_grads), weight_args.storage_tables is None,
-                     main_grad_storage_tables is None),
+                     main_grad_storage_tables is None, shared_gate_weights is None, forward_context.situ_beta),
                     **accum_kwargs,
                 )
             else:

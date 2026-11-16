@@ -740,15 +740,19 @@ def test_eager_stages_misaligned_inputs_in_full(context, monkeypatch, precision,
     assert not failures, failures
 
 
-@pytest.mark.parametrize("gated", [False, True])
-@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
-def test_inductor_stages_inputs_ahead_of_peers(context, precision, gated):
+@pytest.mark.parametrize("precision,gated,routed_only", [
+    ("bf16", False, False), ("bf16", True, False),
+    ("mxfp8", False, False), ("mxfp8", True, False), ("bf16", False, True),
+])
+def test_inductor_stages_inputs_ahead_of_peers(context, precision, gated, routed_only):
     """Compiled staging must precede peer reads for both offset inputs and views taken inside the graph."""
     from torch._inductor.utils import run_and_get_code
 
     # BF16 with separate gate and up weights: the fake kernel of the BF16 backward does not describe the
     # combined-FC1 weight gradient, which Inductor checks.
     p = _problem(context, precision, gated=gated, accumulate=False, single_grouped=precision == "mxfp8")
+    if routed_only:
+        p["shared"] = (None, None, None)
     schedule = _schedule(p)
 
     def step(x, router_weights, d_output):
@@ -793,7 +797,8 @@ def test_inductor_stages_inputs_ahead_of_peers(context, precision, gated):
                     continue
                 differing = [
                     index for index, (reference, result) in enumerate(zip(expected, actual, strict=True))
-                    if not torch.equal(reference, result)
+                    if (reference is None) != (result is None)
+                    or (reference is not None and not torch.equal(reference, result))
                 ]
                 if differing:
                     failures.append(f"{kind} at a {offset}-byte offset: results {differing} differ from eager")
