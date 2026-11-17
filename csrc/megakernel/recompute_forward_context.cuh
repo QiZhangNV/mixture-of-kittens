@@ -1,12 +1,12 @@
-template <bool IS_CLAMPED>
+template <bool IS_CLAMPED, bool IS_SITU = false>
 static __device__ __forceinline__ void recompute_forward_context_kernel(const globals_recompute_forward_context &g) {
     int cluster_idx = clusterIdx().x;
     const int cta_rank = cluster_ctarank();
-    const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
+    const int shared_row_blocks = HAS_SHARED ? (g.x_shared.rows() / config::MLP_Mb) : 0;
     const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * config::mlp_col_blocks(g.w_shared_gate.rows());
-    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * config::mlp_col_blocks(g.w_routed_gate.rows());
-    const int shared_swiglu_tiles = (g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
+    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(g.w_shared_gate.rows()));
+    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (config::mlp_col_blocks(g.w_routed_gate.rows()));
+    const int shared_swiglu_tiles = HAS_SHARED ? ((g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
     const int minibatch_routed_swiglu_tiles = (g.minibatch_size / config::SWIGLU_Mb) * (g.hidden_fp8_routed.cols() / config::SWIGLU_Nb);
     const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
     const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
@@ -91,8 +91,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
 
     auto is_cta_local_task = [&](int compute_cluster_idx) {
         if (compute_cluster_idx < 0) return false;
-        if (compute_cluster_idx < 2 * shared_gate_up_tasks) return false;
-        if (compute_cluster_idx < shared_tasks) return true;
+        if (HAS_SHARED && compute_cluster_idx < 2 * shared_gate_up_tasks) return false;
+        if (HAS_SHARED && compute_cluster_idx < shared_tasks) return true;
         const int minibatch_task_idx = (compute_cluster_idx - shared_tasks) % minibatch_tasks;
         return minibatch_task_idx >= 2 * minibatch_routed_gate_up_tasks;
     };
@@ -110,7 +110,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
         const int compute_cluster_idx = cluster_idx - comm_clusters;
         const bool current_is_cta_local = is_cta_local_task(compute_cluster_idx);
 
-        if (compute_cluster_idx < shared_gate_up_tasks) {
+        if (HAS_SHARED && compute_cluster_idx < shared_gate_up_tasks) {
+            if constexpr (HAS_SHARED) {
             // Shared gate (BF16)
             const int task_idx = compute_cluster_idx;
             expert_grouped_gemm_kernel<true>(g.x_shared, g.w_shared_gate, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -120,7 +121,9 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
                                       gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                       num_tokens, g.macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
                                       0, 0, 0, 0, 0, smem_base_addr);
-        } else if (compute_cluster_idx < shared_gate_up_tasks * 2) {
+        }
+        } else if (HAS_SHARED && compute_cluster_idx < shared_gate_up_tasks * 2) {
+            if constexpr (HAS_SHARED) {
             // Shared up (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks;
             expert_grouped_gemm_kernel<true>(g.x_shared, g.w_shared_up, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -130,14 +133,17 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
                                       gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                       num_tokens, g.macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
                                       0, 0, 0, 0, 0, smem_base_addr);
-        } else if (compute_cluster_idx < shared_tasks) {
+        }
+        } else if (HAS_SHARED && compute_cluster_idx < shared_tasks) {
+            if constexpr (HAS_SHARED) {
             // Shared Swiglu (BF16)
             const int task_idx = compute_cluster_idx - shared_gate_up_tasks * 2;
-            swiglu_fwd_kernel<true, IS_CLAMPED>(g.gate_shared, g.up_shared, g.hidden_shared, nullptr, nullptr, nullptr,
+            swiglu_fwd_kernel<true, IS_CLAMPED, IS_SITU>(g.gate_shared, g.up_shared, g.hidden_shared, nullptr, nullptr, nullptr,
                              g.gate_up_tile_ready, g.hidden_row_block_ready,
                              swiglu_inputs_arrived, swiglu_bitfield,
-                             g.x_shared.rows(), g.swiglu_limit, g.macrobatch_size, g.minibatch_size,
+                             g.x_shared.rows(), g.swiglu_limit, g.situ_beta, g.macrobatch_size, g.minibatch_size,
                              0, 0, task_idx, cta_rank, 0, 0, smem_base_addr);
+        }
         } else {
             const int routed_task_idx = compute_cluster_idx - shared_tasks;
             const int minibatch_idx = routed_task_idx / minibatch_tasks;
@@ -166,11 +172,11 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
             } else {
                 // Routed Swiglu
                 const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
-                swiglu_fwd_kernel<false, IS_CLAMPED>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
+                swiglu_fwd_kernel<false, IS_CLAMPED, IS_SITU>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
                                   &g.hidden_sc_routed, &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
                                   g.gate_up_tile_ready, g.hidden_row_block_ready,
                                   swiglu_inputs_arrived, swiglu_bitfield,
-                                  num_tokens, g.swiglu_limit, g.macrobatch_size, g.minibatch_size,
+                                  num_tokens, g.swiglu_limit, g.situ_beta, g.macrobatch_size, g.minibatch_size,
                                   0, minibatch_idx, task_idx, cta_rank,
                                   shared_gate_up_tasks, shared_row_blocks, smem_base_addr);
             }
@@ -242,17 +248,20 @@ recompute_forward_context_mxfp8(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
     const int num_routed_tokens = min(schedule_capacity, macrobatch_size);
     const int hidden_dim = x.size(1);
-    const int intermediate_dim = w_shared_gate.size(0);
+    const int intermediate_dim = w_routed_gate.size(-2) / (w_routed_gate.is_same(w_routed_up) ? 2 : 1);
     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
-    const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
+    const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(w_shared_gate.size(0)));
+    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(intermediate_dim));
     const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(w_routed_gate.size(1)));
 
     activation_bf16_pgl x_routed_send_buffer_data;
@@ -263,15 +272,15 @@ recompute_forward_context_mxfp8(
     at::Tensor x_sc_routed = at::empty({macrobatch_size / 128, hidden_dim / 128, 32, 16}, x.options().dtype(at::kByte));
     at::Tensor x_fp8_t_routed = at::empty({hidden_dim, macrobatch_size}, x.options().dtype(at::kFloat8_e4m3fn));
     at::Tensor x_sc_t_routed = at::empty({hidden_dim / 128, macrobatch_size / 128, 32, 16}, x.options().dtype(at::kByte));
-    at::Tensor gate_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
+    at::Tensor gate_shared = shared_empty({num_local_tokens, intermediate_dim}, x.options());
     at::Tensor gate_routed = at::empty({macrobatch_size, intermediate_dim}, x.options());
     at::Tensor gate_fp8_routed = at::empty({macrobatch_size, intermediate_dim}, x.options().dtype(at::kFloat8_e4m3fn));
     at::Tensor gate_sc_routed = at::empty({macrobatch_size / 128, intermediate_dim / 128, 32, 16}, x.options().dtype(at::kByte));
-    at::Tensor up_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
+    at::Tensor up_shared = shared_empty({num_local_tokens, intermediate_dim}, x.options());
     at::Tensor up_routed = at::empty({macrobatch_size, intermediate_dim}, x.options());
     at::Tensor up_fp8_routed = at::empty({macrobatch_size, intermediate_dim}, x.options().dtype(at::kFloat8_e4m3fn));
     at::Tensor up_sc_routed = at::empty({macrobatch_size / 128, intermediate_dim / 128, 32, 16}, x.options().dtype(at::kByte));
-    at::Tensor hidden_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
+    at::Tensor hidden_shared = shared_empty({num_local_tokens, intermediate_dim}, x.options());
     at::Tensor hidden_fp8_routed = at::empty({macrobatch_size, intermediate_dim}, x.options().dtype(at::kFloat8_e4m3fn));
     at::Tensor hidden_sc_routed = at::empty({macrobatch_size / 128, intermediate_dim / 128, 32, 16}, x.options().dtype(at::kByte));
     at::Tensor hidden_fp8_t_routed = at::empty({intermediate_dim, macrobatch_size}, x.options().dtype(at::kFloat8_e4m3fn));
@@ -281,31 +290,31 @@ recompute_forward_context_mxfp8(
     at::Tensor hidden_row_block_ready = at::zeros({shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
 
     globals_recompute_forward_context g {
-        .x_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(x),
+        .x_shared = shared_layout<mlp_bf16_gl>(x),
         .x_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_routed),
         .x_sc_routed = kittens::py::tensor_to_gl<sc_gl>(x_sc_routed),
         .x_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_t_routed),
         .x_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(x_sc_t_routed),
-        .gate_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(gate_shared),
+        .gate_shared = shared_layout<epi_bf16_gl>(gate_shared),
         .gate_routed = kittens::py::tensor_to_gl<epi_bf16_gl>(gate_routed),
         .gate_fp8_routed = kittens::py::tensor_to_gl<gate_up_fp8_gl>(gate_fp8_routed),
         .gate_sc_routed = kittens::py::tensor_to_gl<sc_gl>(gate_sc_routed),
-        .up_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(up_shared),
+        .up_shared = shared_layout<epi_bf16_gl>(up_shared),
         .up_routed = kittens::py::tensor_to_gl<epi_bf16_gl>(up_routed),
         .up_fp8_routed = kittens::py::tensor_to_gl<gate_up_fp8_gl>(up_fp8_routed),
         .up_sc_routed = kittens::py::tensor_to_gl<sc_gl>(up_sc_routed),
-        .hidden_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(hidden_shared),
+        .hidden_shared = shared_layout<mlp_bf16_gl>(hidden_shared),
         .hidden_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(hidden_fp8_routed),
         .hidden_sc_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_routed),
         .hidden_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(hidden_fp8_t_routed),
         .hidden_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_t_routed),
         .x_routed_send_buffer = x_routed_send_buffer_data,
-        .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
+        .w_shared_gate = shared_layout<weight_bf16_gl>(w_shared_gate),
         .w_routed_gate = make_routed_weight_view(
             w_routed_gate, intermediate_dim, hidden_dim),
         .w_routed_gate_sc = make_routed_scale_view(
             w_routed_gate_sc, intermediate_dim / config::QUANT_Mb),
-        .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
+        .w_shared_up = shared_layout<weight_bf16_gl>(w_shared_up),
         .w_routed_up = make_routed_weight_view(
             w_routed_up, intermediate_dim, hidden_dim),
         .w_routed_up_sc = make_routed_scale_view(
@@ -319,12 +328,15 @@ recompute_forward_context_mxfp8(
         .x_routed_ready = kittens::py::tensor_to_gl<index_gl>(x_routed_ready),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false>>(g);
@@ -352,16 +364,19 @@ recompute_forward_context_bf16(
     std::optional<float> swiglu_limit,
     int num_comm_sms,
     int macrobatch_size,
-    int minibatch_size
+    int minibatch_size,
+    float situ_beta1 = 0.0f,
+    float situ_beta2 = 0.0f
 ) {
+    validate_situ(swiglu_limit, situ_beta1, situ_beta2);
     static_assert(!USE_MXFP8);
     const int num_local_tokens = x.size(0);
     const int schedule_capacity = schedule_peer_rank.size(0);
     const int num_routed_tokens = min(schedule_capacity, macrobatch_size);
     const int hidden_dim = x.size(1);
-    const int intermediate_dim = w_shared_gate.size(0);
+    const int intermediate_dim = w_routed_gate.size(-2) / (w_routed_gate.is_same(w_routed_up) ? 2 : 1);
     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
-    const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
+    const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
     const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(intermediate_dim));
     const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(intermediate_dim));
@@ -371,41 +386,41 @@ recompute_forward_context_bf16(
         x_routed_send_buffer_data[i] = reinterpret_cast<bf16*>(x_ptrs[i]);
 
     at::Tensor x_routed = at::empty({macrobatch_size, hidden_dim}, x.options());
-    at::Tensor gate_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
+    at::Tensor gate_shared = shared_empty({num_local_tokens, intermediate_dim}, x.options());
     at::Tensor gate_routed = at::empty({macrobatch_size, intermediate_dim}, x.options());
-    at::Tensor up_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
+    at::Tensor up_shared = shared_empty({num_local_tokens, intermediate_dim}, x.options());
     at::Tensor up_routed = at::empty({macrobatch_size, intermediate_dim}, x.options());
-    at::Tensor hidden_shared = at::empty({num_local_tokens, intermediate_dim}, x.options());
+    at::Tensor hidden_shared = shared_empty({num_local_tokens, intermediate_dim}, x.options());
     at::Tensor hidden_routed = at::empty({macrobatch_size, intermediate_dim}, x.options());
     at::Tensor x_routed_ready = at::zeros({num_routed_minibatches}, tokens_per_expert.options());
     at::Tensor gate_up_tile_ready = at::zeros({shared_gate_up_tasks + routed_gate_up_tasks}, tokens_per_expert.options());
     at::Tensor hidden_row_block_ready = at::zeros({shared_row_blocks + routed_row_blocks}, tokens_per_expert.options());
 
     globals_recompute_forward_context g {
-        .x_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(x),
+        .x_shared = shared_layout<mlp_bf16_gl>(x),
         .x_fp8_routed = kittens::py::tensor_to_gl<routed_activation_gl>(x_routed),
         .x_sc_routed = {},
         .x_fp8_t_routed = kittens::py::tensor_to_gl<routed_transposed_gl>(x_routed),
         .x_sc_t_routed = {},
-        .gate_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(gate_shared),
+        .gate_shared = shared_layout<epi_bf16_gl>(gate_shared),
         .gate_routed = kittens::py::tensor_to_gl<epi_bf16_gl>(gate_routed),
         .gate_fp8_routed = kittens::py::tensor_to_gl<routed_gate_up_gl>(gate_routed),
         .gate_sc_routed = {},
-        .up_shared = kittens::py::tensor_to_gl<epi_bf16_gl>(up_shared),
+        .up_shared = shared_layout<epi_bf16_gl>(up_shared),
         .up_routed = kittens::py::tensor_to_gl<epi_bf16_gl>(up_routed),
         .up_fp8_routed = kittens::py::tensor_to_gl<routed_gate_up_gl>(up_routed),
         .up_sc_routed = {},
-        .hidden_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(hidden_shared),
+        .hidden_shared = shared_layout<mlp_bf16_gl>(hidden_shared),
         .hidden_fp8_routed = kittens::py::tensor_to_gl<routed_activation_gl>(hidden_routed),
         .hidden_sc_routed = {},
         .hidden_fp8_t_routed = kittens::py::tensor_to_gl<routed_transposed_gl>(hidden_routed),
         .hidden_sc_t_routed = {},
         .x_routed_send_buffer = x_routed_send_buffer_data,
-        .w_shared_gate = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_gate),
+        .w_shared_gate = shared_layout<weight_bf16_gl>(w_shared_gate),
         .w_routed_gate = make_routed_weight_view(
             w_routed_gate, intermediate_dim, hidden_dim),
         .w_routed_gate_sc = {},
-        .w_shared_up = kittens::py::tensor_to_gl<weight_bf16_gl>(w_shared_up),
+        .w_shared_up = shared_layout<weight_bf16_gl>(w_shared_up),
         .w_routed_up = make_routed_weight_view(
             w_routed_up, intermediate_dim, hidden_dim),
         .w_routed_up_sc = {},
@@ -418,12 +433,15 @@ recompute_forward_context_bf16(
         .x_routed_ready = kittens::py::tensor_to_gl<index_gl>(x_routed_ready),
         .topk = topk,
         .swiglu_limit = swiglu_limit.value_or(0.0f),
+        .situ_beta = {situ_beta1, situ_beta2},
         .num_comm_sms = num_comm_sms,
         .macrobatch_size = macrobatch_size,
         .minibatch_size = minibatch_size
     };
 
-    if (swiglu_limit.has_value())
+    if (situ_beta1 > 0.0f) {
+        kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false, true>>(g);
+    } else if (swiglu_limit.has_value())
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<true>>(g);
     else
         kittens::py::launch_kernel<config, globals_recompute_forward_context, recompute_forward_context_kernel<false>>(g);
