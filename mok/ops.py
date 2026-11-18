@@ -1,6 +1,57 @@
+from functools import wraps
+from inspect import signature
+from typing import Any, get_args
+
 import torch
 
 from . import _C
+
+
+def _tensor_outputs(fn):
+    """Use distinct zero-element tensors for absent outputs in the dispatcher ABI."""
+    first_argument = next(iter(signature(fn).parameters))
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        outputs = fn(*args, **kwargs)
+        prototype = args[0] if args else kwargs[first_argument]
+        return tuple(prototype.new_empty((0,)) if value is None else value for value in outputs)
+
+    return wrapped
+
+
+def _optional_output_op(name: str, *, mutates_args):
+    """Keep public None outputs while mutable custom ops expose only Tensor returns to Inductor."""
+
+    def register(fn):
+        result_type = fn.__annotations__["return"]
+        result_items = get_args(result_type)
+        optional = tuple(type(None) in get_args(item) for item in result_items)
+        shared_index = tuple(signature(fn).parameters).index("w_shared_gate")
+        fn.__annotations__["return"] = tuple[tuple(torch.Tensor for _ in result_items)]
+        try:
+            schema = torch.library.infer_schema(fn, mutates_args=mutates_args)
+        finally:
+            fn.__annotations__["return"] = result_type
+        op = torch.library.custom_op(name, mutates_args=mutates_args, schema=schema)(_tensor_outputs(fn))
+
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            outputs = op(*args, **kwargs)
+            shared = args[shared_index] if len(args) > shared_index else kwargs["w_shared_gate"]
+            if shared is None:
+                return tuple(None if absent else value for absent, value in zip(optional, outputs, strict=True))
+            return outputs
+
+        return wrapped
+
+    return register
+
+
+def _check_shared_mode(*tensors: torch.Tensor | None) -> None:
+    present = [tensor is not None for tensor in tensors]
+    if any(present) != all(present):
+        raise ValueError("shared tensors must be all present or all absent")
 
 
 @torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
@@ -197,19 +248,109 @@ def mxfp8_quantize(
     return _C.mxfp8_quantize(x_bf16, return_normal, return_transposed)
 
 
-@torch.library.custom_op("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8", mutates_args=("combine_buffer",))
+def _make_routed_storage_table(
+    expert_tensors: list[torch.Tensor], *, precision: str
+) -> torch.Tensor:
+    """Build a reusable device table of per-expert TK/TMA layouts.
+
+    This is a one-time setup operation and must run before CUDA graph capture.
+    The returned tensor owns only descriptors; it does not copy weight data.
+    """
+    if not isinstance(expert_tensors, list) or not expert_tensors:
+        raise TypeError("expert_tensors must be a nonempty list of tensors")
+    first = expert_tensors[0]
+    if not isinstance(first, torch.Tensor):
+        raise TypeError("each expert tensor must be a torch.Tensor")
+    if not first.is_cuda or not first.is_contiguous() or first.ndim != 2:
+        raise ValueError("each expert tensor must be a contiguous CUDA matrix")
+    for tensor in expert_tensors:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device != first.device
+            or tensor.dtype != first.dtype
+            or tensor.shape != first.shape
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("all expert tensors must have identical dtype, shape, and device")
+    if precision == "mxfp8":
+        if first.dtype != torch.float8_e4m3fn:
+            raise TypeError("MXFP8 expert tensors must have dtype float8_e4m3fn")
+        return _C.make_routed_weight_storage_table_mxfp8(expert_tensors)
+    if precision == "bf16":
+        if first.dtype != torch.bfloat16:
+            raise TypeError("BF16 expert tensors must have dtype bfloat16")
+        return _C.make_routed_weight_storage_table_bf16(expert_tensors)
+    if precision == "wgrad":
+        if first.dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError("expert main grads must have dtype float32 or bfloat16")
+        return _C.make_routed_d_weight_storage_table(expert_tensors)
+    raise ValueError(f"unsupported routed storage-table precision: {precision}")
+
+
+def make_routed_weight_storage_table_mxfp8(
+    expert_tensors: list[torch.Tensor],
+) -> torch.Tensor:
+    return _make_routed_storage_table(expert_tensors, precision="mxfp8")
+
+
+def make_routed_weight_storage_table_bf16(
+    expert_tensors: list[torch.Tensor],
+) -> torch.Tensor:
+    return _make_routed_storage_table(expert_tensors, precision="bf16")
+
+
+def make_routed_scale_storage_table(
+    expert_tensors: list[torch.Tensor],
+) -> torch.Tensor:
+    """Build a reusable table of per-expert tcgen05 scale layouts."""
+    if not isinstance(expert_tensors, list) or not expert_tensors:
+        raise TypeError("expert_tensors must be a nonempty list of tensors")
+    first = expert_tensors[0]
+    if (
+        not isinstance(first, torch.Tensor)
+        or not first.is_cuda
+        or first.dtype != torch.uint8
+        or not first.is_contiguous()
+        or first.ndim != 4
+        or tuple(first.shape[-2:]) != (32, 16)
+    ):
+        raise ValueError(
+            "each expert scale must be contiguous CUDA uint8 shaped "
+            "[row_blocks, col_blocks, 32, 16]"
+        )
+    for tensor in expert_tensors:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device != first.device
+            or tensor.dtype != torch.uint8
+            or tensor.shape != first.shape
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "all expert scales must have identical dtype, shape, and device"
+            )
+    return _C.make_routed_scale_storage_table(expert_tensors)
+
+
+def make_routed_d_weight_storage_table(
+    expert_tensors: list[torch.Tensor],
+) -> torch.Tensor:
+    return _make_routed_storage_table(expert_tensors, precision="wgrad")
+
+
+@_optional_output_op("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8", mutates_args=("combine_buffer",))
 def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     x: torch.Tensor,
     x_ptrs: list[int],
     combine_buffer: torch.Tensor,
     combine_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
     w_routed_gate_sc: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
     w_routed_up_sc: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down: torch.Tensor,
     w_routed_down_sc: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
@@ -221,19 +362,27 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
+    w_routed_gate_sc_storage_table: torch.Tensor | None = None,
+    w_routed_up_sc_storage_table: torch.Tensor | None = None,
+    w_routed_down_sc_storage_table: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
 ]:
     """Runs the fused MXFP8 MoE forward pass.
@@ -277,13 +426,14 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         y_shared:            bfloat16 [num_local_tokens, hidden_size]
         y_routed:            bfloat16 [macrobatch_size, hidden_size]
     """
+    _check_shared_mode(w_shared_gate, w_shared_up, w_shared_down)
     if x.ndim != 2:
         raise ValueError("x must have shape (num_local_tokens, hidden_size)")
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -307,31 +457,96 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         raise ValueError("x_ptrs length must be one of 1, 4, 8, 16, 32, 64")
     if len(combine_buffer_ptrs) != ep_size:
         raise ValueError("combine_buffer_ptrs length must match x_ptrs")
-    if w_shared_gate.ndim != 2:
+    if w_shared_gate is not None and w_shared_gate.ndim != 2:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
-    intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
-    if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
-        raise ValueError("w_routed_gate must have shape "
-                         "(num_local_experts, intermediate_size, hidden_size)")
-    num_local_experts = w_routed_gate.shape[0]
+    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+    split_storage = w_routed_gate_storage_table is not None
+    if (
+        split_storage != (w_routed_up_storage_table is not None)
+        or split_storage != (w_routed_down_storage_table is not None)
+    ):
+        raise ValueError("all three routed storage tables must be provided together")
+    split_scale_storage = w_routed_gate_sc_storage_table is not None
+    if (
+        split_scale_storage != (w_routed_up_sc_storage_table is not None)
+        or split_scale_storage != (w_routed_down_sc_storage_table is not None)
+    ):
+        raise ValueError("all three routed scale storage tables must be provided together")
+    if split_scale_storage != split_storage:
+        raise ValueError(
+            "split MXFP8 weights and scales must provide descriptor tables together"
+        )
+    if split_storage:
+        num_local_experts = tokens_per_expert.numel()
+        if num_local_experts <= 0 or w_routed_gate.ndim != 2:
+            raise ValueError("split w_routed_gate must be one expert matrix")
+    else:
+        if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
+            raise ValueError("w_routed_gate must have shape "
+                             "(num_local_experts, intermediate_size, hidden_size)")
+        num_local_experts = w_routed_gate.shape[0]
+    combined_fc1_payload = w_routed_gate is w_routed_up
+    combined_fc1_scale_payload = w_routed_gate_sc is w_routed_up_sc
+    if combined_fc1_payload != combined_fc1_scale_payload:
+        raise ValueError(
+            "combined FC1 data and scale tensors must alias consistently"
+        )
+    if split_storage:
+        if combined_fc1_payload != (
+            w_routed_gate_storage_table is w_routed_up_storage_table
+        ):
+            raise ValueError(
+                "combined FC1 weights and weight descriptor tables must alias consistently"
+            )
+        if combined_fc1_scale_payload != (
+            w_routed_gate_sc_storage_table is w_routed_up_sc_storage_table
+        ):
+            raise ValueError(
+                "combined FC1 scales and scale descriptor tables must alias consistently"
+            )
+    routed_fc1_shape = (
+        ((2 if combined_fc1_payload else 1) * intermediate_size, hidden_size)
+        if split_storage
+        else (
+            num_local_experts,
+            (2 if combined_fc1_payload else 1) * intermediate_size,
+            hidden_size,
+        )
+    )
+    routed_fc1_sc_shape = (
+        (
+            (2 if combined_fc1_payload else 1) * intermediate_size // 128,
+            hidden_size // 128, 32, 16,
+        )
+        if split_scale_storage
+        else (
+            num_local_experts * (2 if combined_fc1_payload else 1) * intermediate_size // 128,
+            hidden_size // 128, 32, 16,
+        )
+    )
     expected_shapes = (
         ("combine_buffer", combine_buffer, (num_local_tokens * topk, hidden_size)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate", w_routed_gate, (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_gate_sc", w_routed_gate_sc,
-         (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
+        ("w_routed_gate_sc", w_routed_gate_sc, routed_fc1_sc_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_up_sc", w_routed_up_sc,
-         (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
+        ("w_routed_up_sc", w_routed_up_sc, routed_fc1_sc_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
-        ("w_routed_down", w_routed_down, (num_local_experts, hidden_size, intermediate_size)),
+        ("w_routed_down", w_routed_down,
+         ((hidden_size, intermediate_size) if split_storage
+          else (num_local_experts, hidden_size, intermediate_size))),
         ("w_routed_down_sc", w_routed_down_sc,
-         (num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16)),
+         ((hidden_size // 128, intermediate_size // 128, 32, 16)
+          if split_scale_storage
+          else (num_local_experts * hidden_size // 128,
+                intermediate_size // 128, 32, 16))),
     )
     for tensor_name, tensor, expected_shape in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(f"{tensor_name} must have shape {expected_shape}")
     for tensor_name, tensor in (
@@ -350,8 +565,28 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         ("num_tokens", num_tokens),
         ("tokens_per_expert", tokens_per_expert),
     ):
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tensor.device != x.device:
             raise ValueError(f"{tensor_name} must be on {x.device}")
+    if split_storage:
+        for tensor_name, table in (
+            ("w_routed_gate_storage_table", w_routed_gate_storage_table),
+            ("w_routed_up_storage_table", w_routed_up_storage_table),
+            ("w_routed_down_storage_table", w_routed_down_storage_table),
+            ("w_routed_gate_sc_storage_table", w_routed_gate_sc_storage_table),
+            ("w_routed_up_sc_storage_table", w_routed_up_sc_storage_table),
+            ("w_routed_down_sc_storage_table", w_routed_down_sc_storage_table),
+        ):
+            if (
+                table.device != x.device
+                or table.dtype != torch.uint8
+                or not table.is_contiguous()
+                or table.numel() == 0
+            ):
+                raise ValueError(
+                    f"{tensor_name} must be nonempty contiguous CUDA uint8 on {x.device}"
+                )
     if schedule_peer_rank.ndim != 1 or schedule_peer_rank.numel() == 0:
         raise ValueError("schedule_peer_rank must be a nonempty 1D tensor")
     schedule_capacity = schedule_peer_rank.numel()
@@ -371,20 +606,25 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
         w_shared_down, w_routed_down, w_routed_down_sc,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        w_routed_gate_storage_table, w_routed_up_storage_table,
+        w_routed_down_storage_table,
+        w_routed_gate_sc_storage_table, w_routed_up_sc_storage_table,
+        w_routed_down_sc_storage_table,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
-@torch.library.custom_op("mok::dispatch_mlp_swiglu_combine_fwd_bf16", mutates_args=("combine_buffer",))
+@_optional_output_op("mok::dispatch_mlp_swiglu_combine_fwd_bf16", mutates_args=("combine_buffer",))
 def dispatch_mlp_swiglu_combine_fwd_bf16(
     x: torch.Tensor,
     x_ptrs: list[int],
     combine_buffer: torch.Tensor,
     combine_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
     schedule_peer_token_idx: torch.Tensor,
@@ -395,15 +635,20 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
 ]:
     """Runs the fused BF16 MoE forward pass.
@@ -440,21 +685,52 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
         y_shared:      bfloat16 [num_local_tokens, hidden_size]
         y_routed:      bfloat16 [macrobatch_size, hidden_size]
     """
+    _check_shared_mode(w_shared_gate, w_shared_up, w_shared_down)
     if x.ndim != 2:
         raise ValueError("x must have shape (num_local_tokens, hidden_size)")
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
-    if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+    if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
-    intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
-    if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
-        raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
-    num_local_experts = w_routed_gate.shape[0]
+    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+    split_storage = w_routed_gate_storage_table is not None
+    if (
+        split_storage != (w_routed_up_storage_table is not None)
+        or split_storage != (w_routed_down_storage_table is not None)
+    ):
+        raise ValueError("all three routed storage tables must be provided together")
+    if split_storage:
+        num_local_experts = tokens_per_expert.numel()
+        if num_local_experts <= 0 or w_routed_gate.ndim != 2:
+            raise ValueError("split w_routed_gate must be one expert matrix")
+    else:
+        if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
+            raise ValueError(
+                "w_routed_gate must have shape "
+                "(num_local_experts, intermediate_size, hidden_size)"
+            )
+        num_local_experts = w_routed_gate.shape[0]
+    combined_fc1_payload = w_routed_gate is w_routed_up
+    if split_storage and combined_fc1_payload != (
+        w_routed_gate_storage_table is w_routed_up_storage_table
+    ):
+        raise ValueError(
+            "combined FC1 weights and weight descriptor tables must alias consistently"
+        )
+    routed_fc1_shape = (
+        ((2 if combined_fc1_payload else 1) * intermediate_size, hidden_size)
+        if split_storage
+        else (
+            num_local_experts,
+            (2 if combined_fc1_payload else 1) * intermediate_size,
+            hidden_size,
+        )
+    )
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -483,16 +759,20 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     expected_shapes = (
         ("combine_buffer", combine_buffer, (num_local_tokens * topk, hidden_size)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate", w_routed_gate, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
-        ("w_routed_down", w_routed_down, (num_local_experts, hidden_size, intermediate_size)),
+        ("w_routed_down", w_routed_down,
+         ((hidden_size, intermediate_size) if split_storage
+          else (num_local_experts, hidden_size, intermediate_size))),
         ("schedule_peer_token_idx", schedule_peer_token_idx, (schedule_capacity,)),
         ("num_tokens", num_tokens, (1,)),
         ("tokens_per_expert", tokens_per_expert, (num_local_experts,)),
     )
     for tensor_name, tensor, expected_shape in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(f"{tensor_name} must have shape {expected_shape}")
     for tensor_name, tensor in (
@@ -508,8 +788,25 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
         ("num_tokens", num_tokens),
         ("tokens_per_expert", tokens_per_expert),
     ):
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tensor.device != x.device:
             raise ValueError(f"{tensor_name} must be on {x.device}")
+    if split_storage:
+        for tensor_name, table in (
+            ("w_routed_gate_storage_table", w_routed_gate_storage_table),
+            ("w_routed_up_storage_table", w_routed_up_storage_table),
+            ("w_routed_down_storage_table", w_routed_down_storage_table),
+        ):
+            if (
+                table.device != x.device
+                or table.dtype != torch.uint8
+                or not table.is_contiguous()
+                or table.numel() == 0
+            ):
+                raise ValueError(
+                    f"{tensor_name} must be nonempty contiguous CUDA uint8 on {x.device}"
+                )
 
     return _C.dispatch_mlp_swiglu_combine_fwd_bf16(
         x, x_ptrs, combine_buffer, combine_buffer_ptrs,
@@ -517,17 +814,20 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
         w_shared_down, w_routed_down,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        w_routed_gate_storage_table, w_routed_up_storage_table,
+        w_routed_down_storage_table,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
-@torch.library.custom_op("mok::recompute_forward_context_mxfp8", mutates_args=())
+@_optional_output_op("mok::recompute_forward_context_mxfp8", mutates_args=())
 def recompute_forward_context_mxfp8(
     x: torch.Tensor,
     x_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
     w_routed_gate_sc: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
     w_routed_up_sc: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
@@ -539,16 +839,18 @@ def recompute_forward_context_mxfp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
 ]:
@@ -586,13 +888,14 @@ def recompute_forward_context_mxfp8(
         hidden_fp8_t_routed: float8_e4m3fn [intermediate_size, macrobatch_size]
         hidden_sc_t_routed:  uint8 [intermediate_size // 128, macrobatch_size // 128, 32, 16]
     """
+    _check_shared_mode(w_shared_gate, w_shared_up)
     if x.ndim != 2:
         raise ValueError("x must have shape (num_local_tokens, hidden_size)")
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -608,11 +911,11 @@ def recompute_forward_context_mxfp8(
     ep_size = len(x_ptrs)
     if ep_size not in (1, 4, 8, 16, 32, 64):
         raise ValueError("x_ptrs length must be one of 1, 4, 8, 16, 32, 64")
-    if w_shared_gate.ndim != 2:
+    if w_shared_gate is not None and w_shared_gate.ndim != 2:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
-    intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
@@ -628,6 +931,8 @@ def recompute_forward_context_mxfp8(
          (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)),
     )
     for tensor_name, tensor, expected_shape in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(f"{tensor_name} must have shape {expected_shape}")
     for tensor_name, tensor in (
@@ -642,6 +947,8 @@ def recompute_forward_context_mxfp8(
         ("num_tokens", num_tokens),
         ("tokens_per_expert", tokens_per_expert),
     ):
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tensor.device != x.device:
             raise ValueError(f"{tensor_name} must be on {x.device}")
     if schedule_peer_rank.ndim != 1 or schedule_peer_rank.numel() == 0:
@@ -662,16 +969,17 @@ def recompute_forward_context_mxfp8(
         w_shared_up, w_routed_up, w_routed_up_sc,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
-@torch.library.custom_op("mok::recompute_forward_context_bf16", mutates_args=())
+@_optional_output_op("mok::recompute_forward_context_bf16", mutates_args=())
 def recompute_forward_context_bf16(
     x: torch.Tensor,
     x_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
     schedule_peer_token_idx: torch.Tensor,
@@ -682,13 +990,15 @@ def recompute_forward_context_bf16(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
 ]:
     """Recomputes the BF16 MoE forward context.
@@ -719,18 +1029,19 @@ def recompute_forward_context_bf16(
         hidden_shared: bfloat16 [num_local_tokens, intermediate_size]
         hidden_routed: bfloat16 [macrobatch_size, intermediate_size]
     """
+    _check_shared_mode(w_shared_gate, w_shared_up)
     if x.ndim != 2:
         raise ValueError("x must have shape (num_local_tokens, hidden_size)")
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
-    if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+    if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
-    intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
@@ -766,9 +1077,13 @@ def recompute_forward_context_bf16(
         ("tokens_per_expert", tokens_per_expert, (num_local_experts,)),
     )
     for tensor_name, tensor, expected_shape in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(f"{tensor_name} must have shape {expected_shape}")
     for tensor_name, tensor, _ in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tensor.device != x.device:
             raise ValueError(f"{tensor_name} must be on {x.device}")
     if schedule_peer_rank.device != x.device:
@@ -779,10 +1094,11 @@ def recompute_forward_context_bf16(
         w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
-@torch.library.custom_op(
+@_optional_output_op(
     "mok::dispatch_mlp_swiglu_combine_bwd_mxfp8",
     mutates_args=("d_x_routed_buffer", "d_router_weight_buffer",
                   "x_fp8_t_routed", "x_sc_t_routed",
@@ -798,24 +1114,24 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     router_weight_buffer_ptrs: list[int],
     d_router_weight_buffer: torch.Tensor,
     d_router_weight_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate_T: torch.Tensor,
     w_routed_gate_T_sc: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up_T: torch.Tensor,
     w_routed_up_T_sc: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down_T: torch.Tensor,
     w_routed_down_T_sc: torch.Tensor,
     x_fp8_t_routed: torch.Tensor,
     x_sc_t_routed: torch.Tensor,
-    gate_shared: torch.Tensor,
+    gate_shared: torch.Tensor | None,
     gate_fp8_routed: torch.Tensor,
     gate_sc_routed: torch.Tensor,
-    up_shared: torch.Tensor,
+    up_shared: torch.Tensor | None,
     up_fp8_routed: torch.Tensor,
     up_sc_routed: torch.Tensor,
-    hidden_shared: torch.Tensor,
+    hidden_shared: torch.Tensor | None,
     hidden_fp8_t_routed: torch.Tensor,
     hidden_sc_t_routed: torch.Tensor,
     x: torch.Tensor,
@@ -833,27 +1149,35 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    routed_weights_are_native_columnwise: bool = False,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
 ]:
     """Runs the fused MXFP8 MoE backward pass.
+
+    ``shared_grad_output`` optionally supplies BF16 [T, H] gradients for
+    the shared MLP only. Routed dispatch/quantization and router backward
+    retain the original ``d_y_buffer``. None preserves the ungated path.
 
     Inputs:
         d_y_buffer:                    bfloat16 [num_local_tokens, hidden_size]
@@ -865,13 +1189,18 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         d_router_weight_buffer:        float32 [num_local_tokens, topk]
         d_router_weight_buffer_ptrs:   list[int] [ep_size]
         w_shared_gate:                 bfloat16 [intermediate_size, hidden_size]
-        w_routed_gate_T:               float8_e4m3fn [num_local_experts, hidden_size, intermediate_size]
-        w_routed_gate_T_sc:            uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16]
+        w_routed_gate_T:               legacy: float8_e4m3fn [num_local_experts, hidden_size, intermediate_size];
+                                         native single-grouped: shared FC1 columnwise payload [num_local_experts, 2 * intermediate_size, hidden_size]
+        w_routed_gate_T_sc:            legacy: uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16];
+                                         native single-grouped: uint8 [num_local_experts * hidden_size // 128, 2 * intermediate_size // 128, 32, 16]
         w_shared_up:                   bfloat16 [intermediate_size, hidden_size]
-        w_routed_up_T:                 float8_e4m3fn [num_local_experts, hidden_size, intermediate_size]
-        w_routed_up_T_sc:              uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16]
+        w_routed_up_T:                 legacy: float8_e4m3fn [num_local_experts, hidden_size, intermediate_size];
+                                         native single-grouped: alias of w_routed_gate_T
+        w_routed_up_T_sc:              legacy: uint8 [num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16];
+                                         native single-grouped: alias of w_routed_gate_T_sc
         w_shared_down:                 bfloat16 [hidden_size, intermediate_size]
-        w_routed_down_T:               float8_e4m3fn [num_local_experts, intermediate_size, hidden_size]
+        w_routed_down_T:               legacy: float8_e4m3fn [num_local_experts, intermediate_size, hidden_size];
+                                         native single-grouped: float8_e4m3fn [num_local_experts, hidden_size, intermediate_size]
         w_routed_down_T_sc:            uint8 [num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16]
         x_fp8_t_routed:                float8_e4m3fn [hidden_size, macrobatch_size]
         x_sc_t_routed:                 uint8 [hidden_size // 128, macrobatch_size // 128, 32, 16]
@@ -899,6 +1228,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         num_comm_sms:                  int
         macrobatch_size:               int
         minibatch_size:                int
+        routed_weights_are_native_columnwise:
+                                        bool; selects native TE/MCore single-grouped columnwise payloads
 
     Outputs:
         d_x_shared:          bfloat16 [num_local_tokens, hidden_size]
@@ -920,13 +1251,14 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         d_w_shared_down:     bfloat16 [hidden_size, intermediate_size]
         d_w_routed_down:     bfloat16 [num_local_experts, hidden_size, intermediate_size]
     """
+    _check_shared_mode(w_shared_gate, w_shared_up, w_shared_down)
     if x.ndim != 2:
         raise ValueError("x must have shape (num_local_tokens, hidden_size)")
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -939,6 +1271,9 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     if (type(macrobatch_size) is not int or macrobatch_size <= 0
             or macrobatch_size % minibatch_size != 0):
         raise ValueError("macrobatch_size must be a positive multiple of minibatch_size")
+    if type(routed_weights_are_native_columnwise) is not bool:
+        raise TypeError("routed_weights_are_native_columnwise must be a bool")
+
     for pointer_name, pointers in (
         ("d_y_buffer_ptrs", d_y_buffer_ptrs),
         ("d_x_routed_buffer_ptrs", d_x_routed_buffer_ptrs),
@@ -961,35 +1296,71 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     ):
         if len(pointers) != ep_size:
             raise ValueError(f"{pointer_name} length must match x_ptrs")
-    if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
+    if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
-    intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
+    combined_fc1_payload = w_routed_gate is w_routed_up
+    combined_fc1_scale_payload = w_routed_gate_sc is w_routed_up_sc
+    combined_fc1_transposed_payload = w_routed_gate_T is w_routed_up_T
+    combined_fc1_transposed_scale_payload = (
+        w_routed_gate_T_sc is w_routed_up_T_sc
+    )
+    if combined_fc1_payload != combined_fc1_scale_payload:
+        raise ValueError(
+            "combined rowwise FC1 data and scales must alias consistently"
+        )
+    if combined_fc1_transposed_payload != combined_fc1_transposed_scale_payload:
+        raise ValueError(
+            "combined columnwise FC1 data and scales must alias consistently"
+        )
+    if routed_weights_are_native_columnwise and not (
+        combined_fc1_payload and combined_fc1_scale_payload
+        and combined_fc1_transposed_payload and combined_fc1_transposed_scale_payload
+    ):
+        raise ValueError("native columnwise weights require combined FC1 aliases")
+
     mb_i_sc = (macrobatch_size // 128, intermediate_size // 128, 32, 16)
     i_mb_sc = (intermediate_size // 128, macrobatch_size // 128, 32, 16)
     h_mb_sc = (hidden_size // 128, macrobatch_size // 128, 32, 16)
     e_i_h_sc = (num_local_experts * intermediate_size // 128, hidden_size // 128, 32, 16)
-    e_h_i_sc = (num_local_experts * hidden_size // 128, intermediate_size // 128, 32, 16)
+    routed_fc1_shape = (
+        num_local_experts, (2 if combined_fc1_payload else 1) * intermediate_size, hidden_size
+    )
+    routed_fc1_sc_shape = (
+        num_local_experts * (2 if combined_fc1_payload else 1) * intermediate_size // 128,
+        hidden_size // 128, 32, 16,
+    )
+    routed_fc1_t_shape = (
+        routed_fc1_shape if routed_weights_are_native_columnwise else
+        (num_local_experts, hidden_size,
+         (2 if combined_fc1_transposed_payload else 1) * intermediate_size)
+    )
+    routed_fc1_t_sc_shape = (
+        num_local_experts * hidden_size // 128,
+        (2 if combined_fc1_transposed_payload else 1) * intermediate_size // 128, 32, 16,
+    )
     expected_shapes = (
         ("d_y_buffer", d_y_buffer, (num_local_tokens, hidden_size)),
         ("d_x_routed_buffer", d_x_routed_buffer, (num_local_tokens * topk, hidden_size)),
         ("router_weight_buffer", router_weight_buffer, (num_local_tokens, topk)),
         ("d_router_weight_buffer", d_router_weight_buffer, (num_local_tokens, topk)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate_T", w_routed_gate_T,
-         (num_local_experts, hidden_size, intermediate_size)),
-        ("w_routed_gate_T_sc", w_routed_gate_T_sc, e_h_i_sc),
+        ("w_routed_gate_T", w_routed_gate_T, routed_fc1_t_shape),
+        ("w_routed_gate_T_sc", w_routed_gate_T_sc, routed_fc1_t_sc_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up_T", w_routed_up_T, (num_local_experts, hidden_size, intermediate_size)),
-        ("w_routed_up_T_sc", w_routed_up_T_sc, e_h_i_sc),
+        ("w_routed_up_T", w_routed_up_T, routed_fc1_t_shape),
+        ("w_routed_up_T_sc", w_routed_up_T_sc, routed_fc1_t_sc_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
         ("w_routed_down_T", w_routed_down_T,
-         (num_local_experts, intermediate_size, hidden_size)),
+         ((num_local_experts, hidden_size, intermediate_size)
+          if routed_weights_are_native_columnwise else
+          (num_local_experts, intermediate_size, hidden_size))),
         ("w_routed_down_T_sc", w_routed_down_T_sc, e_i_h_sc),
         ("x_fp8_t_routed", x_fp8_t_routed, (hidden_size, macrobatch_size)),
         ("x_sc_t_routed", x_sc_t_routed, h_mb_sc),
@@ -1002,13 +1373,14 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         ("hidden_shared", hidden_shared, (num_local_tokens, intermediate_size)),
         ("hidden_fp8_t_routed", hidden_fp8_t_routed, (intermediate_size, macrobatch_size)),
         ("hidden_sc_t_routed", hidden_sc_t_routed, i_mb_sc),
-        ("w_routed_gate", w_routed_gate,
-         (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_gate_sc", w_routed_gate_sc, e_i_h_sc),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
-        ("w_routed_up_sc", w_routed_up_sc, e_i_h_sc),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
+        ("w_routed_gate_sc", w_routed_gate_sc, routed_fc1_sc_shape),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
+        ("w_routed_up_sc", w_routed_up_sc, routed_fc1_sc_shape),
     )
     for tensor_name, tensor, expected_shape in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(f"{tensor_name} must have shape {expected_shape}")
     for tensor_name, tensor in (
@@ -1045,6 +1417,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         ("num_tokens", num_tokens),
         ("tokens_per_expert", tokens_per_expert),
     ):
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tensor.device != x.device:
             raise ValueError(f"{tensor_name} must be on {x.device}")
     if schedule_peer_rank.ndim != 1 or schedule_peer_rank.numel() == 0:
@@ -1058,6 +1432,9 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         raise ValueError("num_tokens must have shape (1,)")
     if tuple(tokens_per_expert.shape) != (num_local_experts,):
         raise ValueError("tokens_per_expert must have shape (num_local_experts,)")
+
+    if shared_grad_output is not None:
+        _validate_shared_grad_output(shared_grad_output, d_y_buffer)
 
     return _C.dispatch_mlp_swiglu_combine_bwd_mxfp8(
         d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -1073,10 +1450,212 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         x, x_ptrs, w_routed_gate, w_routed_gate_sc, w_routed_up, w_routed_up_sc,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        routed_weights_are_native_columnwise,
+        shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
-@torch.library.custom_op(
+_PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
+_TRACING_DISPATCH_MODES = (
+    torch._C._TorchDispatchModeKey.FAKE,
+    torch._C._TorchDispatchModeKey.PROXY,
+    torch._C._TorchDispatchModeKey.FUNCTIONAL,
+)
+
+
+def _check_accumulation_operands(operands: Any) -> None:
+    """Rejects the calls that the accumulating backward wrappers below cannot run correctly.
+
+    The wrappers are not custom ops: they hand every operand to the C++ entry point, which reads raw data pointers.
+    make_fx, FakeTensorMode, FunctionalTensorMode, pre-dispatch tracing and torch.func transforms would neither record
+    nor transform that launch, and a tensor subclass would make the kernels read memory that is not its data (a
+    wrapper subclass reports a null data pointer). ``operands`` holds tensors, None, other arguments (lists hold
+    pointers), and tuples of them.
+    """
+    if (
+        any(torch._C._get_dispatch_mode(key) is not None for key in _TRACING_DISPATCH_MODES)
+        or torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
+        or torch._C._are_functorch_transforms_active()
+    ):
+        raise RuntimeError(
+            "the accumulating MoK backward (main_grads) has no custom op, so make_fx, FakeTensorMode, "
+            "FunctionalTensorMode, pre-dispatch tracing and torch.func transforms cannot trace it; "
+            "pass main_grads=None to get fresh weight gradients through the custom ops"
+        )
+    for operand in operands:
+        for value in operand if isinstance(operand, tuple) else (operand,):
+            if isinstance(value, torch.Tensor) and type(value) not in _PLAIN_TENSOR_TYPES:
+                raise TypeError(
+                    "the accumulating MoK backward (main_grads) has no custom op and launches its kernels on the "
+                    "operands' raw data pointers, so every tensor operand must be a plain torch.Tensor or "
+                    f"nn.Parameter, not {type(value).__name__}; pass main_grads=None to get fresh weight gradients "
+                    "through the custom ops"
+                )
+
+
+def _validate_main_grads(main_grads: tuple[torch.Tensor | None, ...], shared_present: bool) -> None:
+    if len(main_grads) != 6:
+        raise ValueError("main_grads must contain six tensors")
+    _check_shared_mode(*main_grads[::2])
+    if (main_grads[0] is not None) != shared_present:
+        raise ValueError("shared main-grad presence must match shared weights")
+    main_grad_dtype = main_grads[1].dtype
+    if main_grad_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("main_grads must have dtype float32 or bfloat16")
+    for name, main_grad in zip(
+        ("shared_gate", "routed_gate", "shared_up", "routed_up", "shared_down", "routed_down"),
+        main_grads,
+        strict=True,
+    ):
+        if main_grad is None and name.startswith("shared_") and not shared_present:
+            continue
+        if not main_grad.is_cuda:
+            raise TypeError(f"main_grad_{name} must be a CUDA tensor")
+        if main_grad.dtype != main_grad_dtype:
+            raise TypeError("all main_grads must have the same dtype")
+        if not main_grad.is_contiguous():
+            raise ValueError(f"main_grad_{name} must be contiguous")
+
+
+def _bwd_mxfp8_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor | None, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    scale_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+) -> tuple[torch.Tensor | None, ...]:
+    """Unchecked MXFP8 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+            *args, *main_grads, *weight_storage_tables, *scale_storage_tables,
+            *main_grad_storage_tables, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    return outputs[:12]
+
+
+def _bwd_bf16_accum_entrypoint(
+    *args: Any,
+    main_grads: tuple[torch.Tensor | None, ...],
+    weight_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    main_grad_storage_tables: tuple[torch.Tensor, ...] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+) -> tuple[torch.Tensor | None, ...]:
+    """Unchecked BF16 accumulation launch shared by the validated wrapper and eager fast path."""
+    if weight_storage_tables is None:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    else:
+        outputs = _C.dispatch_mlp_swiglu_combine_bwd_bf16(
+            *args, *main_grads, *weight_storage_tables, *main_grad_storage_tables,
+            shared_grad_output=shared_grad_output,
+            situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+        )
+    return outputs[:9]
+
+
+def dispatch_mlp_swiglu_combine_bwd_mxfp8_accum(
+    *args: Any,
+    main_grads: tuple[
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+    ],
+    weight_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None = None,
+    scale_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None = None,
+    main_grad_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+) -> tuple[torch.Tensor | None, ...]:
+    """Runs MXFP8 backward and accumulates wgrad directly into FP32 or BF16 buffers.
+
+    ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_mxfp8`.
+    ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
+    up, shared down, routed down. The returned tuple contains only the twelve
+    non-weight-gradient outputs; the six weight gradients are side effects.
+    Without shared experts, shared intermediate outputs and main-grad slots are None.
+
+    This eager wrapper is separate from the original custom op because custom
+    op outputs may not alias mutated inputs. Not being a custom op, it accepts
+    only plain tensors and cannot be traced (see _check_accumulation_operands).
+    ``shared_grad_output`` follows the fresh op's BF16 shared-only contract.
+    """
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, scale_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
+    _validate_main_grads(main_grads, args[8] is not None)
+    split_tables = weight_storage_tables is not None
+    if (
+        split_tables != (scale_storage_tables is not None)
+        or split_tables != (main_grad_storage_tables is not None)
+    ):
+        raise ValueError(
+            "split weight, scale, and main-grad storage tables must be provided together"
+        )
+    if shared_grad_output is not None:
+        _validate_shared_grad_output(shared_grad_output, args[0])
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 5
+        or len(scale_storage_tables) != 5
+        or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError(
+            "MXFP8 split storage tables must contain five weight, five scale, and three main-grad tables"
+        )
+    return _bwd_mxfp8_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, scale_storage_tables=scale_storage_tables,
+        main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+    )
+
+
+def _validate_shared_grad_output(shared_grad_output: torch.Tensor, d_y_buffer: torch.Tensor) -> None:
+    if (
+        not shared_grad_output.is_cuda
+        or shared_grad_output.dtype != torch.bfloat16
+        or not shared_grad_output.is_contiguous()
+        or shared_grad_output.device != d_y_buffer.device
+        or shared_grad_output.shape != d_y_buffer.shape
+    ):
+        raise ValueError("shared_grad_output must be contiguous CUDA BF16 with d_y_buffer's shape/device")
+
+
+@_optional_output_op(
     "mok::dispatch_mlp_swiglu_combine_bwd_bf16",
     mutates_args=("d_x_routed_buffer", "d_router_weight_buffer", "x_routed", "gate_routed", "up_routed", "hidden_routed"),
 )
@@ -1089,18 +1668,18 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     router_weight_buffer_ptrs: list[int],
     d_router_weight_buffer: torch.Tensor,
     d_router_weight_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down: torch.Tensor,
     x_routed: torch.Tensor,
-    gate_shared: torch.Tensor,
+    gate_shared: torch.Tensor | None,
     gate_routed: torch.Tensor,
-    up_shared: torch.Tensor,
+    up_shared: torch.Tensor | None,
     up_routed: torch.Tensor,
-    hidden_shared: torch.Tensor,
+    hidden_shared: torch.Tensor | None,
     hidden_routed: torch.Tensor,
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -1113,24 +1692,31 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
 ]:
     """Runs the fused BF16 MoE backward pass.
+
+    ``shared_grad_output`` optionally supplies BF16 [T, H] upstream gradients
+    for the shared MLP only. Routed dispatch and router-weight backward keep
+    using the original ``d_y_buffer``. None preserves the ungated path.
 
     Inputs:
         d_y_buffer:                    bfloat16 [num_local_tokens, hidden_size]
@@ -1183,21 +1769,28 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         d_w_shared_down: bfloat16 [hidden_size, intermediate_size]
         d_w_routed_down: bfloat16 [num_local_experts, hidden_size, intermediate_size]
     """
+    _check_shared_mode(w_shared_gate, w_shared_up, w_shared_down)
     if x.ndim != 2:
         raise ValueError("x must have shape (num_local_tokens, hidden_size)")
     num_local_tokens, hidden_size = x.shape
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
-    if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+    if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
-    intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+    if intermediate_size < 256 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
+    combined_fc1_payload = w_routed_gate is w_routed_up
+    routed_fc1_shape = (
+        num_local_experts,
+        (2 if combined_fc1_payload else 1) * intermediate_size,
+        hidden_size,
+    )
     if type(topk) is not int or not 0 < topk <= 255:
         raise ValueError("topk must be an integer in [1, 255]")
     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
@@ -1237,9 +1830,9 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         ("router_weight_buffer", router_weight_buffer, (num_local_tokens, topk)),
         ("d_router_weight_buffer", d_router_weight_buffer, (num_local_tokens, topk)),
         ("w_shared_gate", w_shared_gate, (intermediate_size, hidden_size)),
-        ("w_routed_gate", w_routed_gate, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_gate", w_routed_gate, routed_fc1_shape),
         ("w_shared_up", w_shared_up, (intermediate_size, hidden_size)),
-        ("w_routed_up", w_routed_up, (num_local_experts, intermediate_size, hidden_size)),
+        ("w_routed_up", w_routed_up, routed_fc1_shape),
         ("w_shared_down", w_shared_down, (hidden_size, intermediate_size)),
         ("w_routed_down", w_routed_down, (num_local_experts, hidden_size, intermediate_size)),
         ("x_routed", x_routed, (macrobatch_size, hidden_size)),
@@ -1254,13 +1847,20 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         ("tokens_per_expert", tokens_per_expert, (num_local_experts,)),
     )
     for tensor_name, tensor, expected_shape in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(f"{tensor_name} must have shape {expected_shape}")
     for tensor_name, tensor, _ in expected_shapes:
+        if tensor is None and "shared" in tensor_name:
+            continue
         if tensor.device != x.device:
             raise ValueError(f"{tensor_name} must be on {x.device}")
     if schedule_peer_rank.device != x.device:
         raise ValueError(f"schedule_peer_rank must be on {x.device}")
+
+    if shared_grad_output is not None:
+        _validate_shared_grad_output(shared_grad_output, d_y_buffer)
 
     return _C.dispatch_mlp_swiglu_combine_bwd_bf16(
         d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
@@ -1273,14 +1873,79 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         x, x_ptrs,
         schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert,
         topk, swiglu_limit, num_comm_sms, macrobatch_size, minibatch_size,
+        shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
+    )
+
+
+def dispatch_mlp_swiglu_combine_bwd_bf16_accum(
+    *args: Any,
+    main_grads: tuple[
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+    ],
+    weight_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None = None,
+    main_grad_storage_tables: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None = None,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+) -> tuple[torch.Tensor | None, ...]:
+    """Runs BF16 backward and accumulates wgrad directly into FP32 or BF16 buffers.
+
+    ``args`` are the inputs of :func:`dispatch_mlp_swiglu_combine_bwd_bf16`.
+    ``main_grads`` are ordered as shared gate, routed gate, shared up, routed
+    up, shared down, routed down. The returned tuple contains only the nine
+    non-weight-gradient outputs; the six weight gradients are side effects.
+    Without shared experts, shared intermediate outputs and main-grad slots are None.
+
+    This eager wrapper is intentionally separate from the original custom op:
+    PyTorch custom-op outputs may not alias mutated inputs, while the C++ entry
+    point returns the supplied buffers for convenient internal bookkeeping. Not
+    being a custom op, it accepts only plain tensors and cannot be traced (see
+    _check_accumulation_operands).
+    ``shared_grad_output`` follows the fresh op's shared-only gradient contract.
+    """
+    _check_accumulation_operands(
+        (*args, main_grads, weight_storage_tables, main_grad_storage_tables, shared_grad_output)
+    )
+    _validate_main_grads(main_grads, args[8] is not None)
+    if (weight_storage_tables is None) != (main_grad_storage_tables is None):
+        raise ValueError(
+            "split weight and main-grad storage tables must be provided together"
+        )
+    if shared_grad_output is not None:
+        _validate_shared_grad_output(shared_grad_output, args[0])
+    if weight_storage_tables is not None and (
+        len(weight_storage_tables) != 3 or len(main_grad_storage_tables) != 3
+    ):
+        raise ValueError("BF16 split storage tables must contain three weight and three main-grad tables")
+    return _bwd_bf16_accum_entrypoint(
+        *args, main_grads=main_grads,
+        weight_storage_tables=weight_storage_tables, main_grad_storage_tables=main_grad_storage_tables,
+        shared_grad_output=shared_grad_output,
+        situ_beta1=situ_beta1, situ_beta2=situ_beta2,
     )
 
 
 @torch.library.custom_op("mok::fwd_epilogue", mutates_args=())
 def fwd_epilogue(
-    y_shared: torch.Tensor,
+    y_shared: torch.Tensor | None,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    top_experts: torch.Tensor,
+    shared_output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Combines shared and router-weighted routed expert outputs.
 
@@ -1288,19 +1953,25 @@ def fwd_epilogue(
         y_shared:       bfloat16 [num_local_tokens, hidden_size]
         combine_buffer: bfloat16 [num_local_tokens * topk, hidden_size]
         topk_weights:   float32 [num_local_tokens, topk]
+        top_experts:    int32 [num_local_tokens, topk], with -1 for invalid routes
+        shared_output_gate: optional contiguous bfloat16 [num_local_tokens, 1].
+                            Scales shared output in FP32 before routed accumulation.
 
     Outputs:
         output: bfloat16 [num_local_tokens, hidden_size]
     """
-    if y_shared.ndim != 2:
+    if y_shared is not None and y_shared.ndim != 2:
         raise ValueError("y_shared must have shape (num_local_tokens, hidden_size)")
-    num_local_tokens, hidden_size = y_shared.shape
+    num_local_tokens, hidden_size = topk_weights.shape[0], combine_buffer.shape[1]
+    if y_shared is not None and tuple(y_shared.shape) != (num_local_tokens, hidden_size):
+        raise ValueError("y_shared shape must match routed output")
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
-    if (topk_weights.device != y_shared.device
-            or combine_buffer.device != y_shared.device):
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+    if (topk_weights.device != combine_buffer.device
+            or top_experts.device != combine_buffer.device
+            or (y_shared is not None and y_shared.device != combine_buffer.device)):
         raise ValueError("all tensors must be on the same CUDA device")
     if topk_weights.ndim != 2 or topk_weights.shape[0] != num_local_tokens:
         raise ValueError("topk_weights must have shape (num_local_tokens, topk)")
@@ -1309,33 +1980,57 @@ def fwd_epilogue(
         raise ValueError("topk must be in [1, 255]")
     if tuple(combine_buffer.shape) != (num_local_tokens * topk, hidden_size):
         raise ValueError("combine_buffer must have shape (num_local_tokens * topk, hidden_size)")
+    if (top_experts.dtype != torch.int32 or not top_experts.is_contiguous()
+            or tuple(top_experts.shape) != (num_local_tokens, topk)):
+        raise ValueError("top_experts must be contiguous int32 (num_local_tokens, topk)")
 
-    return _C.fwd_epilogue(y_shared, combine_buffer, topk_weights)
+
+    if shared_output_gate is None:
+        return _C.fwd_epilogue(y_shared, combine_buffer, topk_weights, top_experts)
+    if y_shared is None:
+        raise ValueError("shared output gate requires shared output")
+    if (
+        not shared_output_gate.is_cuda
+        or shared_output_gate.dtype != torch.bfloat16
+        or not shared_output_gate.is_contiguous()
+        or shared_output_gate.device != y_shared.device
+        or tuple(shared_output_gate.shape) != (num_local_tokens, 1)
+    ):
+        raise ValueError("shared_output_gate must be contiguous CUDA BF16 [T, 1] on y_shared's device")
+    return _C.fwd_epilogue(
+        y_shared, combine_buffer, topk_weights, top_experts,
+        shared_output_gate=shared_output_gate,
+    )
 
 
 @torch.library.custom_op("mok::bwd_epilogue", mutates_args=())
 def bwd_epilogue(
-    d_x_shared: torch.Tensor,
+    d_x_shared: torch.Tensor | None,
     d_x_routed_buffer: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:
     """Combines shared and routed input gradients.
 
     Inputs:
         d_x_shared:        bfloat16 [num_local_tokens, hidden_size]
         d_x_routed_buffer: bfloat16 [num_local_tokens * topk, hidden_size]
+        top_experts:       int32 [num_local_tokens, topk], with -1 for invalid routes
 
     Outputs:
         d_x: bfloat16 [num_local_tokens, hidden_size]
     """
-    if d_x_shared.ndim != 2:
+    if d_x_shared is not None and d_x_shared.ndim != 2:
         raise ValueError("d_x_shared must have shape (num_local_tokens, hidden_size)")
-    num_local_tokens, hidden_size = d_x_shared.shape
+    num_local_tokens, hidden_size = top_experts.shape[0], d_x_routed_buffer.shape[1]
+    if d_x_shared is not None and tuple(d_x_shared.shape) != (num_local_tokens, hidden_size):
+        raise ValueError("d_x_shared shape must match routed input gradient")
     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
-    if hidden_size <= 0 or hidden_size % 256 != 0:
-        raise ValueError("hidden_size must be positive and divisible by 256")
-    if d_x_routed_buffer.device != d_x_shared.device:
-        raise ValueError("d_x_routed_buffer must be on the same CUDA device")
+    if hidden_size < 256 or hidden_size % 128 != 0:
+        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+    if (top_experts.device != d_x_routed_buffer.device
+            or (d_x_shared is not None and d_x_shared.device != d_x_routed_buffer.device)):
+        raise ValueError("all tensors must be on the same CUDA device")
     if d_x_routed_buffer.ndim != 2:
         raise ValueError("d_x_routed_buffer must have shape "
                          "(num_local_tokens * topk, hidden_size)")
@@ -1345,5 +2040,47 @@ def bwd_epilogue(
             or d_x_routed_buffer.shape[0] > num_local_tokens * 255):
         raise ValueError("d_x_routed_buffer must have shape "
                          "(num_local_tokens * topk, hidden_size)")
+    topk = d_x_routed_buffer.shape[0] // num_local_tokens
+    if (top_experts.device != d_x_routed_buffer.device
+            or top_experts.dtype != torch.int32
+            or not top_experts.is_contiguous()
+            or tuple(top_experts.shape) != (num_local_tokens, topk)):
+        raise ValueError("top_experts must be contiguous int32 (num_local_tokens, topk)")
 
-    return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer)
+
+    return _C.bwd_epilogue(d_x_shared, d_x_routed_buffer, top_experts)
+
+
+@torch.library.custom_op("mok::stage_into_buffers", mutates_args=("buffers",))
+def stage_into_buffers(sources: list[torch.Tensor], buffers: list[torch.Tensor]) -> None:
+    """Copies each source in full into its workspace buffer, which peers read through raw data pointers.
+
+    The functional layer stages its inputs through this op whenever it does not launch its kernels directly, with
+    one call per direction: x and router weights in forward, grad_output (first), x and router weights in backward,
+    and x in recompute_forward_context. The op declares its writes, so a compiled graph writes the buffers in place
+    where the op runs, ahead of the barrier after which peers read them in program order (the functional module
+    comment lists when Inductor reorders them). Tensor.copy_ into a workspace buffer would instead become an input
+    mutation that AOTAutograd applies at the end of the compiled graph, after the kernels that read the buffer.
+    Because the backward call takes the incoming gradient, AOTAutograd's partitioner keeps all of its copies in the
+    backward graph of a compiled autograd.Function; a copy that does not depend on the gradient could otherwise move
+    into the forward graph. The copies have no alignment requirement.
+
+    Inputs:
+        sources: tensors, each with its buffer's shape, dtype and device
+        buffers: contiguous tensors, updated in place
+
+    Outputs:
+        None
+    """
+    if len(sources) != len(buffers):
+        raise ValueError("sources and buffers must have the same length")
+    for source, buffer in zip(sources, buffers):
+        if (
+            source.shape != buffer.shape
+            or source.dtype != buffer.dtype
+            or source.device != buffer.device
+            or not buffer.is_contiguous()
+        ):
+            raise ValueError("each source must have the shape, dtype and device of its contiguous buffer")
+    for source, buffer in zip(sources, buffers):
+        buffer.copy_(source)
