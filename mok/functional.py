@@ -540,7 +540,9 @@ def create_workspace(
     )
     barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
 
-    dist.barrier(group=group, async_op=True, device_ids=[device_index]).block_current_stream()
+    # A blocking barrier: Work.block_current_stream() on an async barrier can hang (seen with PyTorch 2.15,
+    # NGC 26.11, on VR NVL72), and this one-time setup has no need to stay asynchronous.
+    dist.barrier(group=group, device_ids=[device_index])
 
     workspace = MoKWorkspace(
         group_name=group_name, ep_rank=ep_rank, ep_size=ep_size, device=device,
