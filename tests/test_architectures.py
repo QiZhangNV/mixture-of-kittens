@@ -77,7 +77,7 @@ def test_architecture_work_stealing_forward_backward(context, precision) -> None
     """Launch more working CTAs than the GPU has SMs, as production shapes do.
 
     The cases above start every working CTA at once, so no CTA ever takes over a queued task through
-    cluster launch control. Here most tasks reach a CTA that way, which is the path a hang would block.
+    cluster launch control. Here most tasks reach a CTA that way.
     """
     _, _, device = context
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count

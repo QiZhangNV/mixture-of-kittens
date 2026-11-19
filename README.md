@@ -94,15 +94,6 @@ The backport covers the BF16/MXFP8 instructions used by MoK, including Rubin's
 32-bit multicast masks and shared-memory address encoding. It preserves the
 existing SM100/SM103 paths and the pinned ThunderKittens revision.
 
-A third patch carries two upstream synchronization fixes unchanged, for every
-target: [72f14517](https://github.com/HazyResearch/ThunderKittens/commit/72f145171e4edbd07915a26991d6df62ad566ca4)
-fences the cluster-launch-control handle between the asynchronous and generic
-proxies, and [b62aa152](https://github.com/HazyResearch/ThunderKittens/commit/b62aa1528b62918ade5910f8677f1576a0b8af1a)
-stops NVCC from moving memory accesses across `mbarrier` waits. The megakernels
-depend on both whenever a running CTA takes over a queued task, which the small
-architecture cases never do; `tests/test_architectures.py` therefore includes a
-case with more working CTAs than SMs.
-
 ### Development
 
 For development, install MoK in editable mode once, then use `make` for fast rebuilds:
