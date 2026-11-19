@@ -1,0 +1,147 @@
+diff --git a/include/ops/group/util/sync.cuh b/include/ops/group/util/sync.cuh
+index 6bfc5365..74f342a0 100644
+--- a/include/ops/group/util/sync.cuh
++++ b/include/ops/group/util/sync.cuh
+@@ -125,6 +125,7 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         :: "r"(mbar_ptr),
+         "r"(kPhaseBit)
++        : "memory"
+     );
+ #else
+     asm volatile (
+@@ -139,6 +140,7 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         :: "r"(mbar_ptr),
+         "r"(kPhaseBit)
++        : "memory"
+     );
+ #endif
+ }
+@@ -182,6 +184,7 @@ __device__ static inline int test_wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         : "=r"(result)
+         : "r"(mbar_ptr), "r"(kPhaseBit)
++        : "memory"
+     );
+     return result;
+ }
+diff --git a/include/ops/group/util/util.cuh b/include/ops/group/util/util.cuh
+index 58112f22..87733373 100644
+--- a/include/ops/group/util/util.cuh
++++ b/include/ops/group/util/util.cuh
+@@ -20,12 +20,8 @@ struct clc {
+  * @param sem The semaphore that the caller will wait on.
+  */
+ __device__ static inline void schedule(kittens::clc::handle &h, kittens::semaphore &sem) {
+-    if (laneid() == 0) {
+-        asm volatile("{clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [%0], [%1];}"
+-            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&h.internal_value))), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&sem)))
+-            : "memory"
+-        );
+-    }
++    if (laneid() == 0)
++        kittens::clc::schedule(h, sem);
+ }
+ 
+ /**
+@@ -33,24 +29,7 @@ __device__ static inline void schedule(kittens::clc::handle &h, kittens::semapho
+  * @param h The CLC handle.
+  */
+ __device__ static inline kittens::clc::result query(kittens::clc::handle &h) {
+-    kittens::clc::result r;
+-    asm volatile(
+-        "{\n"
+-        ".reg .pred SUCCESS;\n"
+-        ".reg .b128 CLC_HANDLE;\n"
+-        "ld.shared.b128 CLC_HANDLE, [%4];\n"
+-        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 SUCCESS, CLC_HANDLE;\n"
+-        "selp.u32 %0, 1, 0, SUCCESS;\n"
+-        "@!SUCCESS bra.uni DONE;\n"
+-        "clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%1, %2, %3, _}, CLC_HANDLE;\n"
+-        "fence.proxy.async.shared::cta;\n"
+-        "DONE:\n"
+-        "}"
+-        : "=r"(r.success), "=r"(r.x), "=r"(r.y), "=r"(r.z)
+-        : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&h.internal_value)))
+-        : "memory"
+-    );
+-    return r;
++    return kittens::clc::query(h);
+ }
+ 
+ };
+diff --git a/include/ops/thread/util/sync.cuh b/include/ops/thread/util/sync.cuh
+index ddb26276..9b600cad 100644
+--- a/include/ops/thread/util/sync.cuh
++++ b/include/ops/thread/util/sync.cuh
+@@ -119,6 +119,7 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         :: "r"(mbar_ptr),
+         "r"(kPhaseBit)
++        : "memory"
+     );
+ #else
+     asm volatile (
+@@ -133,6 +134,7 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         :: "r"(mbar_ptr),
+         "r"(kPhaseBit)
++        : "memory"
+     );
+ #endif
+ }
+@@ -181,6 +183,7 @@ __device__ static inline void careful_wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         :: "r"(mbar_ptr),
+         "r"(kPhaseBit)
++        : "memory"
+     );
+ #else
+     asm volatile (
+@@ -195,6 +198,7 @@ __device__ static inline void careful_wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         :: "r"(mbar_ptr),
+         "r"(kPhaseBit)
++        : "memory"
+     );
+ #endif
+ }
+@@ -217,6 +221,7 @@ __device__ static inline int test_wait(semaphore& sem, int kPhaseBit) {
+         "}\n"
+         : "=r"(result)
+         : "r"(mbar_ptr), "r"(kPhaseBit)
++        : "memory"
+     );
+     return result;
+ }
+diff --git a/include/ops/thread/util/util.cuh b/include/ops/thread/util/util.cuh
+index fa7e2f3c..e698cb93 100644
+--- a/include/ops/thread/util/util.cuh
++++ b/include/ops/thread/util/util.cuh
+@@ -255,6 +255,7 @@ struct result {
+  * @param sem The semaphore that the caller will wait on.
+  */
+ __device__ static inline void schedule(handle &h, semaphore &sem) {
++    asm volatile("fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
+     asm volatile("{clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [%0], [%1];}"
+         :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&h.internal_value))), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&sem)))
+         : "memory"
+@@ -266,7 +267,7 @@ __device__ static inline void schedule(handle &h, semaphore &sem) {
+  * @param h The CLC handle.
+  */
+ __device__ static inline result query(handle &h) {
+-    result r;
++    result r{};
+     asm volatile(
+         "{\n"
+         ".reg .pred SUCCESS;\n"
+@@ -276,7 +277,7 @@ __device__ static inline result query(handle &h) {
+         "selp.u32 %0, 1, 0, SUCCESS;\n"
+         "@!SUCCESS bra.uni DONE;\n"
+         "clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%1, %2, %3, _}, CLC_HANDLE;\n"
+-        "fence.proxy.async.shared::cta;\n"
++        "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;\n"
+         "DONE:\n"
+         "}"
+         : "=r"(r.success), "=r"(r.x), "=r"(r.y), "=r"(r.z)
