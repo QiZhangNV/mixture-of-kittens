@@ -18,11 +18,15 @@ See our [blog post](https://cursor.com/blog/mixture-of-kittens) for the methodol
 
 ### Requirements
 
-- NVIDIA Blackwell SM100 or SM103 GPUs (e.g., GB200 NVL72 or GB300 NVL72)
+- NVIDIA Blackwell SM100/SM103 or Rubin SM107 GPUs
 - Python 3.12 or later
 - PyTorch 2.10 or later
 - Triton (`mok.functional` imports it for the shared output gate backward)
 - CUDA toolkit 13.0 or later
+
+SM107 and `ALL` builds require a CUDA toolkit with `sm_107a` support (CUDA
+13.4 is the target toolchain). The installed PyTorch CUDA version must still
+match the toolkit as described below.
 
 ### PyTorch and CUDA
 
@@ -54,14 +58,18 @@ To build for SM100 instead, set the `MOK_ARCH` environment variable:
 MOK_ARCH=SM100 pip install . --no-build-isolation
 ```
 
-To build one wheel for both SM100 and SM103, set `MOK_ARCH=ALL`:
+To build for Rubin alone, set `MOK_ARCH=SM107`. To build one wheel for SM100,
+SM103, and SM107, set `MOK_ARCH=ALL`:
 
 ```bash
 MOK_ARCH=ALL pip wheel . --no-build-isolation --no-deps
 ```
 
-This includes `sm_100a` and `sm_103a` kernels using the BF16/MXFP8 features shared
-by both targets. For direct Makefile builds, use `make ARCH=ALL`.
+This includes separate `sm_100a`, `sm_103a`, and `sm_107a` kernels. ThunderKittens
+selects the corresponding multicast and MMA instructions for each device
+compilation. For direct Makefile builds, use `make -B ARCH=ALL`. Rebuild when
+changing architectures; workspace creation checks the extension's compiled
+targets before launching kernels.
 
 To verify the installation:
 
@@ -69,8 +77,8 @@ To verify the installation:
 python -c "import mok; print(mok.__version__)"
 ```
 
-The `qizhang/mok-fused-grad-accum` integration branch carries one
-ThunderKittens change as a repository-local patch so that all referenced
+The integration branch carries ThunderKittens changes as repository-local
+patches so that all referenced
 submodule commits remain fetchable from their upstream repositories. Prepare
 the submodule before building this branch:
 
@@ -80,7 +88,11 @@ make -B ARCH=SM103
 ```
 
 The preparation script is idempotent. It enables the native MN-major MXFP8 B
-operand consumed by MCore single-grouped parameters.
+operand consumed by MCore single-grouped parameters, then applies a focused
+SM107 backport from [ThunderKittens commit f6e16dcc](https://github.com/HazyResearch/ThunderKittens/commit/f6e16dcc7faeae7b55ccba95fae43590dd61f084).
+The backport covers the BF16/MXFP8 instructions used by MoK, including Rubin's
+32-bit multicast masks and shared-memory address encoding. It preserves the
+existing SM100/SM103 paths and the pinned ThunderKittens revision.
 
 ### Development
 
@@ -104,6 +116,13 @@ Launch multi-GPU unit tests through `torchrun` and `pytest`:
 ```bash
 torchrun --standalone --nproc-per-node=<num-gpus> -m pytest -s <test-path>
 ```
+
+For architecture validation, run `tests/test_architectures.py` on each target
+GPU using the same `ALL` wheel. This checks the runtime guard and compares BF16
+and MXFP8 forward/backward results with the PyTorch reference. Also run
+`tests/test_eager_dispatch.py::test_eager_dispatch_matches_custom_ops` for the
+native columnwise MXFP8 and accumulated-gradient paths used by MCore. Passing
+the build tests alone does not validate CUDA compilation or GPU correctness.
 
 ## Getting Started
 
