@@ -1,0 +1,558 @@
+Backport the SM107 BF16/MXFP8 support needed by MoK from ThunderKittens
+f6e16dcc7faeae7b55ccba95fae43590dd61f084. Apply after the MN-major patch.
+Keep existing SM100/SM103 behavior and avoid the unrelated NVFP4,
+collector, extended tensor-memory, and memory-semantics changes.
+
+diff --git a/include/common/base_types.cuh b/include/common/base_types.cuh
+--- a/include/common/base_types.cuh
++++ b/include/common/base_types.cuh
+@@ -28,6 +28,18 @@
+  * @brief 8-bit unsigned integer type.
+  */
+ using uint8 = unsigned char;
++
++/**
++ * @brief CTA-rank mask type used by cluster multicast operations.
++ *
++ * SM107 adds 32-bit multicast-mask instruction forms. Earlier architectures
++ * retain the original 16-bit API and operand width.
++ */
++#ifdef KITTENS_SM107
++using cluster_mask_t = uint32_t;
++#else
++using cluster_mask_t = uint16_t;
++#endif
+ 
+ /**
+  * @brief Packed word of two bfloat16 floating-point values.
+diff --git a/include/common/util.cuh b/include/common/util.cuh
+--- a/include/common/util.cuh
++++ b/include/common/util.cuh
+@@ -4,6 +4,17 @@
+  */
+ 
+ #pragma once
++
++// SM107 multicast instructions require the explicit ::32b suffix and a 32-bit register operand.
++// Earlier architectures use the implicit 16-bit form and a half-register operand. Keep the
++// instruction suffix and inline-assembly operand constraint paired through these macros.
++#ifdef KITTENS_SM107
++#define KITTENS_MCAST_SUFFIX "::32b"
++#define KITTENS_MCAST_OPERAND(mask) "r"(mask)
++#else
++#define KITTENS_MCAST_SUFFIX ""
++#define KITTENS_MCAST_OPERAND(mask) "h"(mask)
++#endif
+ 
+ /**
+  * @namespace kittens
+diff --git a/include/kittens.cuh b/include/kittens.cuh
+--- a/include/kittens.cuh
++++ b/include/kittens.cuh
+@@ -16,13 +16,13 @@
+ #define KITTENS_SM100
+ #endif
+ 
+-// The user must define exactly one of KITTENS_SM80, KITTENS_SM90, KITTENS_SM100, KITTENS_SM103, KITTENS_SM120
+-#if defined(KITTENS_SM80) + defined(KITTENS_SM90) + defined(KITTENS_SM100) + defined(KITTENS_SM103) + defined(KITTENS_SM120) != 1
+-#error "Define exactly one of: KITTENS_SM80, KITTENS_SM90, KITTENS_SM100, KITTENS_SM103, KITTENS_SM120"
++// The user must define exactly one of KITTENS_SM80, KITTENS_SM90, KITTENS_SM100, KITTENS_SM103, KITTENS_SM107, KITTENS_SM120
++#if defined(KITTENS_SM80) + defined(KITTENS_SM90) + defined(KITTENS_SM100) + defined(KITTENS_SM103) + defined(KITTENS_SM107) + defined(KITTENS_SM120) != 1
++#error "Define exactly one of: KITTENS_SM80, KITTENS_SM90, KITTENS_SM100, KITTENS_SM103, KITTENS_SM107, KITTENS_SM120"
+ #endif
+ 
+ // Convert to family
+-#if defined(KITTENS_SM100) || defined(KITTENS_SM103)
++#if defined(KITTENS_SM100) || defined(KITTENS_SM103) || defined(KITTENS_SM107)
+ #define KITTENS_SM10X
+ #endif
+ 
+diff --git a/include/ops/group/memory/tile/tma_cluster.cuh b/include/ops/group/memory/tile/tma_cluster.cuh
+--- a/include/ops/group/memory/tile/tma_cluster.cuh
++++ b/include/ops/group/memory/tile/tma_cluster.cuh
+@@ -5,26 +5,26 @@
+ 
+ #ifdef KITTENS_SM10X
+ template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) {
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) {
+     if(laneid() == 0) {
+         ::kittens::tma::cluster::load_async<axis, policy, ST, GL, COORD>(dst, src, idx, bar, cluster_mask, dst_mbar_cta);
+     }
+ }
+ template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) {
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) {
+     if(laneid() == 0) {
+         ::kittens::tma::cluster::load_async<dim::ROW, cache_policy::NORMAL, ST, GL, COORD>(dst, src, idx, bar, cluster_mask, dst_mbar_cta);
+     }
+ }
+ #else
+ template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask) {
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask) {
+     if(laneid() == 0) {
+         ::kittens::tma::cluster::load_async<axis, policy, ST, GL, COORD>(dst, src, idx, bar, cluster_mask);
+     }
+ }
+ template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask) {
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask) {
+     if(laneid() == 0) {
+         ::kittens::tma::cluster::load_async<dim::ROW, cache_policy::NORMAL, ST, GL, COORD>(dst, src, idx, bar, cluster_mask);
+     }
+diff --git a/include/ops/group/memory/vec/tma_cluster.cuh b/include/ops/group/memory/vec/tma_cluster.cuh
+--- a/include/ops/group/memory/vec/tma_cluster.cuh
++++ b/include/ops/group/memory/vec/tma_cluster.cuh
+@@ -16,7 +16,7 @@
+  * @param[in] cluster_mask The mask of the clusters to broadcast to.
+  */
+  template<cache_policy policy, ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD=coord<SV>>
+- __device__ static inline void load_async(SV &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) {
++ __device__ static inline void load_async(SV &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) {
+      coord<> unit_coord = idx.template unit_coord<-1, 3>();
+      uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src.template get_tma<SV, -1>());
+      uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
+diff --git a/include/ops/group/util/tma_cluster.cuh b/include/ops/group/util/tma_cluster.cuh
+--- a/include/ops/group/util/tma_cluster.cuh
++++ b/include/ops/group/util/tma_cluster.cuh
+@@ -107,12 +107,12 @@
+ 
+ /* ------- Non-tensor TMA transfers ------- */
+ 
+-__device__ static inline void load_async(void *dst, void *src, uint32_t size_bytes, semaphore& bar, uint16_t cta_mask) {
++__device__ static inline void load_async(void *dst, void *src, uint32_t size_bytes, semaphore& bar, cluster_mask_t cta_mask) {
+     if(laneid() == 0) {
+         ::kittens::tma::cluster::load_async(dst, src, size_bytes, bar, cta_mask);
+     }
+ }
+ template<typename T>
+-__device__ static inline void load_async(T &dst, T &src, uint32_t size_bytes, semaphore& bar, uint16_t cta_mask) {
++__device__ static inline void load_async(T &dst, T &src, uint32_t size_bytes, semaphore& bar, cluster_mask_t cta_mask) {
+     load_async(reinterpret_cast<void*>(&dst), reinterpret_cast<void*>(&src), size_bytes, bar, cta_mask);
+ }
+diff --git a/include/ops/thread/memory/tile/tma.cuh b/include/ops/thread/memory/tile/tma.cuh
+--- a/include/ops/thread/memory/tile/tma.cuh
++++ b/include/ops/thread/memory/tile/tma.cuh
+@@ -746,10 +746,10 @@
+  */
+ #ifdef KITTENS_SM10X
+ template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1)
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1)
+ #else
+ template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask)
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask)
+ #endif
+ {
+     uint64_t tma_ptr = reinterpret_cast<uint64_t>(src.template get_tma<ST, axis>());
+@@ -770,20 +770,20 @@
+             );
+             if constexpr (policy == cache_policy::NORMAL) {
+                 asm volatile (
+-                    "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster"
++                    "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster" KITTENS_MCAST_SUFFIX
+                     " [%0], [%1, {%3, %4, %5, %6, %7}], [%2], %8;"
+                     :
+                     : "r"(dst_ptr), "l"(tma_ptr), "r"(neighbor_mbar_ptr),
+-                    "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), "h"(cluster_mask)
++                    "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), KITTENS_MCAST_OPERAND(cluster_mask)
+                     : "memory"
+                 );
+             } else {
+                 asm volatile (
+-                    "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster.L2::cache_hint"
++                    "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster" KITTENS_MCAST_SUFFIX ".L2::cache_hint"
+                     " [%0], [%1, {%3, %4, %5, %6, %7}], [%2], %8, %9;"
+                     :
+                     : "r"(dst_ptr), "l"(tma_ptr), "r"(neighbor_mbar_ptr),
+-                    "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), "h"(cluster_mask), "l"(make_cache_policy<policy>())
++                    "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), KITTENS_MCAST_OPERAND(cluster_mask), "l"(make_cache_policy<policy>())
+                     : "memory"
+                 );
+             }
+@@ -791,20 +791,20 @@
+ #endif
+         if constexpr (policy == cache_policy::NORMAL) {
+                 asm volatile (
+-                    "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
++                    "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster" KITTENS_MCAST_SUFFIX
+                     " [%0], [%1, {%3, %4, %5, %6, %7}], [%2], %8;"
+                     :
+                     : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+-                    "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), "h"(cluster_mask)
++                    "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), KITTENS_MCAST_OPERAND(cluster_mask)
+                     : "memory"
+                 );
+         } else {
+             asm volatile (
+-                "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
++                "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster" KITTENS_MCAST_SUFFIX ".L2::cache_hint"
+                 " [%0], [%1, {%3, %4, %5, %6, %7}], [%2], %8, %9;"
+                 :
+                 : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+-                "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), "h"(cluster_mask), "l"(make_cache_policy<policy>())
++                "n"(0), "r"(tma_coords.x), "r"(tma_coords.y), "r"(tma_coords.z), "r"(tma_coords.w), KITTENS_MCAST_OPERAND(cluster_mask), "l"(make_cache_policy<policy>())
+                 : "memory"
+             );
+         }
+@@ -821,21 +821,21 @@
+             );
+             if constexpr (policy == cache_policy::NORMAL) {
+                 asm volatile (
+-                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster"
++                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster" KITTENS_MCAST_SUFFIX
+                     " [%0], [%1, {%3, %4, %5, %6}], [%2], %7;"
+                     :
+                     : "r"(dst_ptr), "l"(tma_ptr), "r"(neighbor_mbar_ptr),
+-                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), "h"(cluster_mask)
++                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), KITTENS_MCAST_OPERAND(cluster_mask)
+                     : "memory"
+                 );
+             }
+             else {
+                 asm volatile (
+-                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster.L2::cache_hint"
++                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster" KITTENS_MCAST_SUFFIX ".L2::cache_hint"
+                     " [%0], [%1, {%3, %4, %5, %6}], [%2], %7, %8;"
+                     :
+                     : "r"(dst_ptr), "l"(tma_ptr), "r"(neighbor_mbar_ptr),
+-                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), "h"(cluster_mask), "l"(make_cache_policy<policy>())
++                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), KITTENS_MCAST_OPERAND(cluster_mask), "l"(make_cache_policy<policy>())
+                     : "memory"
+                 );
+             }
+@@ -843,20 +843,20 @@
+ #endif
+         if constexpr (policy == cache_policy::NORMAL) {
+                 asm volatile (
+-                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
++                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster" KITTENS_MCAST_SUFFIX
+                     " [%0], [%1, {%3, %4, %5, %6}], [%2], %7;"
+                     :
+                     : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+-                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), "h"(cluster_mask)
++                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), KITTENS_MCAST_OPERAND(cluster_mask)
+                     : "memory"
+                 );
+         } else {
+                 asm volatile (
+-                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
++                    "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster" KITTENS_MCAST_SUFFIX ".L2::cache_hint"
+                     " [%0], [%1, {%3, %4, %5, %6}], [%2], %7, %8;"
+                     :
+                     : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+-                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), "h"(cluster_mask), "l"(make_cache_policy<policy>())
++                    "r"(unit_coord.c), "r"(unit_coord.r), "r"(unit_coord.d), "r"(unit_coord.b), KITTENS_MCAST_OPERAND(cluster_mask), "l"(make_cache_policy<policy>())
+                     : "memory"
+                 );
+         }
+@@ -864,12 +864,12 @@
+ }
+ #ifdef KITTENS_SM10X
+ template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) {
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) {
+     load_async<dim::ROW, cache_policy::NORMAL, ST, GL, COORD>(dst, src, idx, bar, cluster_mask, dst_mbar_cta);
+ }
+ #else
+ template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+-__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask) {
++__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask) {
+     load_async<dim::ROW, cache_policy::NORMAL, ST, GL, COORD>(dst, src, idx, bar, cluster_mask);
+ }
+ #endif
+diff --git a/include/ops/thread/memory/vec/tma.cuh b/include/ops/thread/memory/vec/tma.cuh
+--- a/include/ops/thread/memory/vec/tma.cuh
++++ b/include/ops/thread/memory/vec/tma.cuh
+@@ -42,12 +42,12 @@
+ }
+ #define __KITTENS_TMA_DEFINE_CLUSTER_SEMAPHORE_CACHE_VEC__(function_name) \
+ template<ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD=coord<SV>> \
+-__device__ static inline void function_name(SV &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) { \
++__device__ static inline void function_name(SV &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) { \
+     function_name<cache_policy::NORMAL>(dst, src, idx, bar, cluster_mask, dst_mbar_cta); \
+ }
+ #define __KITTENS_TMA_DEFINE_PGL_CLUSTER_SEMAPHORE_CACHE_VEC__(function_name) \
+ template<ducks::sv::all SV, ducks::pgl::all PGL, ducks::coord::vec COORD=coord<SV>> \
+-__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) { \
++__device__ static inline void function_name(SV &dst, const PGL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) { \
+     function_name<cache_policy::NORMAL>(dst, src, idx, bar, cluster_mask, dst_mbar_cta); \
+ }
+ 
+@@ -188,7 +188,7 @@
+ }
+ 
+ namespace cluster {
+-template<cache_policy policy> __device__ static inline void vec_load_async_tma_internal(uint64_t tma_ptr, uint32_t dst_i_ptr, uint32_t mbar_ptr, coord<> tma_coord, uint16_t cluster_mask, int dst_mbar_cta=-1) {
++template<cache_policy policy> __device__ static inline void vec_load_async_tma_internal(uint64_t tma_ptr, uint32_t dst_i_ptr, uint32_t mbar_ptr, coord<> tma_coord, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) {
+ #ifdef KITTENS_SM10X
+     if(dst_mbar_cta != -1) {
+         uint32_t neighbor_mbar_ptr;
+@@ -199,21 +199,21 @@
+         );
+         if constexpr (policy == cache_policy::NORMAL) {
+             asm volatile (
+-                "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster"
++                "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster" KITTENS_MCAST_SUFFIX
+                 " [%0], [%1, {%3, %4, %5, %6}], [%2], %7;"
+                 :
+                 : "r"(dst_i_ptr), "l"(tma_ptr), "r"(neighbor_mbar_ptr),
+-                "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), "h"(cluster_mask)
++                "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), KITTENS_MCAST_OPERAND(cluster_mask)
+                 : "memory"
+             );
+         }
+         else {
+             asm volatile (
+-                "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster.L2::cache_hint"
++                "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.cta_group::2.multicast::cluster" KITTENS_MCAST_SUFFIX ".L2::cache_hint"
+                 " [%0], [%1, {%3, %4, %5, %6}], [%2], %7, %8;"
+                 :
+                 : "r"(dst_i_ptr), "l"(tma_ptr), "r"(neighbor_mbar_ptr),
+-                "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), "h"(cluster_mask), "l"(make_cache_policy<policy>())
++                "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), KITTENS_MCAST_OPERAND(cluster_mask), "l"(make_cache_policy<policy>())
+                 : "memory"
+             );
+         }
+@@ -221,21 +221,21 @@
+ #endif
+     if constexpr (policy == cache_policy::NORMAL) {
+         asm volatile (
+-            "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
++            "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster" KITTENS_MCAST_SUFFIX
+             " [%0], [%1, {%3, %4, %5, %6}], [%2], %7;"
+             :
+             : "r"(dst_i_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+-            "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), "h"(cluster_mask)
+-            : "memory"
+-        );
+-    }
+-    else {
+-        asm volatile (
+-            "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
++            "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), KITTENS_MCAST_OPERAND(cluster_mask)
++            : "memory"
++        );
++    }
++    else {
++        asm volatile (
++            "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster" KITTENS_MCAST_SUFFIX ".L2::cache_hint"
+             " [%0], [%1, {%3, %4, %5, %6}], [%2], %7, %8;"
+             :
+             : "r"(dst_i_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+-            "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), "h"(cluster_mask), "l"(make_cache_policy<policy>())
++            "r"(tma_coord.c), "r"(tma_coord.r), "r"(tma_coord.d), "r"(tma_coord.b), KITTENS_MCAST_OPERAND(cluster_mask), "l"(make_cache_policy<policy>())
+             : "memory"
+         );
+     }
+@@ -400,7 +400,7 @@
+ 
+ namespace cluster {
+ template<cache_policy policy, ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD=coord<SV>>
+-__device__ static inline void load_async(SV &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) {
++__device__ static inline void load_async(SV &dst, const GL &src, const COORD &idx, semaphore& bar, cluster_mask_t cluster_mask, int dst_mbar_cta=-1) {
+     coord<> unit_coord = idx.template unit_coord<-1, 3>();
+     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src.template get_tma<SV, -1>());
+     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&bar));
+diff --git a/include/ops/thread/mma/tcgen05.cuh b/include/ops/thread/mma/tcgen05.cuh
+--- a/include/ops/thread/mma/tcgen05.cuh
++++ b/include/ops/thread/mma/tcgen05.cuh
+@@ -312,12 +312,21 @@
+     static_assert(std::is_same_v<AB, fp8e4m3> || std::is_same_v<AB, fp4e2m1_2>, "AB must be fp8e4m3 for f4e2m1");
+     if constexpr (ncta == 1) {
+         if constexpr (std::is_same_v<AB, fp8e4m3>) { // Block size is always 32; alias is 1X
++#ifdef KITTENS_SM107
++            asm volatile(
++                "{.reg .pred p;\n\t" \
++                "setp.eq.u32 p, 1, %6;\n\t" \
++                "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.block32 [%0], %1, %2, %3, [%4], [%5], p;}\n"
++            ::  "r"(d_tt_addr), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(sa_tt_addr), "r"(sb_tt_addr), "n"(acc)
++            );
++#else
+             asm volatile(
+                 "{.reg .pred p;\n\t" \
+                 "setp.eq.u32 p, 1, %6;\n\t" \
+                 "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [%0], %1, %2, %3, [%4], [%5], p;}\n"
+             ::  "r"(d_tt_addr), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(sa_tt_addr), "r"(sb_tt_addr), "n"(acc)
+             );
++#endif
+         } else if constexpr (std::is_same_v<AB, fp4e2m1_2>) {
+             if constexpr (block_size == 32) { // E8M0 scale only
+                 asm volatile(
+@@ -341,12 +350,21 @@
+     }
+     else {
+         if constexpr (std::is_same_v<AB, fp8e4m3>) { // Block size is always 32; alias is 1X
++#ifdef KITTENS_SM107
++            asm volatile(
++                "{.reg .pred p;\n\t" \
++                "setp.eq.u32 p, 1, %6;\n\t" \
++                "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.block32 [%0], %1, %2, %3, [%4], [%5], p;}\n"
++            ::  "r"(d_tt_addr), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(sa_tt_addr), "r"(sb_tt_addr), "n"(acc)
++            );
++#else
+             asm volatile(
+                 "{.reg .pred p;\n\t" \
+                 "setp.eq.u32 p, 1, %6;\n\t" \
+                 "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.scale_vec::1X [%0], %1, %2, %3, [%4], [%5], p;}\n"
+             ::  "r"(d_tt_addr), "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(sa_tt_addr), "r"(sb_tt_addr), "n"(acc)
+             );
++#endif
+         } else if constexpr (std::is_same_v<AB, fp4e2m1_2>) {
+             if constexpr (block_size == 32) { // E8M0 scale only
+                 asm volatile(
+@@ -371,7 +389,7 @@
+ }
+ 
+ template <int ncta>
+-__device__ static inline void commit(kittens::semaphore &sem, uint16_t dst_cta_mask = 0b11) {
++__device__ static inline void commit(kittens::semaphore &sem, cluster_mask_t dst_cta_mask = 0b11) {
+     if constexpr (ncta == 1) {
+         asm volatile(
+             "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
+@@ -379,8 +397,8 @@
+     }
+     else {
+         asm volatile(
+-            "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;\n"
+-        ::  "l"(__cvta_generic_to_shared(&sem)), "h"(dst_cta_mask));
++            "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster" KITTENS_MCAST_SUFFIX ".b64 [%0], %1;\n"
++        ::  "l"(__cvta_generic_to_shared(&sem)), KITTENS_MCAST_OPERAND(dst_cta_mask));
+     }
+ }
+ 
+diff --git a/include/ops/thread/util/sync.cuh b/include/ops/thread/util/sync.cuh
+--- a/include/ops/thread/util/sync.cuh
++++ b/include/ops/thread/util/sync.cuh
+@@ -274,7 +274,7 @@
+ }
+ 
+ template <int ncta>
+-__device__ static inline void tensor_commit(kittens::semaphore &sem, uint16_t dst_cta_mask = 0b11) {
++__device__ static inline void tensor_commit(kittens::semaphore &sem, cluster_mask_t dst_cta_mask = 0b11) {
+     if constexpr (ncta == 1) {
+         asm volatile(
+             "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
+@@ -282,8 +282,8 @@
+     }
+     else {
+         asm volatile(
+-            "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;\n"
+-        ::  "l"(__cvta_generic_to_shared(&sem)), "h"(dst_cta_mask));
++            "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster" KITTENS_MCAST_SUFFIX ".b64 [%0], %1;\n"
++        ::  "l"(__cvta_generic_to_shared(&sem)), KITTENS_MCAST_OPERAND(dst_cta_mask));
+     }
+ }
+ 
+diff --git a/include/ops/thread/util/tma.cuh b/include/ops/thread/util/tma.cuh
+--- a/include/ops/thread/util/tma.cuh
++++ b/include/ops/thread/util/tma.cuh
+@@ -260,18 +260,18 @@
+ 
+ /* ------- Non-tensor TMA transfers ------- */
+ 
+-__device__ static inline void load_async(void *dst, void *src, uint32_t size_bytes, semaphore& bar, uint16_t cta_mask) {
+-    asm volatile (
+-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [%0], [%1], %2, [%3], %4;\n"
++__device__ static inline void load_async(void *dst, void *src, uint32_t size_bytes, semaphore& bar, cluster_mask_t cta_mask) {
++    asm volatile (
++        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster" KITTENS_MCAST_SUFFIX " [%0], [%1], %2, [%3], %4;\n"
+         :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))), 
+            "l"(src), "r"(size_bytes), 
+            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&bar))),
+-           "h"(cta_mask)
++           KITTENS_MCAST_OPERAND(cta_mask)
+         : "memory"
+     );
+ }
+ template<typename T>
+-__device__ static inline void load_async(T &dst, T &src, uint32_t size_bytes, semaphore& bar, uint16_t cta_mask) {
++__device__ static inline void load_async(T &dst, T &src, uint32_t size_bytes, semaphore& bar, cluster_mask_t cta_mask) {
+     load_async(reinterpret_cast<void*>(&dst), reinterpret_cast<void*>(&src), size_bytes, bar, cta_mask);
+ }
+ 
+diff --git a/include/types/shared/descriptor.cuh b/include/types/shared/descriptor.cuh
+--- a/include/types/shared/descriptor.cuh
++++ b/include/types/shared/descriptor.cuh
+@@ -21,7 +21,15 @@
+ namespace detail {
+ 
+ // See https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
+-__device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
++#ifdef KITTENS_SM107
++constexpr uint64_t DESCRIPTOR_ADDR_MASK = 0x7FFF;
++#else
++constexpr uint64_t DESCRIPTOR_ADDR_MASK = 0x3FFF;
++#endif
++constexpr uint64_t DESCRIPTOR_OFFSET_MASK = 0x3FFF;
++
++__device__ static inline uint64_t matrix_descriptor_encode_addr(uint64_t x) { return (x >> 4) & DESCRIPTOR_ADDR_MASK; }
++__device__ static inline uint64_t matrix_descriptor_encode_offset(uint64_t x) { return (x >> 4) & DESCRIPTOR_OFFSET_MASK; }
+ 
+ template <typename T>
+ __device__ static inline uint64_t matrix_descriptor_raw(
+@@ -32,13 +40,13 @@
+ ) {
+ #ifdef KITTENS_SM10X
+     // see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-descriptor
+-    return matrix_descriptor_encode(reinterpret_cast<uint64_t>(addr)) | 
++    return matrix_descriptor_encode_addr(reinterpret_cast<uint64_t>(addr)) |
+            (1llu << 46) | // needed for blackwell shared memory descriptors
+ #else
+-    return matrix_descriptor_encode(reinterpret_cast<uint64_t>(addr)) |
++    return matrix_descriptor_encode_addr(reinterpret_cast<uint64_t>(addr)) |
+ #endif
+-           matrix_descriptor_encode((uint64_t)leading_dim_offset) << 16 |
+-           matrix_descriptor_encode((uint64_t)stride_dim_offset) << 32 |
++           matrix_descriptor_encode_offset((uint64_t)leading_dim_offset) << 16 |
++           matrix_descriptor_encode_offset((uint64_t)stride_dim_offset) << 32 |
+            (uint64_t)swizzle_mode << 62;
+ }
+ 
+@@ -83,27 +91,27 @@
+         // And for K-major, "how to forward K elements in the leading dimension?"
+         if constexpr (MN_major) { // MN major mode (i.e., K x M for A matrix, K x N for B matrix)
+             if constexpr (ST::swizzle_bytes == 128) { // 128B swizzle: 
+-                return base_desc + detail::matrix_descriptor_encode(chunk_idx*2048);
++                return base_desc + detail::matrix_descriptor_encode_addr(chunk_idx*2048);
+             }
+             else if constexpr (ST::swizzle_bytes == 64) {
+-                return base_desc + detail::matrix_descriptor_encode(chunk_idx*1024);
++                return base_desc + detail::matrix_descriptor_encode_addr(chunk_idx*1024);
+             }
+             else {
+-                return base_desc + detail::matrix_descriptor_encode(chunk_idx*512);
++                return base_desc + detail::matrix_descriptor_encode_addr(chunk_idx*512);
+             }
+         }
+         else { // K major mode (i.e., M x K for A matrix, N x K for B matrix)
+             if constexpr (ST::swizzle_bytes == 128) {
+                 // 128B swizzle: 4 chunks fit within swizzle bytes; move on to next every 4 chunks (rows * 128B swizzle bytes)
+-                return base_desc + detail::matrix_descriptor_encode((chunk_idx%4)*32 + (chunk_idx/4)*(ST::rows/TILE_ROW_DIM<T>)*2048);
++                return base_desc + detail::matrix_descriptor_encode_addr((chunk_idx%4)*32 + (chunk_idx/4)*(ST::rows/TILE_ROW_DIM<T>)*2048);
+             }
+             else if constexpr (ST::swizzle_bytes == 64) {
+                 // 64B swizzle: 2 chunks fit within swizzle bytes; move on to next every 2 chunks (rows * 64B swizzle bytes)
+-                return base_desc + detail::matrix_descriptor_encode((chunk_idx%2)*32 + (chunk_idx/2)*(ST::rows/TILE_ROW_DIM<T>)*1024);
++                return base_desc + detail::matrix_descriptor_encode_addr((chunk_idx%2)*32 + (chunk_idx/2)*(ST::rows/TILE_ROW_DIM<T>)*1024);
+             }
+             else {
+                 // 32B swizzle: Entire chunk fits within swizzle bytes; move on to next on every chunk (rows * 32B swizzle bytes)
+-                return base_desc + detail::matrix_descriptor_encode(chunk_idx*(ST::rows/TILE_ROW_DIM<T>)*512);
++                return base_desc + detail::matrix_descriptor_encode_addr(chunk_idx*(ST::rows/TILE_ROW_DIM<T>)*512);
+             }
+         }
+     }
+@@ -116,8 +124,8 @@
+         const int edge_gap = 128 - start_byte%128;                          // bytes from the chunk start to the swizzle atom's edge
+         const int cont_byte = start_byte + (edge_gap < 48 ? edge_gap : 32); // first box read through the leading byte offset
+         // 8 chunks span 3 swizzle atoms (384B); move on to the next atom every 128 bytes (rows * 128B swizzle bytes)
+-        const uint64_t start_desc = base_desc + detail::matrix_descriptor_encode(start_byte%128 + (start_byte/128)*(ST::rows/TILE_ROW_DIM<T>)*2048);
+-        const uint64_t cont_desc  = base_desc + detail::matrix_descriptor_encode(cont_byte%128 + (cont_byte/128)*(ST::rows/TILE_ROW_DIM<T>)*2048);
++        const uint64_t start_desc = base_desc + detail::matrix_descriptor_encode_addr(start_byte%128 + (start_byte/128)*(ST::rows/TILE_ROW_DIM<T>)*2048);
++        const uint64_t cont_desc  = base_desc + detail::matrix_descriptor_encode_addr(cont_byte%128 + (cont_byte/128)*(ST::rows/TILE_ROW_DIM<T>)*2048);
+         return (start_desc & ~(0x3FFFull << 16)) | ((cont_desc & 0x3FFFull) << 16) | (1ull << 52);
+     }
+ #endif
