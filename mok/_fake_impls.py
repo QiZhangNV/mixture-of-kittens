@@ -65,18 +65,19 @@ def _mxfp8_quantize_fake(
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_fwd_mxfp8")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
     combine_buffer: torch.Tensor,
     combine_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
     w_routed_gate_sc: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
     w_routed_up_sc: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down: torch.Tensor,
     w_routed_down_sc: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
@@ -88,43 +89,53 @@ def _dispatch_mlp_swiglu_combine_fwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
+    w_routed_gate_sc_storage_table: torch.Tensor | None = None,
+    w_routed_up_sc_storage_table: torch.Tensor | None = None,
+    w_routed_down_sc_storage_table: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor, torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
-    torch.Tensor, torch.Tensor,  # y_shared, y_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
+    torch.Tensor | None, torch.Tensor,  # y_shared, y_routed
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_shared_gate.shape[0]
+    # FC2 carries logical I even for packed FC1; Python tensor identity is not stable in tracing.
+    intermediate_size = w_routed_down.shape[-1]
     return (
         x.new_empty((hidden_size, macrobatch_size), dtype=torch.float8_e4m3fn),
         x.new_empty((hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
         x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
         x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((intermediate_size, macrobatch_size), dtype=torch.float8_e4m3fn),
         x.new_empty((intermediate_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
-        x.new_empty(x.shape),
+        x.new_empty(x.shape) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, hidden_size)),
     )
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_fwd_bf16")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
     combine_buffer: torch.Tensor,
     combine_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
     schedule_peer_token_idx: torch.Tensor,
@@ -135,36 +146,42 @@ def _dispatch_mlp_swiglu_combine_fwd_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    w_routed_gate_storage_table: torch.Tensor | None = None,
+    w_routed_up_storage_table: torch.Tensor | None = None,
+    w_routed_down_storage_table: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_shared_gate.shape[0]
+    intermediate_size = w_routed_down.shape[-1]
     return (
         x.new_empty((macrobatch_size, hidden_size)),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size)),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size)),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size)),
-        x.new_empty(x.shape),
+        x.new_empty(x.shape) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, hidden_size)),
     )
 
 
 @torch.library.register_fake("mok::recompute_forward_context_mxfp8")
+@_ops._tensor_outputs
 def _recompute_forward_context_mxfp8_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
     w_routed_gate_sc: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
     w_routed_up_sc: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
@@ -176,36 +193,39 @@ def _recompute_forward_context_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor, torch.Tensor,  # x_fp8_t_routed, x_sc_t_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # gate_shared, gate_fp8_routed, gate_sc_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # up_shared, up_fp8_routed, up_sc_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_shared_gate.shape[0]
+    intermediate_size = w_routed_gate.shape[-2]
     return (
         x.new_empty((hidden_size, macrobatch_size), dtype=torch.float8_e4m3fn),
         x.new_empty((hidden_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
         x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
         x.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((intermediate_size, macrobatch_size), dtype=torch.float8_e4m3fn),
         x.new_empty((intermediate_size // 128, macrobatch_size // 128, 32, 16), dtype=torch.uint8),
     )
 
 
 @torch.library.register_fake("mok::recompute_forward_context_bf16")
+@_ops._tensor_outputs
 def _recompute_forward_context_bf16_fake(
     x: torch.Tensor,
     x_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
     schedule_peer_rank: torch.Tensor,
     schedule_peer_token_idx: torch.Tensor,
@@ -216,26 +236,29 @@ def _recompute_forward_context_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
-    intermediate_size = w_shared_gate.shape[0]
+    intermediate_size = w_routed_gate.shape[-2]
     return (
         x.new_empty((macrobatch_size, hidden_size)),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size)),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size)),
-        x.new_empty((num_local_tokens, intermediate_size)),
+        x.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         x.new_empty((macrobatch_size, intermediate_size)),
     )
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_bwd_mxfp8")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
     d_y_buffer: torch.Tensor,
     d_y_buffer_ptrs: list[int],
@@ -245,24 +268,24 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
     router_weight_buffer_ptrs: list[int],
     d_router_weight_buffer: torch.Tensor,
     d_router_weight_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate_T: torch.Tensor,
     w_routed_gate_T_sc: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up_T: torch.Tensor,
     w_routed_up_T_sc: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down_T: torch.Tensor,
     w_routed_down_T_sc: torch.Tensor,
     x_fp8_t_routed: torch.Tensor,
     x_sc_t_routed: torch.Tensor,
-    gate_shared: torch.Tensor,
+    gate_shared: torch.Tensor | None,
     gate_fp8_routed: torch.Tensor,
     gate_sc_routed: torch.Tensor,
-    up_shared: torch.Tensor,
+    up_shared: torch.Tensor | None,
     up_fp8_routed: torch.Tensor,
     up_sc_routed: torch.Tensor,
-    hidden_shared: torch.Tensor,
+    hidden_shared: torch.Tensor | None,
     hidden_fp8_t_routed: torch.Tensor,
     hidden_sc_t_routed: torch.Tensor,
     x: torch.Tensor,
@@ -280,42 +303,47 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    routed_weights_are_native_columnwise: bool = False,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,  # d_x_shared, d_x_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed
-    torch.Tensor, torch.Tensor, torch.Tensor,  # d_up_shared, d_up_fp8_routed, d_up_sc_routed
-    torch.Tensor, torch.Tensor,  # d_hidden_shared, d_hidden_routed
+    torch.Tensor | None, torch.Tensor,  # d_x_shared, d_x_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed
+    torch.Tensor | None, torch.Tensor, torch.Tensor,  # d_up_shared, d_up_fp8_routed, d_up_sc_routed
+    torch.Tensor | None, torch.Tensor,  # d_hidden_shared, d_hidden_routed
     torch.Tensor, torch.Tensor,  # d_y_fp8_routed, d_y_sc_routed
-    torch.Tensor, torch.Tensor,  # d_w_shared_gate, d_w_routed_gate
-    torch.Tensor, torch.Tensor,  # d_w_shared_up, d_w_routed_up
-    torch.Tensor, torch.Tensor,  # d_w_shared_down, d_w_routed_down
+    torch.Tensor | None, torch.Tensor,  # d_w_shared_gate, d_w_routed_gate
+    torch.Tensor | None, torch.Tensor,  # d_w_shared_up, d_w_routed_up
+    torch.Tensor | None, torch.Tensor,  # d_w_shared_down, d_w_routed_down
 ]:
     num_local_tokens, hidden_size = x.shape
     num_local_experts = w_routed_gate.shape[0]
-    intermediate_size = w_shared_gate.shape[0]
+    intermediate_size = gate_fp8_routed.shape[-1]
     return (
-        d_y_buffer.new_empty((num_local_tokens, hidden_size)),
+        d_y_buffer.new_empty((num_local_tokens, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, hidden_size)),
-        d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
+        d_y_buffer.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
         d_y_buffer.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
-        d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
+        d_y_buffer.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, intermediate_size), dtype=torch.float8_e4m3fn),
         d_y_buffer.new_empty((macrobatch_size // 128, intermediate_size // 128, 32, 16), dtype=torch.uint8),
-        d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
+        d_y_buffer.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, intermediate_size)),
         d_y_buffer.new_empty((macrobatch_size, hidden_size), dtype=torch.float8_e4m3fn),
         d_y_buffer.new_empty((macrobatch_size // 128, hidden_size // 128, 32, 16), dtype=torch.uint8),
-        d_y_buffer.new_empty((intermediate_size, hidden_size)),
+        d_y_buffer.new_empty((intermediate_size, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((num_local_experts, intermediate_size, hidden_size)),
-        d_y_buffer.new_empty((intermediate_size, hidden_size)),
+        d_y_buffer.new_empty((intermediate_size, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((num_local_experts, intermediate_size, hidden_size)),
-        d_y_buffer.new_empty((hidden_size, intermediate_size)),
+        d_y_buffer.new_empty((hidden_size, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((num_local_experts, hidden_size, intermediate_size)),
     )
 
 
 @torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_bwd_bf16")
+@_ops._tensor_outputs
 def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
     d_y_buffer: torch.Tensor,
     d_y_buffer_ptrs: list[int],
@@ -325,18 +353,18 @@ def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
     router_weight_buffer_ptrs: list[int],
     d_router_weight_buffer: torch.Tensor,
     d_router_weight_buffer_ptrs: list[int],
-    w_shared_gate: torch.Tensor,
+    w_shared_gate: torch.Tensor | None,
     w_routed_gate: torch.Tensor,
-    w_shared_up: torch.Tensor,
+    w_shared_up: torch.Tensor | None,
     w_routed_up: torch.Tensor,
-    w_shared_down: torch.Tensor,
+    w_shared_down: torch.Tensor | None,
     w_routed_down: torch.Tensor,
     x_routed: torch.Tensor,
-    gate_shared: torch.Tensor,
+    gate_shared: torch.Tensor | None,
     gate_routed: torch.Tensor,
-    up_shared: torch.Tensor,
+    up_shared: torch.Tensor | None,
     up_routed: torch.Tensor,
-    hidden_shared: torch.Tensor,
+    hidden_shared: torch.Tensor | None,
     hidden_routed: torch.Tensor,
     x: torch.Tensor,
     x_ptrs: list[int],
@@ -349,50 +377,61 @@ def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    shared_grad_output: torch.Tensor | None = None,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
 ) -> tuple[
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
     torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
+    torch.Tensor | None, torch.Tensor,
 ]:
     num_local_tokens, hidden_size = x.shape
     num_local_experts = w_routed_gate.shape[0]
-    intermediate_size = w_shared_gate.shape[0]
+    intermediate_size = gate_routed.shape[-1]
     return (
-        d_y_buffer.new_empty((num_local_tokens, hidden_size)),
+        d_y_buffer.new_empty((num_local_tokens, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, hidden_size)),
-        d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
+        d_y_buffer.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, intermediate_size)),
-        d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
+        d_y_buffer.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, intermediate_size)),
-        d_y_buffer.new_empty((num_local_tokens, intermediate_size)),
+        d_y_buffer.new_empty((num_local_tokens, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((macrobatch_size, intermediate_size)),
         d_y_buffer.new_empty((macrobatch_size, hidden_size)),
-        d_y_buffer.new_empty((intermediate_size, hidden_size)),
+        d_y_buffer.new_empty((intermediate_size, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((num_local_experts, intermediate_size, hidden_size)),
-        d_y_buffer.new_empty((intermediate_size, hidden_size)),
+        d_y_buffer.new_empty((intermediate_size, hidden_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((num_local_experts, intermediate_size, hidden_size)),
-        d_y_buffer.new_empty((hidden_size, intermediate_size)),
+        d_y_buffer.new_empty((hidden_size, intermediate_size)) if w_shared_gate is not None else None,
         d_y_buffer.new_empty((num_local_experts, hidden_size, intermediate_size)),
     )
 
 
 @torch.library.register_fake("mok::fwd_epilogue")
 def _fwd_epilogue_fake(
-    y_shared: torch.Tensor,
+    y_shared: torch.Tensor | None,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    top_experts: torch.Tensor,
+    shared_output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:  # output
-    return y_shared.new_empty(y_shared.shape)
+    return combine_buffer.new_empty((topk_weights.shape[0], combine_buffer.shape[1]))
 
 
 @torch.library.register_fake("mok::bwd_epilogue")
 def _bwd_epilogue_fake(
-    d_x_shared: torch.Tensor,
+    d_x_shared: torch.Tensor | None,
     d_x_routed_buffer: torch.Tensor,
+    top_experts: torch.Tensor,
 ) -> torch.Tensor:  # d_x
-    return d_x_shared.new_empty(d_x_shared.shape)
+    return d_x_routed_buffer.new_empty((top_experts.shape[0], d_x_routed_buffer.shape[1]))
+
+
+@torch.library.register_fake("mok::stage_into_buffers")
+def _stage_into_buffers_fake(sources: list[torch.Tensor], buffers: list[torch.Tensor]) -> None:
+    return None
